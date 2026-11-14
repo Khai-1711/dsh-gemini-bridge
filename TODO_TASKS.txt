@@ -1,0 +1,19 @@
+# DSH Gemini Agent Bridge - Danh sách việc cần làm (To-Do List)
+
+## 1. Kiểm tra & Bảo mật (Security & Validation)
+- [ ] Kiểm tra lại cơ chế mã hóa hoặc ẩn cookie trong file `.env` và `.bridge_session.json` để tránh rò rỉ token.
+- [ ] Thắt chặt kiểm tra quyền truy cập (Access Control) nếu deploy ra môi trường mạng công khai.
+- [ ] Bổ sung unit test cho tính năng Hot-Reload cookie qua `POST /v1/update-cookies`.
+
+## 2. Hiệu năng & Ổn định (Performance & Reliability)
+- [ ] Kiểm tra và tối ưu hóa thời gian chờ của `asyncio.Lock` trong `gemini_session.py` khi có nhiều request đồng thời.
+- [ ] Tinh chỉnh cơ chế Smart Truncation để đảm bảo không cắt xén nhầm các đoạn log hoặc traceback quan trọng.
+- [ ] Kiểm tra cơ chế tự động reconnect/failover khi tài khoản chính (`SECURE_1PSID`) hết hạn sang tài khoản dự phòng (`BACKUP_1PSID`).
+
+## 3. Giao diện & Trải nghiệm (Frontend & Observability)
+- [ ] Cải thiện độ mượt của Terminal log streaming trên giao diện Web Dashboard.
+- [ ] Bổ sung hiển thị trạng thái của Cookie Failover Pool trực tiếp trên thanh Navbar/Metrics.
+
+## 4. Kiểm thử & Tài liệu (Testing & Documentation)
+- [ ] Viết thêm các test case tự động cho luồng Function Calling (Tool Use) trong `tests/test_core.py`.
+- [ ] Cập nhật thêm tài liệu hướng dẫn xử lý lỗi (Troubleshooting) khi gặp sự cố về mạng hoặc giới hạn Rate Limit của Google Gemini Web.

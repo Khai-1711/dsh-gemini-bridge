@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DSH Gemini Bridge — Enterprise Dashboard</title>
+  <link rel="stylesheet" href="/frontend/css/main.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-wrapper">
+    <!-- Navbar Component -->
+    <bridge-navbar></bridge-navbar>
+
+    <!-- Telemetry Cards Grid -->
+    <bridge-metrics></bridge-metrics>
+
+    <!-- 2-Column Main Workspace -->
+    <main class="workspace-layout">
+      <!-- Left Column: Terminal & Logs -->
+      <bridge-terminal></bridge-terminal>
+
+      <!-- Right Column: Settings & Operations -->
+      <div class="controls-column">
+        <bridge-model-switch></bridge-model-switch>
+        <bridge-cookie-manager></bridge-cookie-manager>
+        <bridge-quick-actions></bridge-quick-actions>
+      </div>
+    </main>
+  </div>
+
+  <!-- Floating Toast Notification System -->
+  <bridge-toast></bridge-toast>
+
+  <!-- ES6+ Module Bootstrap -->
+  <script type="module" src="/frontend/js/app.js"></script>
+</body>
+</html>
