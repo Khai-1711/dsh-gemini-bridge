@@ -27,6 +27,18 @@ class TestSmartTruncate(unittest.TestCase):
         out = smart_truncate(text, 2000)
         self.assertLessEqual(len(out), 2000)
 
+    def test_smart_truncate_only_middle_errors(self):
+        text = "HEAD_CONTENT\n" + ("line ok\n" * 50) + "middle ERROR: fail here\n" + ("line ok\n" * 50) + "TAIL_CONTENT"
+        out = smart_truncate(text, 200)
+        self.assertIn("ERROR: fail here", out)
+        self.assertIn("HEAD_CONTENT", out)
+        self.assertIn("TAIL_CONTENT", out)
+
+    def test_smart_truncate_tail_zero(self):
+        text = "A" * 1000
+        out = smart_truncate(text, 100)
+        self.assertLessEqual(len(out), 120)
+
 
 class TestPromptBuilder(unittest.TestCase):
     def test_first_turn_includes_tool_header(self):
@@ -74,6 +86,19 @@ class TestSecurity(unittest.TestCase):
         self.assertFalse(is_safe_path_no_c_drive(r"..\..\Windows\System32"))
         self.assertTrue(is_safe_path_no_c_drive(r"D:\ABC\file.txt"))
 
+    def test_sanitize_command_allows_format_flag(self):
+        for cmd in ["npx prettier --format src/", "black --format", "ruff format ."]:
+            self.assertEqual(sanitize_shell_command_no_c_drive(cmd), cmd)
+
+    def test_safe_path_relative_to_project_dir(self):
+        self.assertTrue(is_safe_path_no_c_drive("src/main.py"))
+        self.assertTrue(is_safe_path_no_c_drive(r"app\subsystem\logic.py"))
+
+    def test_safe_path_blocks_c_drive_and_system(self):
+        self.assertFalse(is_safe_path_no_c_drive(r"C:\Windows"))
+        self.assertFalse(is_safe_path_no_c_drive(r"C:\Program Files\app"))
+        self.assertFalse(is_safe_path_no_c_drive(r"..\..\Windows"))
+
 
 class TestToolParser(unittest.TestCase):
     def test_normalize_path_alias(self):
@@ -107,6 +132,31 @@ class TestToolParser(unittest.TestCase):
         reply = '<tool_call>{"name":"read_image","arguments":{}}</tool_call>'
         calls = parse_tool_calls_from_reply(reply, {})
         self.assertEqual(calls, [])
+
+    def test_normalize_tool_arguments_preserves_path_when_schema_accepts_path(self):
+        schema = {"parameters": {"properties": {"path": {"type": "string"}}}}
+        args = {"path": r"D:\test\file.txt"}
+        out = normalize_tool_arguments("CustomTool", args, schema)
+        self.assertIn("path", out)
+        self.assertNotIn("file_path", out)
+
+    def test_normalize_tool_arguments_no_fake_command(self):
+        schema = {"parameters": {"properties": {"command": {"type": "string"}}}}
+        args = {"arg1": "val1"}
+        out = normalize_tool_arguments("Pwsh", args, schema)
+        self.assertNotIn("command", out)
+
+    def test_parse_tool_calls_with_empty_tools_map_accepts_tagged(self):
+        reply = '<tool_call>{"name": "AnyTool", "arguments": {}}</tool_call>'
+        calls = parse_tool_calls_from_reply(reply, {})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "AnyTool")
+
+    def test_parse_tool_calls_prefix_stripped_correctly(self):
+        reply = '<tool_call>{"name": "functions.MyTool", "arguments": {}}</tool_call>'
+        calls = parse_tool_calls_from_reply(reply, {})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "MyTool")
 
 
 if __name__ == "__main__":

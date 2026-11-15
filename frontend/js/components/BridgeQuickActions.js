@@ -1,10 +1,12 @@
+// Quy tắc: Poll không được render lại ô nhập/chọn
 import { api } from "../api.js";
 import { store } from "../state.js";
 import { t } from "../i18n.js";
+import { displayName } from "../lane-name.js";
 
 /**
- * <bridge-quick-actions> Component
- * Handles Session Reset & Cache Invalidation + i18n
+ * <bridge-quick-actions> Component (T40E)
+ * Handles Session Reset & Cache Invalidation routed to selectedLane.
  */
 export class BridgeQuickActions extends HTMLElement {
   connectedCallback() {
@@ -12,9 +14,26 @@ export class BridgeQuickActions extends HTMLElement {
     this.setupEvents();
 
     this.unsubscribe = store.subscribe((state, prevState) => {
-      if (prevState && state.lang !== prevState.lang) {
+      if (!prevState) return;
+
+      const langChanged = state.lang !== prevState.lang;
+      const selectedLaneChanged = state.selectedLane !== prevState.selectedLane;
+
+      if (langChanged || selectedLaneChanged) {
         this.render();
         this.setupEvents();
+      } else {
+        const lane = this.getCurrentLane(state);
+        const laneId = lane.id || state.selectedLane || "default";
+        const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
+        const lanes = state.lanes || [];
+        const showLaneTag = Array.isArray(lanes) && lanes.length >= 2;
+        const tagContainer = this.querySelector(".qa-lane-tag-container");
+        if (tagContainer) {
+          tagContainer.innerHTML = showLaneTag
+            ? `<span class="badge-tag badge-cyan" style="text-transform:none; font-weight:600; font-size:11px; margin-left:6px;">${displayName(laneId, lane.label, flowNum, state.lang)}</span>`
+            : "";
+        }
       }
     });
   }
@@ -23,15 +42,31 @@ export class BridgeQuickActions extends HTMLElement {
     if (this.unsubscribe) this.unsubscribe();
   }
 
+  getCurrentLane(state) {
+    const lanes = state.lanes || [];
+    const sel = state.selectedLane;
+    return lanes.find((l) => l.id === sel) || lanes[0] || {};
+  }
+
   render() {
-    const { lang } = store.getState();
+    const state = store.getState();
+    const { lang, lanes } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+
+    const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
+    const showLaneTag = Array.isArray(lanes) && lanes.length >= 2;
+    const laneTagHtml = showLaneTag
+      ? `<span class="badge-tag badge-cyan" style="text-transform:none; font-weight:600; font-size:11px; margin-left:6px;">${displayName(laneId, lane.label, flowNum, lang)}</span>`
+      : "";
 
     this.innerHTML = `
       <div class="panel">
         <div class="panel-head">
-          <div class="panel-title">
+          <div class="panel-title" style="display:flex; align-items:center;">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-            ${t("quickActionsTitle", lang)}
+            <span>${t("quickActionsTitle", lang)}</span>
+            <span class="qa-lane-tag-container">${laneTagHtml}</span>
           </div>
         </div>
         <div class="panel-body">
@@ -56,26 +91,39 @@ export class BridgeQuickActions extends HTMLElement {
   }
 
   async handleReset() {
-    const { lang } = store.getState();
-    if (!confirm(t("confirmResetSession", lang))) {
+    const state = store.getState();
+    const { lang } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+
+    const confirmMsg =
+      lang === "vi"
+        ? `⚠️ Bạn có chắc muốn đóng đoạn chat hiện tại trên Gemini Web của luồng ${laneId} và tạo đoạn chat mới?`
+        : `⚠️ Are you sure you want to close current chat session for lane ${laneId} and start a new one?`;
+
+    if (!confirm(confirmMsg)) {
       return;
     }
 
     try {
-      await api.resetSession();
+      await api.resetLaneSession(laneId);
       store.notifyToast(t("sessionResetSuccess", lang), "success");
-      this.dispatchEvent(new CustomEvent("refresh-request", { bubbles: true }));
+      window.dispatchEvent(new CustomEvent("refresh-request"));
     } catch (err) {
       store.notifyToast(`Error: ${err.message}`, "error");
     }
   }
 
   async handleClearCache() {
-    const { lang } = store.getState();
+    const state = store.getState();
+    const { lang } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+
     try {
-      const data = await api.clearCache();
-      store.notifyToast(t("cacheClearedSuccess", lang, { count: data.cleared_entries }), "success");
-      this.dispatchEvent(new CustomEvent("refresh-request", { bubbles: true }));
+      const data = await api.clearLaneCache(laneId);
+      store.notifyToast(t("cacheClearedSuccess", lang, { count: data.cleared_entries || 0 }), "success");
+      window.dispatchEvent(new CustomEvent("refresh-request"));
     } catch (err) {
       store.notifyToast(`Error: ${err.message}`, "error");
     }

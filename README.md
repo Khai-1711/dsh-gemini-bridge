@@ -142,6 +142,37 @@ In DeepSeek Harness, navigate to **Settings → Model Providers**:
 
 ---
 
+## Multi-Instance Isolation (Run 2 Concurrent Agents)
+
+The bridge supports running up to 2 completely isolated DSH agents from the **same repository** on separate ports, each bound to its own Google account and state files:
+
+### Instance Identification Matrix
+
+| ID | Account | Port | DSH Agent | Config File | Session State | Process Log | Activity Journal |
+|---|---|---|---|---|---|---|---|
+| `acc1` | Google A | 10000 | DSH 1 (project 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
+| `acc2` | Google B | 10001 | DSH 2 (project 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
+| *(default)* | - | 10000 | Single legacy | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
+
+### Configuration & Startup
+
+1. **Create Configuration Files:**
+   - Copy `.env.example` to `.env.acc1` (`PORT=10000`, Google Account A cookies, `INSTANCE_LABEL="Agent-1"`).
+   - Copy `.env.example` to `.env.acc2` (`PORT=10001`, Google Account B cookies, `INSTANCE_LABEL="Agent-2"`).
+2. **Launch Instances:**
+   - Double-click `run_acc1.bat` to launch `acc1` on port 10000.
+   - Double-click `run_acc2.bat` to launch `acc2` on port 10001.
+3. **Connect DeepSeek Harness:**
+   - Agent 1: Base URL `http://127.0.0.1:10000/v1`
+   - Agent 2: Base URL `http://127.0.0.1:10001/v1`
+4. **Monitor Activity Separately:**
+   - Activities: `http://127.0.0.1:10000/v1/activity` and `http://127.0.0.1:10001/v1/activity`
+   - Dashboards: `http://127.0.0.1:10000/dashboard` and `http://127.0.0.1:10001/dashboard`
+5. **CRITICAL ACCOUNT NOTE:**
+   - Do NOT share cookies between instances. Log in to each Google account in separate Chrome profiles or Incognito windows, copy the cookies, and close the browser. Verify `account_key` differs at `/health` between both ports.
+
+---
+
 ## Management API Endpoints
 
 | Method   | Endpoint                | Description                                                                          |
@@ -150,22 +181,70 @@ In DeepSeek Harness, navigate to **Settings → Model Providers**:
 | **GET**  | `/v1/models`            | Dynamic list of Gemini models discovered on your Google account.                     |
 | **GET**  | `/health`               | Telemetry endpoint: Uptime, total requests, error rates, cache metrics.              |
 | **GET**  | `/dashboard`            | Web-based management console.                                                        |
+| **GET**  | `/v1/control`           | Get API switch state (`off`, `starting`, `on`, `stopping`, `drain_timeout`).          |
+| **POST** | `/v1/control/enable`    | Connect to Gemini Web and enable requests.                                           |
+| **POST** | `/v1/control/disable`   | Gracefully drain in-flight requests and disconnect Gemini Web.                        |
 | **POST** | `/v1/update-cookies`    | Hot-reload cookies at runtime without restarting the server.                         |
 | **POST** | `/v1/switch-model`      | Switch the active Gemini model (`gemini-flash`, `gemini-pro`, etc.).                 |
 | **POST** | `/v1/reset`             | Terminate current chat session on Gemini Web and start fresh.                        |
 | **POST** | `/v1/cache/clear`       | Invalidate all cached prompt responses.                                              |
-| **GET**  | `/v1/logs`              | Retrieve recent log lines from `logs/bridge.log`.                                    |
+| **GET**  | `/v1/logs`              | Retrieve recent log lines from the instance's log file.                              |
+| **GET**  | `/v1/activity`          | Dedicated JSONL activity journal for this instance.                                  |
+
+---
+
+## Dashboard API Control Switch (On/Off)
+
+The bridge features an on-demand connection switch:
+- **Starts in OFF state by default:** The web server and dashboard start immediately, but **NO** connection to Gemini Web is established and **NO** background cookie refresh tasks run until explicitly enabled.
+- **Independent switches per instance:** Instance `acc1` (`:10000/dashboard`) and `acc2` (`:10001/dashboard`) maintain completely independent control switches. Control state is memory-only and initialized on startup based on `API_START_STATE`.
+
+### State Lifecycle Matrix
+
+| State | Gemini Connection | `/v1/chat/completions` | Dashboard / `/health` |
+|---|---|---|---|
+| `off` | NOT initialized | HTTP 503 (`code: "bridge_disabled"`) | Fully accessible |
+| `starting` | Initializing client | HTTP 503 (`code: "bridge_disabled"`) | Fully accessible |
+| `on` | Initialized & Ready | Processed normally | Fully accessible |
+| `stopping` | Draining / Disconnecting | HTTP 503 (`code: "bridge_disabled"`) | Fully accessible |
+
+### Configuration Variables (`.env`)
+
+```ini
+# Startup state: off (default) = wait for manual enable on dashboard; on = auto-connect
+API_START_STATE=off
+
+# Maximum seconds to wait for in-flight requests to drain when disabling (default: 120s)
+DISABLE_DRAIN_TIMEOUT=120
+```
+
+### LAN / Dual-Computer Support
+When hosting the bridge on one computer and accessing the dashboard from another on your local network:
+- Configure `HOST=0.0.0.0` in `.env` to bind on all network interfaces.
+- The control origin guard automatically permits private RFC 1918 LAN IP ranges (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`), preventing HTTP 403 `origin_not_allowed` errors while still rejecting external malicious websites.
 
 ---
 
 ## Troubleshooting
 
-1. **`[CONFIG ERROR] SECURE_1PSID is empty!` at startup:**
+0. **Agent receives HTTP 503 `bridge_disabled`:**
+   * Open the dashboard (`http://127.0.0.1:10000/dashboard` or `:10001/dashboard`) and click **START / BẬT**. Once the green **ON / BẬT** badge appears, retry your request.
+
+1. **Handling Guest Mode (Unauthenticated):**
+   * **Symptoms:** Dashboard displays a red `GUEST (UNAUTHENTICATED)` badge, and API requests return HTTP 503 with error code `{"error": {"code": "gemini_not_authenticated", "message": "Gemini chưa đăng nhập..."}}`.
+   * **Root Cause:** Cookie `SECURE_1PSID` or `SECURE_1PSIDTS` has expired or was revoked by Google. `gemini-webapi` 2.x silently falls back to an unauthenticated Guest session, but the bridge explicitly intercepts and blocks guest mode to protect your chat history and ensure Gemini Pro features remain functional.
+   * **Resolution:**
+     1. Open Chrome → go to [https://gemini.google.com](https://gemini.google.com) and ensure you are logged in.
+     2. Press `F12` → **Application** tab → **Storage** → **Cookies** → `https://gemini.google.com`.
+     3. Copy values for `__Secure-1PSID` and `__Secure-1PSIDTS`.
+     4. Open Bridge Dashboard (`http://127.0.0.1:10000/dashboard`) → paste them into **Cookie Manager (Hot-Reload)** → click **Save & Update**. Alternatively send via `POST /v1/update-cookies`. No restart required.
+
+2. **`[CONFIG ERROR] SECURE_1PSID is empty!` at startup:**
    * You haven't created your `.env` file yet. Copy `.env.example` to `.env` and populate your cookies.
-2. **`COOKIE MAY BE EXPIRED!` Warnings in Logs:**
+3. **`COOKIE MAY BE EXPIRED!` Warnings in Logs:**
    * Your browser session cookies have expired. Get fresh cookies from `gemini.google.com` and paste them into the Dashboard UI or send via:
      ```bash
      curl -X POST http://127.0.0.1:10000/v1/update-cookies -H "Content-Type: application/json" -d "{\"SECURE_1PSID\":\"...\",\"SECURE_1PSIDTS\":\"...\"}"
      ```
-3. **Agent tool fails with missing properties:**
+4. **Agent tool fails with missing properties:**
    * The Auto-Mapper in `app/tool_parser.py` automatically normalizes common parameter variations (e.g. `path` → `file_path`, `cmd` → `command`). Extend `normalize_tool_arguments()` if adding custom tools.

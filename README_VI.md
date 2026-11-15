@@ -111,11 +111,22 @@ DEFAULT_PROJECT_DIR=D:\ABC
 icacls "D:\ABC" /grant "$($env:USERNAME):(OI)(CI)F" /T
 ```
 
-### 4. Khởi động Bridge Server
-Tại thư mục `dsh_gemini_bridge/`, khởi chạy:
+### 4. Khởi động nhanh cả hai luồng (`run_all.bat`)
+Chủ dự án có thể khởi động cả hai luồng `acc1` (cổng 10000) và `acc2` (cổng 10001) chỉ với **MỘT thao tác**:
+- **(a) Bấm đúp `run_all.bat`:** Script sẽ kiểm tra cổng lắng nghe và tự động khởi động 2 cửa sổ cmd thu nhỏ (`minimized`) cho 2 luồng riêng biệt. Nếu luồng nào đã chạy từ trước, script tự động bỏ qua.
+- **(b) Tạo shortcut ra Desktop:** Bấm chuột phải vào `run_all.bat` → *Send to* → *Desktop (create shortcut)* để mở 2 luồng nhanh chóng từ màn hình chính.
+- **(c) Tự chạy khi khởi động máy:** Nhấn tổ hợp phím `Win + R` → gõ `shell:startup` → Enter → kéo shortcut của `run_all.bat` vào thư mục Startup này. Trong thuộc tính của Shortcut (Properties), chọn *Run: Minimized* để chạy ngầm gọn gàng.
+- **Dừng tiến trình:** Khi cần tắt hoàn toàn cả 2 tiến trình ngay lập tức, chạy `stop_all.bat`. Lưu ý: trong vận hành thông thường, hãy sử dụng công tắc **BẬT/TẮT** trên Dashboard để chờ request đang xử lý hoàn tất (drain an toàn).
 
+### 5. Khởi động thủ công từng luồng
+Tại thư mục `dsh_gemini_bridge/`, bạn vẫn có thể khởi chạy riêng lẻ từng luồng:
 ```bash
+# Chạy luồng mặc định
 python main.py
+
+# Hoặc chạy riêng lẻ qua file .bat:
+run_acc1.bat    # Luồng acc1 cổng 10000
+run_acc2.bat    # Luồng acc2 cổng 10001
 ```
 
 Khi khởi động thành công, Terminal sẽ hiển thị:
@@ -145,6 +156,54 @@ Vào giao diện **Settings → Model Providers** trên ứng dụng DeepSeek Ha
 
 ---
 
+## Chạy 2 Agent Song Song (Multi-Instance Isolation)
+
+Bridge hỗ trợ chạy tối đa 2 Agent DSH độc lập cùng lúc từ **cùng một thư mục mã nguồn**, mỗi con dùng một tài khoản Google riêng biệt và một cổng riêng biệt mà không bao giờ xung đột hay lẫn lộn dữ liệu:
+
+### Bảng Định Danh Instance
+
+| ID | Tài khoản | Cổng | Agent DSH | File cấu hình | File session | Log chạy | Nhật ký công việc |
+|---|---|---|---|---|---|---|---|
+| `acc1` | Google A | 10000 | DSH 1 (dự án 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
+| `acc2` | Google B | 10001 | DSH 2 (dự án 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
+| *(default)* | - | 10000 | Đơn lẻ (cũ) | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
+
+### Hướng Dẫn Cấu Hình & Chạy
+
+1. **Tạo 2 file môi trường:**
+   - Copy `.env.example` thành `.env.acc1`:
+     ```ini
+     PORT=10000
+     INSTANCE_LABEL="Frontend"
+     PEER_LANES="acc2=http://127.0.0.1:10001"
+     LANE_ADMIN_TOKEN="<chuỗi ngẫu nhiên dài dùng chung cho cả 2 luồng>"
+     ```
+   - Copy `.env.example` thành `.env.acc2`:
+     ```ini
+     PORT=10001
+     INSTANCE_LABEL="Backend"
+     PEER_LANES="acc1=http://127.0.0.1:10000"
+     LANE_ADMIN_TOKEN="<cùng chuỗi token như ở .env.acc1>"
+     ```
+   - *Tạo token an toàn:* `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+   - *Lưu ý bảo mật:* `LANE_ADMIN_TOKEN` là bí mật xác thực giữa 2 luồng, không commit ra ngoài (tất cả file `.env.*` đã nằm trong `.gitignore`).
+2. **Khởi chạy:**
+   - Nhấp đúp `run_acc1.bat` để chạy con `acc1` (cổng 10000).
+   - Nhấp đúp `run_acc2.bat` để chạy con `acc2` (cổng 10001).
+3. **Cấu hình DeepSeek Harness:**
+   - DSH 1: Base URL `http://127.0.0.1:10000/v1`
+   - DSH 2: Base URL `http://127.0.0.1:10001/v1`
+4. **Theo dõi công việc riêng biệt:**
+   - Nhật ký hoạt động: `http://127.0.0.1:10000/v1/activity` và `http://127.0.0.1:10001/v1/activity`
+   - Dashboard: `http://127.0.0.1:10000/dashboard` và `http://127.0.0.1:10001/dashboard`
+5. **CẢNH BÁO QUAN TRỌNG VỀ TÀI KHOẢN:**
+   - TUYỆT ĐỐI KHÔNG dùng chung cookie giữa 2 instance (nếu dùng chung sẽ cùng vào 1 tài khoản).
+   - `BACKUP_1PSID` của instance này không được trùng với tài khoản của instance kia.
+   - Để lấy cookie: hãy đăng nhập mỗi tài khoản Google trong 1 Profile Chrome (hoặc cửa sổ ẩn danh Incognito) riêng biệt, copy cookie rồi đóng cửa sổ để tránh xoay cookie ngầm.
+   - Kiểm tra hai con có bị trùng tài khoản không bằng cách đối chiếu mã `account_key` tại `http://127.0.0.1:10000/health` và `http://127.0.0.1:10001/health` (2 mã hash 12 ký tự này bắt buộc phải khác nhau).
+
+---
+
 ## Danh Sách Các Endpoint Quản Trị Hỗ Trợ
 
 | Phương thức | Đường dẫn               | Mô tả chức năng                                                                            |
@@ -153,22 +212,88 @@ Vào giao diện **Settings → Model Providers** trên ứng dụng DeepSeek Ha
 | **GET**    | `/v1/models`            | Trả về danh sách model thực tế được phát hiện trên tài khoản Google.                       |
 | **GET**    | `/health`               | Báo cáo chi tiết: Uptime, tổng số request, tỷ lệ lỗi, trạng thái cookie, dung lượng cache.  |
 | **GET**    | `/dashboard`            | Giao diện Web Dashboard điều khiển trực quan.                                              |
+| **GET**    | `/v1/control`           | Lấy trạng thái công tắc API (`off`, `starting`, `on`, `stopping`, `drain_timeout`).        |
+| **POST**   | `/v1/control/enable`    | Bật kết nối Gemini Web & mở nhận request cho Agent.                                       |
+| **POST**   | `/v1/control/disable`   | Tắt kết nối Gemini (chờ request đang chạy xong rồi mới đóng client).                      |
 | **POST**   | `/v1/update-cookies`    | Cập nhật `SECURE_1PSID` và `SECURE_1PSIDTS` mới ngay khi server đang chạy (không cần restart).|
 | **POST**   | `/v1/switch-model`      | Chuyển đổi linh hoạt giữa các model Gemini khả dụng (`gemini-flash`, v.v.).                |
 | **POST**   | `/v1/reset`             | Đóng đoạn chat hiện tại trên Gemini Web và tạo một đoạn chat mới tinh.                      |
 | **POST**   | `/v1/cache/clear`       | Xóa sạch các câu trả lời lưu trong bộ nhớ đệm cache.                                       |
-| **GET**    | `/v1/logs`              | Trích xuất 50 dòng log gần nhất từ `logs/bridge.log`.                                       |
+| **GET**    | `/v1/logs`              | Trích xuất 50 dòng log gần nhất từ file log của instance.                                  |
+| **GET**    | `/v1/activity`          | Nhật ký công việc chi tiết của chính instance (request, tool calls, model, latency).       |
+
+---
+
+## Công Tắc BẬT/TẮT API Trên Dashboard (API Control Switch)
+
+Bridge tích hợp cơ chế kiểm soát kết nối chủ động:
+- **Khởi động ở trạng thái TẮT (mặc định):** Server web và dashboard vẫn hoạt động, nhưng **KHÔNG** kết nối Gemini Web và **KHÔNG** chạy vòng tự làm mới token ngầm (chống hao mòn / quét cookie khi không dùng).
+- **Mỗi Instance một công tắc riêng:** `acc1` trên `:10000/dashboard` và `acc2` trên `:10001/dashboard` có công tắc hoàn toàn độc lập. Trạng thái không lưu ra đĩa (mỗi lần khởi động luôn theo biến `API_START_STATE`).
+
+### Bảng Hành Vi Trạng Thái
+
+| Trạng thái | Kết nối Gemini | /v1/chat/completions | Dashboard, /health, Công tắc |
+|---|---|---|---|
+| `off` | KHÔNG init | HTTP 503 (`code: "bridge_disabled"`) | Sử dụng bình thường |
+| `starting` | Đang init | HTTP 503 (`code: "bridge_disabled"`, đang khởi động) | Sử dụng bình thường |
+| `on` | Đã init | Nhận và xử lý bình thường | Sử dụng bình thường |
+| `stopping` | Đang chờ drain / ngắt | HTTP 503 (`code: "bridge_disabled"`, đang tắt) | Sử dụng bình thường |
+
+### Cấu Hình Liên Quan Trong `.env`
+
+```ini
+# Trạng thái lúc khởi động: off (mặc định) = chờ bấm BẬT trên dashboard; on = tự bật lúc chạy
+API_START_STATE=off
+
+# Số giây tối đa chờ request đang chạy dở hoàn thành khi bấm TẮT (mặc định: 120 giây)
+DISABLE_DRAIN_TIMEOUT=120
+```
+
+### Cơ Chế Draining Khi Bấm TẮT
+1. Request **MỚI** sẽ lập tức bị từ chối với HTTP 503 `bridge_disabled`.
+2. Request **ĐANG CHẠY** được giữ cho chạy tới khi hoàn thành (tối đa `DISABLE_DRAIN_TIMEOUT` giây), sau đó Bridge lưu metadata session và đóng client.
+3. Nếu request chạy quá thời hạn quy định, Bridge sẽ **KHÔNG cắt ngang** (trả HTTP 409 `bridge_control_conflict` và giữ nguyên trạng thái `on` để bảo vệ dữ liệu).
+
+### Dùng Từ Máy Thứ Hai (An Toàn Mạng LAN)
+Khi cần truy cập Bridge hoặc Dashboard từ một máy tính khác trong cùng mạng nội bộ (LAN):
+1. **Thiết lập an toàn bắt buộc:**
+   - Trong file `.env` (hoặc `.env.acc1`, `.env.acc2`), đặt `HOST=0.0.0.0` VÀ BẮT BUỘC ĐẶT `API_KEY`:
+     ```ini
+     HOST=0.0.0.0
+     API_KEY=chuỗi_khóa_bí_mật_tự_chọn
+     ```
+   - *Cơ chế phòng thủ:* Nếu đặt `HOST=0.0.0.0` mà `API_KEY` để trống, Bridge sẽ **TỪ CHỐI KHỞI ĐỘNG** (thoát mã lỗi 1) để bảo vệ tài khoản Google của bạn khỏi truy cập trái phép từ các thiết bị khác trong mạng (trừ khi cố ý đặt `ALLOW_INSECURE_LAN=true`).
+2. **Tạo luật Windows Firewall giới hạn địa chỉ IP:**
+   Khuyến nghị chỉ cho phép IP cụ thể của máy thứ hai truy cập vào các cổng 10000/10001 (chạy trong PowerShell với quyền Administrator):
+   ```powershell
+   New-NetFirewallRule -DisplayName "DSH Bridge" -Direction Inbound -LocalPort 10000,10001 -Protocol TCP -RemoteAddress <IP_MÁY_2> -Action Allow
+   ```
+3. **Lưu ý bảo mật đường truyền:**
+   - Kết nối trên mạng LAN sử dụng giao thức HTTP thông thường (chưa mã hóa TLS/HTTPS), do đó API Key có thể bị nghe lén nếu kết nối qua mạng Wi-Fi không tin cậy. Chỉ nên sử dụng tính năng này trên mạng gia đình hoặc văn phòng tin cậy.
 
 ---
 
 ## Xử Lý Sự Cố Thường Gặp (Troubleshooting)
 
-1. **Lỗi `[CONFIG ERROR] SECURE_1PSID is empty!` khi khởi động:**
+0. **Agent nhận mã lỗi HTTP 503 `bridge_disabled`:**
+   * **Triệu chứng:** Agent thông báo `Bridge đang TẮT. Hãy bật ở dashboard rồi thử lại.`
+   * **Cách xử lý:** Mở Dashboard của instance tương ứng (`http://127.0.0.1:10000/dashboard` cho con 1 hoặc `:10001/dashboard` cho con 2) và bấm nút **BẬT**. Sau khi trạng thái chuyển sang màu xanh **BẬT**, gửi lại prompt trên Agent.
+
+1. **Xử lý khi bridge rơi vào Guest mode (Chưa đăng nhập):**
+   * **Triệu chứng:** Dashboard hiển thị huy hiệu `GUEST (CHƯA ĐĂNG NHẬP)` màu đỏ, request API từ Agent trả về HTTP 503 với mã lỗi `{"error": {"code": "gemini_not_authenticated", "message": "Gemini chưa đăng nhập..."}}`.
+   * **Nguyên nhân:** Cookie `SECURE_1PSID` hoặc `SECURE_1PSIDTS` đã hết hạn hoặc bị Google thu hồi (khi bạn đăng xuất trình duyệt hoặc đổi IP/đăng nhập từ thiết bị khác). Thư viện `gemini-webapi` 2.x có cơ chế tự động fallback về phiên Guest, nhưng Bridge đã chủ động chặn đứng phiên Guest để không làm hỏng dữ liệu chat và không mất tính năng Gemini Pro.
+   * **Cách xử lý:**
+     1. Mở trình duyệt Chrome → truy cập [https://gemini.google.com](https://gemini.google.com) → đảm bảo đang đăng nhập tài khoản Google của bạn.
+     2. Bấm `F12` → tab **Application** (hoặc Lưu trữ) → **Storage** → **Cookies** → `https://gemini.google.com`.
+     3. Sao chép giá trị của 2 cookie: `__Secure-1PSID` và `__Secure-1PSIDTS`.
+     4. Mở Dashboard Bridge (`http://127.0.0.1:10000/dashboard`) → dán vào thẻ **Quản Lý Cookie (Hot-Reload)** → bấm **Lưu & Cập Nhật**. Hoặc gửi API `POST /v1/update-cookies`. Cookie sẽ được nạp ngay mà không cần khởi động lại server.
+
+2. **Lỗi `[CONFIG ERROR] SECURE_1PSID is empty!` khi khởi động:**
    * Bạn chưa tạo tệp `.env` hoặc chưa điền cookie. Hãy sao chép từ `.env.example` sang `.env` và điền giá trị.
-2. **Cảnh báo `COOKIE CÓ THỂ HẾT HẠN!` trong Logs:**
+3. **Cảnh báo `COOKIE CÓ THỂ HẾT HẠN!` trong Logs:**
    * Cookie phiên làm việc trên trình duyệt của bạn đã hết hạn. Mở lại trình duyệt Google Gemini, lấy lại 2 chuỗi cookie mới và gửi qua giao diện Dashboard hoặc lệnh:
      ```bash
      curl -X POST http://127.0.0.1:10000/v1/update-cookies -H "Content-Type: application/json" -d "{\"SECURE_1PSID\":\"...\",\"SECURE_1PSIDTS\":\"...\"}"
      ```
-3. **Agent báo lỗi `missing required property` khi gọi Tool:**
+4. **Agent báo lỗi `missing required property` khi gọi Tool:**
    * Cơ chế `Auto-Mapper` trong `app/tool_parser.py` sẽ tự động bổ sung và chuẩn hóa tên tham số (`path` → `file_path`, `cmd` → `command`). Nếu có custom tool mới, bạn có thể bổ sung quy tắc ánh xạ vào hàm `normalize_tool_arguments()`.

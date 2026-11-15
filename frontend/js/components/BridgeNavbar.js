@@ -1,9 +1,11 @@
 import { store } from "../state.js";
 import { t } from "../i18n.js";
+import { getStoredApiKey, clearStoredApiKey } from "../api.js";
 
 /**
  * <bridge-navbar> Component
- * Top Bar, Language Toggle (EN/VI), Theme Toggle (Dark/Light), Ping Latency
+ * Top Bar: Brand, Language (EN/VI), Theme (Dark/Light), Server Health Badge, Refresh, Forget Key.
+ * (Nút BẬT/TẮT chung đã chuyển sang BridgeLanes theo từng luồng).
  */
 export class BridgeNavbar extends HTMLElement {
   connectedCallback() {
@@ -11,20 +13,18 @@ export class BridgeNavbar extends HTMLElement {
     this.setupEvents();
 
     this.unsubscribe = store.subscribe((state, prevState) => {
-      // Re-render navbar if lang or theme changed
-      if (!prevState || state.lang !== prevState.lang || state.theme !== prevState.theme) {
+      if (
+        !prevState ||
+        state.lang !== prevState.lang ||
+        state.theme !== prevState.theme ||
+        (state.latency >= 0) !== (prevState.latency >= 0)
+      ) {
         this.render();
         this.setupEvents();
-      }
-
-      const latencyEl = this.querySelector("#nav-latency");
-      if (latencyEl) {
-        if (state.latency > 0) {
+      } else {
+        const latencyEl = this.querySelector("#nav-latency");
+        if (latencyEl && state.latency >= 0) {
           latencyEl.innerText = `${state.latency} ms`;
-          latencyEl.style.color = state.latency < 100 ? "var(--status-success)" : "var(--status-warning)";
-        } else {
-          latencyEl.innerText = t("offline", state.lang);
-          latencyEl.style.color = "var(--status-danger)";
         }
       }
     });
@@ -37,6 +37,7 @@ export class BridgeNavbar extends HTMLElement {
   render() {
     const { lang, theme, latency } = store.getState();
     const isDark = theme === "dark";
+    const isOnline = latency >= 0;
 
     this.innerHTML = `
       <header class="top-nav">
@@ -56,6 +57,24 @@ export class BridgeNavbar extends HTMLElement {
         </div>
 
         <div class="nav-actions">
+          <!-- Server Health Badge: ● Server OK / ✕ Mất liên lạc với server -->
+          ${
+            isOnline
+              ? `
+            <div class="server-status-pill ok" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#10b981;">
+              <span class="pulse-dot" style="background:#10b981;"></span>
+              <span>${t("serverOk", lang)}</span>
+              <span id="nav-latency" style="font-size:11px; opacity:0.8; font-family:var(--font-mono);">${latency > 0 ? latency + " ms" : ""}</span>
+            </div>
+          `
+              : `
+            <div class="server-status-pill error" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#ef4444;">
+              <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ef4444;"></span>
+              <span>${t("serverLost", lang)}</span>
+            </div>
+          `
+          }
+
           <!-- Language Switcher Pill -->
           <div class="toggle-pill-group">
             <button class="toggle-pill-btn ${lang === "vi" ? "active" : ""}" id="btn-lang-vi" title="Tiếng Việt">🇻🇳 VI</button>
@@ -71,24 +90,33 @@ export class BridgeNavbar extends HTMLElement {
             }
           </button>
 
-          <!-- Ping Latency Indicator -->
-          <div class="latency-indicator" title="API Ping Latency">
-            <span class="pulse-dot"></span>
-            <span id="nav-latency">${latency > 0 ? latency + " ms" : t("offline", lang)}</span>
-          </div>
-
           <!-- Manual Refresh Button -->
           <button class="btn btn-secondary btn-icon" id="nav-refresh-btn" title="${t("refreshData", lang)} (Ctrl+R)">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
             </svg>
           </button>
+
+          ${
+            getStoredApiKey()
+              ? `
+          <button class="btn btn-secondary" id="nav-forget-key-btn" title="${t("forgetKey", lang)}" style="font-size: 11px; padding: 4px 8px; color: var(--status-warning, #f59e0b);">
+            🔑 ${t("forgetKey", lang)}
+          </button>`
+              : ""
+          }
         </div>
       </header>
     `;
   }
 
   setupEvents() {
+    this.querySelector("#nav-forget-key-btn")?.addEventListener("click", () => {
+      clearStoredApiKey();
+      store.notifyToast(t("accessKeyCleared", store.getState().lang), "info");
+      setTimeout(() => window.location.reload(), 400);
+    });
+
     this.querySelector("#btn-lang-vi")?.addEventListener("click", () => {
       store.setState({ lang: "vi" });
       store.notifyToast("Đã đổi ngôn ngữ sang Tiếng Việt", "info");
@@ -107,7 +135,7 @@ export class BridgeNavbar extends HTMLElement {
     });
 
     this.querySelector("#nav-refresh-btn")?.addEventListener("click", () => {
-      this.dispatchEvent(new CustomEvent("refresh-request", { bubbles: true }));
+      window.dispatchEvent(new CustomEvent("refresh-request"));
       store.notifyToast(t("refreshing", store.getState().lang), "info", 1500);
     });
   }

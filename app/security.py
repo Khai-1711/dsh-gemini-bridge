@@ -3,6 +3,12 @@ import re
 from app.config import DEFAULT_PROJECT_DIR, logger
 
 
+_SYSTEM_DIR_RE = re.compile(
+    r"^[A-Z]:\\(WINDOWS|PROGRAM FILES( \(X86\))?|PROGRAMDATA)(\\|$)",
+    re.IGNORECASE,
+)
+
+
 def is_safe_path_no_c_drive(path_str: str) -> bool:
     """
     Kiểm tra đường dẫn: Tuyệt đối cấm trỏ vào ổ C:\\ hoặc thư mục hệ thống.
@@ -12,18 +18,19 @@ def is_safe_path_no_c_drive(path_str: str) -> bool:
         return True
 
     try:
-        resolved = os.path.realpath(os.path.abspath(path_str)).upper()
+        clean_path = path_str.strip()
+        if not re.match(r"^[A-Za-z]:", clean_path) and not clean_path.startswith(("\\", "/")):
+            target = os.path.join(DEFAULT_PROJECT_DIR, clean_path)
+        else:
+            target = clean_path
+        resolved = os.path.realpath(os.path.abspath(target)).upper()
     except Exception:
         return False
 
     if resolved.startswith("C:") or resolved.startswith("\\\\"):
         return False
 
-    forbidden_segments = (
-        "\\WINDOWS", "\\SYSTEM32", "\\PROGRAM FILES",
-        "\\PROGRAM FILES (X86)", "\\PROGRAMDATA", "\\USERS\\",
-    )
-    if any(seg in resolved for seg in forbidden_segments):
+    if _SYSTEM_DIR_RE.search(resolved):
         return False
 
     return True
@@ -57,7 +64,7 @@ def sanitize_shell_command_no_c_drive(cmd: str) -> str:
         # === Backtick escape bypass ===
         r"C``:\\",
         # === Lệnh nguy hiểm cấp hệ thống ===
-        r"\bformat\b",
+        r"\bformat(\.com)?\s+[a-z]:",
         r"\bdiskpart\b",
         r"\bbcdedit\b",
         r"\breg\s+(add|delete|import|save|export|query)",

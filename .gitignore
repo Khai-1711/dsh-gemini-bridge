@@ -1,5 +1,7 @@
 # Secrets — never commit
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -9,3 +11,13 @@ __pycache__/
 # Runtime artifacts
 logs/
 .bridge_session.json
+.bridge_session_*.json
+
+# Cookie cache của gemini-webapi (BÍ MẬT)
+.gemini_cookies/
+.gemini_cookies_*/
+
+# Quota & Accounts
+.bridge_accounts*.json
+.bridge_chain*.json
+handoff/

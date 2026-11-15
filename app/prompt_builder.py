@@ -6,7 +6,7 @@ from app.vision import extract_text_and_images
 
 def smart_truncate(text: str, max_chars: int = None) -> str:
     """
-    Cắt ngắn thông minh: Giữ đầu + cuối + ưu tiên giữ các dòng chứa lỗi/warning quan trọng.
+    Cắt ngắn thông minh: Giữ đầu + cuối + ưu tiên giữ các dòng chứa lỗi quan trọng ở giữa.
     Khắc phục việc cắt cứng làm mất stack trace ở giữa.
     """
     if max_chars is None:
@@ -14,19 +14,24 @@ def smart_truncate(text: str, max_chars: int = None) -> str:
     if len(text) <= max_chars:
         return text
 
-    # Thu thập các dòng chứa thông tin lỗi quan trọng
+    # Tính toán ước lượng vị trí phần giữa
+    pre_remaining = max(0, max_chars - 100)
+    pre_head = pre_remaining * 2 // 3
+    pre_tail = pre_remaining - pre_head
+    middle = text[pre_head : len(text) - pre_tail if pre_tail > 0 else len(text)]
+
+    # Thu thập các dòng chứa thông tin lỗi quan trọng chỉ từ PHẦN GIỮA
     error_keywords = [
-        "error", "exception", "traceback", "failed", "fail",
+        "error", "exception", "traceback",
         "typeerror", "syntaxerror", "valueerror", "keyerror",
         "importerror", "modulenotfounderror", "attributeerror",
         "runtimeerror", "filenotfounderror", "permissionerror",
         "referenceerror", "nameerror", "indexerror", "oserror",
-        "warning", "warn", "critical", "fatal",
-        "❌", "✗", "FAILED", "ERR", "denied", "refused",
-        "at line", "line ", "column ",
+        "critical", "fatal", "denied", "refused",
+        "❌", "✗", "FAILED", "ERR",
     ]
     important_lines = []
-    for line in text.splitlines():
+    for line in middle.splitlines():
         line_lower = line.lower()
         if any(kw in line_lower for kw in error_keywords):
             important_lines.append(line)
@@ -48,7 +53,9 @@ def smart_truncate(text: str, max_chars: int = None) -> str:
             "\n\n...[TRUNCATED — KEY ERRORS/WARNINGS PRESERVED BELOW]...\n"
             + error_block
         )
-    parts.append("\n...[END TRUNCATED]...\n" + text[-tail:])
+    parts.append("\n...[END TRUNCATED]...\n")
+    if tail > 0:
+        parts.append(text[-tail:])
 
     return "".join(parts)
 
@@ -129,10 +136,9 @@ def build_incremental_prompt_and_files(
         content_str, img_paths = extract_text_and_images(m.get("content"))
         all_images.extend(img_paths)
 
-        # Smart truncation thay vì cắt cứng
-        content_str = smart_truncate(content_str)
-
         if role == "tool":
+            # Smart truncation chỉ áp dụng cho kết quả công cụ
+            content_str = smart_truncate(content_str)
             tool_id = m.get("name") or m.get("tool_call_id") or "tool"
             blocks.append(
                 f"[TOOL_RESULT ({tool_id})]:\n{content_str}\n\n"

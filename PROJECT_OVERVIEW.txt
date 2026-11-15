@@ -1,0 +1,170 @@
+================================================================================
+           DSH GEMINI AGENT BRIDGE (v3.0 - ENTERPRISE MODULAR EDITION)
+             TỔNG QUAN, KIẾN TRÚC & HƯỚNG DẪN CHI TIẾT DỰ ÁN
+================================================================================
+
+1. DỰ ÁN NÀY LÀ GÌ? (WHAT IS IT?)
+--------------------------------------------------------------------------------
+DSH Gemini Agent Bridge là một phần mềm trung gian (Middleware / Reverse Proxy) 
+chuyên dụng, có nhiệm vụ "phiên dịch" giao diện web Google Gemini Web thành một 
+máy chủ chuẩn OpenAI API (/v1/chat/completions).
+
+Nhờ cầu nối này, các công cụ lập trình tự động (Coding Agents) chuẩn OpenAI như:
+- DeepSeek Harness (pi-ai)
+- Cline / Roo Code
+- Cursor / Continue / Aider
+có thể kết nối trực tiếp vào tài khoản Google Gemini Web để đọc hiểu mã nguồn, 
+chạy lệnh terminal, tạo/sửa file và giải quyết bài toán lập trình phức tạp mà 
+KHÔNG CẦN mua API Key trả phí theo token thương mại.
+
+
+2. VẤN ĐỀ CỐT LÕI MÀ DỰ ÁN GIẢI QUYẾT (WHY?)
+--------------------------------------------------------------------------------
+1. Tiết kiệm chi phí API:
+   Tận dụng trực tiếp hạn mức từ tài khoản Google Gemini Web cá nhân (bao gồm cả 
+   tài khoản miễn phí và gói Google Advanced / Gemini Pro/Ultra).
+
+2. Chuẩn hóa giao thức OpenAI:
+   Google Gemini Web không có API mở chuẩn OpenAI và không hỗ trợ gọi hàm tự động 
+   (Function Calling). Bridge đứng giữa để dịch hai chiều:
+   - OpenAI Request  --> System Prompt + XML Tool Schema --> Gemini Web
+   - Gemini Response --> Trích xuất thẻ XML <tool_call>  --> OpenAI Tool Calls
+
+3. Chống khóa tài khoản & Zero-Spam:
+   Nếu mỗi câu lệnh của Agent tạo ra 1 đoạn chat mới trên web, Google sẽ phát hiện 
+   hành vi bất thường và khóa tài khoản vì spam. Bridge gom toàn bộ chuỗi hàng chục 
+   lượt thực thi của Agent vào ĐÚNG 1 ĐOẠN CHAT DUY NHẤT.
+
+
+3. KIẾN TRÚC & LUỒNG HOẠT ĐỘNG (WORKFLOW ARCHITECTURE)
+--------------------------------------------------------------------------------
+[Coding Agent: DeepSeek Harness / Cline]
+       │
+       ▼ (1) Gửi POST /v1/chat/completions (OpenAI format + Tools)
+[DSH Gemini Bridge: FastAPI Server]
+       │
+       ├─► [Prompt Builder]: Cắt tỉa thông minh (Smart Truncate), giữ nguyên stack trace lỗi
+       ├─► [Tool Parser]: Biên dịch danh sách tool thành System Prompt hướng dẫn
+       ├─► [Delta Extractor]: Chỉ gửi phần tin nhắn phát sinh mới vào phiên chat
+       │
+       ▼ (2) Gửi tin nhắn qua gemini_webapi
+[Google Gemini Web: Single ChatSession]
+       │
+       ▼ (3) Trả về văn bản phản hồi kèm thẻ XML: <tool_call>{...}</tool_call>
+[DSH Gemini Bridge: Streaming & Parser]
+       │
+       ├─► [Tool Parser]: Bóc tách XML sang JSON tool_calls chuẩn OpenAI
+       ├─► [Auto-Mapper]: Tự sửa lỗi tên tham số (path -> file_path, cmd -> command)
+       ├─► [Streamer]: Phát xung Heartbeat keep-alive (2.5s) chống treo timeout
+       │
+       ▼ (4) Trả về JSON hoàn chỉnh hoặc luồng SSE chunks
+[Coding Agent: Thực thi lệnh và gửi kết quả lượt tiếp theo]
+
+
+4. CÁC TÍNH NĂNG & ĐIỂM NHẤN CÔNG NGHỆ (V3.0)
+--------------------------------------------------------------------------------
+1. Stateful Single-Session & Khôi phục phiên bền bỉ:
+   - Lưu session metadata vào .bridge_session.json.
+   - Khi restart server, tự động resume phiên chat cũ.
+   - Tự động phát hiện lượt đầu tiên sau resume để gửi lại Header danh sách Tool 
+     (~9.400 ký tự), giúp Gemini không bao giờ bị "quên" công cụ Read/Glob/Grep/Pwsh.
+
+2. Luồng Streaming SSE có Heartbeat chống Timeout:
+   - Phát nhịp định kỳ ": keep-alive\n\n" mỗi 2.5 giây.
+   - Triệt tiêu hoàn toàn lỗi client bị ngắt kết nối do idle timeout khi model suy nghĩ lâu.
+   - Che giấu các thẻ XML thô, người dùng chỉ nhìn thấy nội dung văn bản giải thích.
+
+3. Tường lửa ổ đĩa & Sandbox nghiêm ngặt (Path & Shell Jail):
+   - Tuyệt đối cấm Agent truy cập, đọc hoặc sửa ổ hệ thống C:\ (Windows, System32, Users).
+   - Mọi thao tác chỉ được phép diễn ra trên ổ dữ liệu an toàn (mặc định ổ D:\).
+   - Kiểm duyệt lệnh PowerShell (Pwsh): Chặn các lệnh xóa nguy hiểm, format, can thiệp 
+     Registry hay leo thang đặc quyền.
+
+4. Tầng thị giác 3 lớp (3-Tier Multimodal Vision Pipeline):
+   - Tầng 1: Nén ảnh Base64 (JPEG Pillow) và upload trực tiếp qua Native Gemini Web.
+   - Tầng 2: Nếu upload Google lỗi, tự động fallback sang bộ 3 Engine OCR cục bộ:
+             RapidOCR (ONNX) -> Windows 11 Native WinRT OCR -> Tesseract OCR.
+   - Tầng 3: Trích xuất nội dung văn bản trong ảnh và gửi vào luồng text thông thường.
+
+5. Cookie Failover Pool & Hot-Reload:
+   - Hỗ trợ tài khoản Google dự phòng (BACKUP_1PSID / BACKUP_1PSIDTS). Tự chuyển khi 
+     tài khoản chính hết hạn.
+   - Hỗ trợ cập nhật Cookie trực tiếp qua API POST /v1/update-cookies mà không cần tắt server.
+
+6. Web Dashboard chuẩn Web Components:
+   - Địa chỉ: http://127.0.0.1:10000/dashboard
+   - Xây dựng 100% bằng W3C Custom Elements & ES Modules (không cần cài Node.js hay build).
+   - Hỗ trợ chế độ Sáng / Tối (Dark / Light mode).
+   - Hỗ trợ Song ngữ tùy chọn: Tiếng Anh (EN) và Tiếng Việt (VI).
+   - Xem nhật ký hệ thống (Terminal logs) trực tiếp theo thời gian thực.
+
+
+5. CẤU TRÚC THƯ MỤC MÃ NGUỒN (PROJECT STRUCTURE)
+--------------------------------------------------------------------------------
+dsh_gemini_bridge/
+├── app/                          # Core Modules Backend
+│   ├── __init__.py               # Khởi tạo gói ứng dụng (v3.0.0)
+│   ├── config.py                 # Nạp .env, kiểm tra tham số, Rotating Logger
+│   ├── security.py               # Tường lửa ổ C:\ (Path Jail & Shell Filter)
+│   ├── vision.py                 # Xử lý ảnh đa tầng & Bộ 3 Engine OCR Fallback
+│   ├── prompt_builder.py         # Nạp tool schema, Smart Truncation, Language Match
+│   ├── tool_parser.py            # Bóc tách <tool_call> XML & Auto-Mapper tham số
+│   ├── streaming.py              # Xử lý luồng SSE & Che giấu tag tool khi stream
+│   └── gemini_session.py         # Quản lý ChatSession, Lock Timeout, Failover, Cache
+├── frontend/                     # Giao diện Web Dashboard (W3C Web Components)
+│   ├── index.html                # Cấu trúc HTML ngữ nghĩa tinh gọn
+│   ├── css/
+│   │   ├── variables.css         # Design tokens, màu sắc Dark/Light mode
+│   │   ├── terminal.css          # Giao diện màn hình dòng lệnh console
+│   │   └── main.css              # Layout chính của Dashboard
+│   └── js/
+│       ├── api.js                # API Client Service
+│       ├── state.js              # Quản lý trạng thái tập trung (Reactive Store)
+│       ├── i18n.js               # Từ điển song ngữ Anh - Việt
+│       ├── app.js                # Khởi động Dashboard
+│       └── components/           # Các Custom Web Components độc lập
+│           ├── BridgeNavbar.js        # Thanh điều hướng, đổi theme & ngôn ngữ
+│           ├── BridgeMetrics.js       # Thẻ đo lường Uptime, Requests, Lỗi
+│           ├── BridgeTerminal.js      # Console hiển thị logs theo thời gian thực
+│           ├── BridgeModelSwitch.js   # Đổi model Gemini trực tiếp
+│           ├── BridgeCookieManager.js # Nạp nóng Cookie bảo mật
+│           ├── BridgeQuickActions.js  # Nút Reset session & Xóa cache
+│           └── BridgeToast.js         # Hệ thống thông báo nổi
+├── logs/                         # Thư mục lưu nhật ký tự động (5MB x 3 file xoay vòng)
+├── tests/                        # Bộ kiểm thử tự động (Unit Tests)
+│   ├── test_core.py              # Test bảo mật, prompt builder và tool parser
+│   └── test_streaming.py         # Test streamer SSE và che giấu tag tool
+├── main.py                       # FastAPI Server chính & Cổng OpenAI API
+├── requirements.txt              # Danh sách thư viện phụ thuộc
+├── .env.example                  # File cấu hình mẫu
+├── ARCHITECTURE.md               # Bản thiết kế kiến trúc chi tiết (English)
+├── ARCHITECTURE_VI.md            # Bản thiết kế kiến trúc chi tiết (Tiếng Việt)
+├── README.md                     # Hướng dẫn cài đặt & vận hành (English)
+└── README_VI.md                  # Hướng dẫn cài đặt & vận hành (Tiếng Việt)
+
+
+6. HƯỚNG DẪN CÀI ĐẶT & KHỞI CHẠY NHANH
+--------------------------------------------------------------------------------
+Bước 1: Cài đặt thư viện:
+   pip install -r requirements.txt
+
+Bước 2: Cấu hình tệp .env:
+   Copy .env.example thành .env và điền cookie Google Gemini:
+   SECURE_1PSID="g.a000..."
+   SECURE_1PSIDTS="sidts-..."
+   HOST="127.0.0.1"
+   PORT="10000"
+   DEFAULT_PROJECT_DIR="D:\ABC"
+
+Bước 3: Khởi chạy Bridge Server:
+   python main.py
+
+Bước 4: Cấu hình vào DeepSeek Harness (pi-ai) / Cline:
+   - Protocol: OpenAI Chat Completions
+   - Base URL: http://127.0.0.1:10000/v1
+   - Model ID: gemini-flash (hoặc gemini-pro)
+   - API Key: Điền bất kỳ (hoặc khớp với API_KEY trong .env)
+
+Bước 5: Truy cập Web Dashboard:
+   http://127.0.0.1:10000/dashboard
+================================================================================

@@ -7,6 +7,8 @@
   --bg-primary: #07090e;
   --bg-secondary: #0d111a;
   --bg-surface: #131926;
+  --bg-card: #131926;
+  --bg-card-sub: #182030;
   --bg-surface-hover: #182030;
   --bg-surface-active: #1e283d;
 
@@ -51,6 +53,8 @@
   --bg-primary: #f8fafc;
   --bg-secondary: #f1f5f9;
   --bg-surface: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-sub: #f1f5f9;
   --bg-surface-hover: #f8fafc;
   --bg-surface-active: #e2e8f0;
 

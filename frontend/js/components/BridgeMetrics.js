@@ -1,17 +1,23 @@
 import { store } from "../state.js";
 import { t } from "../i18n.js";
+import { displayName } from "../lane-name.js";
 
 /**
- * <bridge-metrics> Component
- * Displays the 4 real-time telemetry cards with i18n support
+ * <bridge-metrics> Component (T40D)
+ * Displays the 4 real-time telemetry cards routed to selectedLane.
+ * Không in lặp tên hay default trong tiêu đề viết hoa.
  */
 export class BridgeMetrics extends HTMLElement {
   connectedCallback() {
     this.render();
 
     this.unsubscribe = store.subscribe((state, prevState) => {
-      // Re-render if language changed
-      if (prevState && state.lang !== prevState.lang) {
+      if (!prevState) return;
+
+      const langChanged = state.lang !== prevState.lang;
+      const selectedLaneChanged = state.selectedLane !== prevState.selectedLane;
+
+      if (langChanged || selectedLaneChanged) {
         this.render();
       } else {
         this.updateValues(state);
@@ -23,8 +29,25 @@ export class BridgeMetrics extends HTMLElement {
     if (this.unsubscribe) this.unsubscribe();
   }
 
+  getCurrentLane(state) {
+    const lanes = state.lanes || [];
+    const sel = state.selectedLane;
+    return lanes.find((l) => l.id === sel) || lanes[0] || {};
+  }
+
   render() {
-    const { lang } = store.getState();
+    const state = store.getState();
+    const { lang, lanes } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+
+    const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
+    const showLaneTag = Array.isArray(lanes) && lanes.length >= 2;
+    const laneTagHtml = showLaneTag
+      ? `<span class="badge-tag badge-cyan" style="text-transform:none; font-weight:600; font-size:10px; margin-left:6px;">${displayName(laneId, lane.label, flowNum, lang)}</span>`
+      : "";
+
+    const cacheOn = Boolean(lane.cache_enabled);
 
     this.innerHTML = `
       <section class="metrics-grid">
@@ -32,18 +55,19 @@ export class BridgeMetrics extends HTMLElement {
         <div class="metric-card" style="--card-accent: var(--accent-cyan);">
           <div class="metric-header">
             <span class="metric-label">${t("activeModel", lang)}</span>
-            <span class="metric-icon">
+            ${laneTagHtml}
+            <span class="metric-icon" style="margin-left: auto;">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3"/></svg>
             </span>
           </div>
           <div class="metric-value" id="m-model">--</div>
-          <div class="metric-sub">
-            <span class="badge-tag badge-cyan">${t("sessionReady", lang)}</span>
+          <div class="metric-sub" style="flex-wrap: wrap; gap: 4px;">
+            <span class="badge-tag" id="m-auth-badge" style="background: var(--bg-card-sub, #182030); color: var(--text-muted, #9ca3af);">${t("notConnected", lang)}</span>
             <span id="m-turns">${t("turn", lang)}: 0</span>
           </div>
         </div>
 
-        <!-- Card 2: Throughput & Health -->
+        <!-- Card 2: Requests & Errors -->
         <div class="metric-card" style="--card-accent: var(--status-success);">
           <div class="metric-header">
             <span class="metric-label">${t("requestsAndHealth", lang)}</span>
@@ -61,7 +85,7 @@ export class BridgeMetrics extends HTMLElement {
           </div>
         </div>
 
-        <!-- Card 3: Uptime -->
+        <!-- Card 3: Uptime & Active Account -->
         <div class="metric-card" style="--card-accent: var(--accent-indigo);">
           <div class="metric-header">
             <span class="metric-label">${t("uptimeAndSession", lang)}</span>
@@ -71,12 +95,12 @@ export class BridgeMetrics extends HTMLElement {
           </div>
           <div class="metric-value" id="m-uptime">0h 0m 0s</div>
           <div class="metric-sub">
-            <span class="badge-tag badge-success">${t("statefulDelta", lang)}</span>
-            <span id="m-backup">${t("primaryCookie", lang)}</span>
+            <span class="badge-tag badge-success">${lang === "vi" ? "Gửi phần mới (delta)" : "Stateful Delta"}</span>
+            <span id="m-backup">--</span>
           </div>
         </div>
 
-        <!-- Card 4: Response Cache -->
+        <!-- Card 4: Response Cache (Chân thực theo cấu hình) -->
         <div class="metric-card" style="--card-accent: var(--status-warning);">
           <div class="metric-header">
             <span class="metric-label">${t("promptCache", lang)}</span>
@@ -85,23 +109,29 @@ export class BridgeMetrics extends HTMLElement {
             </span>
           </div>
           <div class="metric-value">
-            <span id="m-cache">0</span>
-            <span style="font-size: 13px; font-weight: normal; color: var(--text-muted);">${t("cached", lang)}</span>
+            <span id="m-cache">${cacheOn ? "0" : "--"}</span>
+            <span style="font-size: 13px; font-weight: normal; color: var(--text-muted);">${cacheOn ? t("cached", lang) : ""}</span>
           </div>
           <div class="metric-sub">
-            <span class="badge-tag badge-warning">${t("ttlNote", lang)}</span>
-            <span>${t("latencySaved", lang)}</span>
+            ${
+              cacheOn
+                ? `<span class="badge-tag badge-warning">Cache: BẬT - TTL 5p</span>`
+                : `<span class="badge-tag" style="background: var(--bg-card-sub, #182030); color: var(--text-muted, #9ca3af);">${lang === "vi" ? "Cache: TẮT" : "Cache: OFF"}</span>`
+            }
           </div>
         </div>
       </section>
     `;
 
-    this.updateValues(store.getState());
+    this.updateValues(state);
   }
 
   updateValues(state) {
     const { lang } = state;
+    const lane = this.getCurrentLane(state);
+
     const mModel = this.querySelector("#m-model");
+    const mAuthBadge = this.querySelector("#m-auth-badge");
     const mTurns = this.querySelector("#m-turns");
     const mRequests = this.querySelector("#m-requests");
     const mErrRate = this.querySelector("#m-err-rate");
@@ -110,20 +140,62 @@ export class BridgeMetrics extends HTMLElement {
     const mBackup = this.querySelector("#m-backup");
     const mCache = this.querySelector("#m-cache");
 
-    if (mModel) mModel.innerText = state.model;
-    if (mTurns) mTurns.innerText = `${t("turn", lang)}: ${state.turnCount}`;
-    if (mRequests) mRequests.innerText = state.totalRequests;
-    if (mErrRate) {
-      mErrRate.innerText = `${state.errorRate} ${t("errorRate", lang)}`;
-      mErrRate.className = `badge-tag ${parseFloat(state.errorRate) > 5 ? "badge-warning" : "badge-success"}`;
+    if (mModel) {
+      mModel.innerText = lane.model || "unspecified";
     }
-    if (mErrCount) mErrCount.innerText = `${state.totalErrors} ${t("failures", lang)}`;
-    if (mUptime) mUptime.innerText = state.uptime;
-    if (mCache) mCache.innerText = state.cacheEntries;
+
+    if (mTurns) {
+      mTurns.innerText = `${t("turn", lang)}: ${state.turnCount || 0}`;
+    }
+
+    if (mAuthBadge) {
+      if (lane.control !== "on") {
+        mAuthBadge.innerText = t("notConnected", lang);
+        mAuthBadge.className = "badge-tag";
+        mAuthBadge.style.background = "var(--bg-card-sub, #182030)";
+        mAuthBadge.style.color = "var(--text-muted, #9ca3af)";
+      } else if (!lane.auth_ok) {
+        mAuthBadge.innerText = t("authGuest", lang);
+        mAuthBadge.className = "badge-tag";
+        mAuthBadge.style.background = "var(--status-warning, #f59e0b)";
+        mAuthBadge.style.color = "#000000";
+      } else {
+        mAuthBadge.innerText = t("authOk", lang);
+        mAuthBadge.className = "badge-tag badge-success";
+        mAuthBadge.style.background = "";
+        mAuthBadge.style.color = "";
+      }
+    }
+
+    const reqs = lane.requests || 0;
+    const errs = lane.errors || 0;
+    const rateStr = reqs > 0 ? ((errs / reqs) * 100).toFixed(1) + "%" : "0.0%";
+
+    if (mRequests) mRequests.innerText = reqs;
+    if (mErrRate) {
+      mErrRate.innerText = `${rateStr} ${t("errorRate", lang)}`;
+      mErrRate.className = `badge-tag ${parseFloat(rateStr) > 5 ? "badge-warning" : "badge-success"}`;
+    }
+    if (mErrCount) mErrCount.innerText = `${errs} ${t("failures", lang)}`;
+
+    if (mUptime) {
+      const upSecs = lane.uptime_s || 0;
+      const h = Math.floor(upSecs / 3600);
+      const m = Math.floor((upSecs % 3600) / 60);
+      const s = upSecs % 60;
+      mUptime.innerText = `${h}h ${m}m ${s}s`;
+    }
 
     if (mBackup) {
-      mBackup.innerText = state.usingBackup ? t("backupCookie", lang) : t("primaryCookie", lang);
-      mBackup.style.color = state.usingBackup ? "var(--status-warning)" : "var(--text-secondary)";
+      const activeObj = lane.active_account || {};
+      const accLabel = activeObj.label || "chinh";
+      const accIdx = (activeObj.index !== undefined ? activeObj.index : 0) + 1;
+      const accTotal = activeObj.total || 1;
+      mBackup.innerText = `${accLabel} (${accIdx}/${accTotal})`;
+    }
+
+    if (mCache && Boolean(lane.cache_enabled)) {
+      mCache.innerText = state.cacheEntries || 0;
     }
   }
 }

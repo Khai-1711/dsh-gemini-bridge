@@ -1,9 +1,13 @@
+// Quy tắc: Poll không được render lại ô nhập/chọn
 import { store } from "../state.js";
 import { t } from "../i18n.js";
+import { displayName } from "../lane-name.js";
 
 /**
- * <bridge-terminal> Component
- * Live Log Explorer with Filtering, Search Highlighting, Copy & Clear + i18n
+ * <bridge-terminal> Component (T40E)
+ * Live Log Explorer routed to selectedLane, with Date Dividers, Filtering & Search.
+ * Chỉ hiện thẻ tên luồng khi có >= 2 luồng.
+ * QUY TẮC: Poll không được render lại ô nhập/chọn (giữ search input & scroll)!
  */
 export class BridgeTerminal extends HTMLElement {
   connectedCallback() {
@@ -11,10 +15,33 @@ export class BridgeTerminal extends HTMLElement {
     this.setupEvents();
 
     this.unsubscribe = store.subscribe((state, prevState) => {
-      if (prevState && state.lang !== prevState.lang) {
+      if (!prevState) {
+        this.renderLogs();
+        return;
+      }
+
+      const langChanged = state.lang !== prevState.lang;
+      const selectedLaneChanged = state.selectedLane !== prevState.selectedLane;
+
+      if (langChanged || selectedLaneChanged) {
+        // Chỉ re-render skeleton khi đổi ngôn ngữ hoặc chuyển sang xem luồng khác
         this.render();
         this.setupEvents();
+      } else {
+        // Vòng poll 3s (lanes thay đổi) -> Cập nhật thẻ tên luồng trên tiêu đề nếu cần
+        const lane = this.getCurrentLane(state);
+        const laneId = lane.id || state.selectedLane || "default";
+        const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
+        const lanes = state.lanes || [];
+        const showLaneTag = Array.isArray(lanes) && lanes.length >= 2;
+        const tagContainer = this.querySelector(".terminal-lane-tag-container");
+        if (tagContainer) {
+          tagContainer.innerHTML = showLaneTag
+            ? `<span class="badge-tag badge-cyan" style="text-transform:none; font-weight:600; font-size:11px; margin-left:6px;">${displayName(laneId, lane.label, flowNum, state.lang)}</span>`
+            : "";
+        }
       }
+
       this.renderLogs();
     });
   }
@@ -23,15 +50,31 @@ export class BridgeTerminal extends HTMLElement {
     if (this.unsubscribe) this.unsubscribe();
   }
 
+  getCurrentLane(state) {
+    const lanes = state.lanes || [];
+    const sel = state.selectedLane;
+    return lanes.find((l) => l.id === sel) || lanes[0] || {};
+  }
+
   render() {
-    const { lang } = store.getState();
+    const state = store.getState();
+    const { lang, lanes } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+
+    const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
+    const showLaneTag = Array.isArray(lanes) && lanes.length >= 2;
+    const laneTagHtml = showLaneTag
+      ? `<span class="badge-tag badge-cyan" style="text-transform:none; font-weight:600; font-size:11px; margin-left:6px;">${displayName(laneId, lane.label, flowNum, lang)}</span>`
+      : "";
 
     this.innerHTML = `
       <section class="panel terminal-panel">
         <div class="panel-head">
-          <div class="panel-title">
+          <div class="panel-title" style="display:flex; align-items:center;">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-            ${t("liveLogsConsole", lang)}
+            <span>${t("liveLogsConsole", lang)}</span>
+            <span class="terminal-lane-tag-container">${laneTagHtml}</span>
           </div>
           <div class="btn-group">
             <button class="btn btn-secondary btn-icon" id="t-copy-btn" title="${t("copyLogsTitle", lang)}">
@@ -112,18 +155,30 @@ export class BridgeTerminal extends HTMLElement {
   }
 
   parseLine(line) {
-    const match = line.match(/^(\d{4}-\d{2}-\d{2}\s)?(\d{2}:\d{2}:\d{2})\s*\|\s*([A-Z]+)\s*\|\s*(.*)$/);
+    const match = line.match(/^(\d{4}-\d{2}-\d{2})?\s*(\d{2}:\d{2}:\d{2})\s*\|\s*([A-Z]+)\s*\|\s*(.*)$/);
     if (match) {
-      return { time: match[2], level: match[3].trim(), msg: match[4].trim() };
+      return {
+        date: match[1] || "",
+        time: match[2],
+        level: match[3].trim(),
+        msg: match[4].trim(),
+      };
     }
-    return { time: "--:--:--", level: "INFO", msg: line };
+    return { date: "", time: "--:--:--", level: "INFO", msg: line };
   }
 
   renderLogs() {
-    const { rawLogs, filterLevel, searchQuery, autoScroll, lang } = store.getState();
+    if (!this.viewport) return;
+    const state = store.getState();
+    const { rawLogs, filterLevel, searchQuery, autoScroll, lang, lanes } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
     const query = searchQuery.toLowerCase().trim();
 
-    const filtered = rawLogs.filter((line) => {
+    // LỖI 4: Chỉ hiện thẻ tên luồng ở từng dòng log khi có >= 2 luồng
+    const showLineTag = Array.isArray(lanes) && lanes.length >= 2;
+
+    const filtered = (rawLogs || []).filter((line) => {
       if (!line) return false;
       const parsed = this.parseLine(line);
 
@@ -142,20 +197,33 @@ export class BridgeTerminal extends HTMLElement {
       return;
     }
 
-    const htmlParts = filtered.map((line) => {
-      const parsed = this.parseLine(line);
-      let formattedMsg = this.escapeHtml(parsed.msg);
+    let lastDate = "";
+    const htmlParts = [];
 
+    filtered.forEach((line) => {
+      const parsed = this.parseLine(line);
+
+      if (parsed.date && parsed.date !== lastDate) {
+        lastDate = parsed.date;
+        htmlParts.push(
+          `<div class="log-date-divider" style="text-align: center; margin: 10px 0 6px 0; color: var(--text-muted); font-size: 11px; font-family: var(--font-mono); font-weight: 600; opacity: 0.85;">── ${parsed.date} ──</div>`
+        );
+      }
+
+      let formattedMsg = this.escapeHtml(parsed.msg);
       if (query) {
         const regex = new RegExp(`(${this.escapeRegex(query)})`, "gi");
         formattedMsg = formattedMsg.replace(regex, '<span class="log-highlight">$1</span>');
       }
 
-      return `<div class="log-entry">
-        <span class="log-time">${parsed.time}</span>
-        <span class="log-level ${parsed.level}">${parsed.level}</span>
-        <span class="log-msg">${formattedMsg}</span>
-      </div>`;
+      htmlParts.push(`
+        <div class="log-entry">
+          ${showLineTag ? `<span style="font-size: 10px; font-family: var(--font-mono); color: var(--text-muted); background: var(--bg-surface-hover); padding: 1px 4px; border-radius: 3px; margin-right: 4px;">${laneId}</span>` : ""}
+          <span class="log-time">${parsed.time}</span>
+          <span class="log-level ${parsed.level}">${parsed.level}</span>
+          <span class="log-msg">${formattedMsg}</span>
+        </div>
+      `);
     });
 
     this.viewport.innerHTML = htmlParts.join("");

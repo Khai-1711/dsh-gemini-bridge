@@ -10,10 +10,13 @@ from app.config import MAX_IMAGES_PER_TURN, logger
 try:
     from PIL import Image
     HAS_PILLOW = True
+    Image.MAX_IMAGE_PIXELS = 50_000_000  # 50 MP, đủ cho ảnh 8K, chống zip bomb
 except ImportError:
     HAS_PILLOW = False
 
 MAX_BASE64_LENGTH = 8 * 1024 * 1024  # 8MB
+
+_TEMP_FILES: set = set()
 
 _rapid_ocr = None
 _rapid_ocr_checked = False
@@ -88,9 +91,22 @@ def _tesseract_ocr(image_path: str) -> str:
     tesseract_cmd = shutil.which("tesseract")
     if not tesseract_cmd:
         return ""
+    # Thử eng+vie trước
     try:
         proc = subprocess.run(
             [tesseract_cmd, image_path, "stdout", "-l", "eng+vie"],
+            capture_output=True, text=True, timeout=15,
+        )
+        out = (proc.stdout or "").strip()
+        if out:
+            return out
+    except Exception:
+        pass
+
+    # Fallback chỉ dùng eng nếu eng+vie thất bại hoặc rỗng
+    try:
+        proc = subprocess.run(
+            [tesseract_cmd, image_path, "stdout", "-l", "eng"],
             capture_output=True, text=True, timeout=15,
         )
         return (proc.stdout or "").strip()
@@ -152,7 +168,13 @@ def _decode_compress_and_save_image(url_or_path: str) -> str:
 
             if HAS_PILLOW:
                 with Image.open(io.BytesIO(raw_bytes)) as img:
-                    img = img.convert("RGB")
+                    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                        background = Image.new("RGB", img.size, (255, 255, 255))
+                        alpha = img.convert("RGBA").split()[-1]
+                        background.paste(img, mask=alpha)
+                        img = background
+                    else:
+                        img = img.convert("RGB")
                     img.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
                     fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="dsh_vision_")
                     with os.fdopen(fd, "wb") as f:
@@ -164,13 +186,11 @@ def _decode_compress_and_save_image(url_or_path: str) -> str:
                     f.write(raw_bytes)
 
             del raw_bytes
+            _TEMP_FILES.add(tmp_path)
             return tmp_path
         except Exception as e:
             logger.warning(f"Lỗi xử lý ảnh: {e}")
             return ""
-
-    if os.path.isfile(url_or_path):
-        return url_or_path
 
     return ""
 
@@ -227,8 +247,9 @@ def extract_text_and_images(content: Any) -> Tuple[str, List[str]]:
 def cleanup_temp_images(image_paths: List[str]) -> None:
     """Dọn dẹp file ảnh tạm sau khi đã gửi lên Gemini Web."""
     for path in image_paths:
-        if "dsh_vision_" in path and os.path.exists(path):
+        if path in _TEMP_FILES:
             try:
                 os.remove(path)
             except Exception:
                 pass
+            _TEMP_FILES.discard(path)
