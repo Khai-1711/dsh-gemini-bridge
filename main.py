@@ -532,7 +532,7 @@ async def local_reauth(request: Request):
 
 
 @app.get("/v1/lanes")
-async def list_lanes():
+async def list_lanes(refresh: bool = False):
     local_st = build_local_lane_status(
         session_manager,
         port=PORT,
@@ -540,7 +540,10 @@ async def list_lanes():
         instance_label=INSTANCE_LABEL or (INSTANCE_ID or "default"),
         cache_enabled=ENABLE_RESPONSE_CACHE,
     )
-    lanes = await lane_registry.list_lanes(local_st)
+    if refresh:
+        lanes = await lane_registry.list_lanes(local_st, force_refresh=True)
+    else:
+        lanes = await lane_registry.list_lanes(local_st)
     return {
         "self": INSTANCE_ID or "default",
         "lanes": lanes,

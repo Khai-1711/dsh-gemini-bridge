@@ -58,7 +58,7 @@ export class BridgeTerminal extends HTMLElement {
 
   render() {
     const state = store.getState();
-    const { lang, lanes } = state;
+    const { lang, lanes, filterLevel, searchQuery, autoScroll } = state;
     const lane = this.getCurrentLane(state);
     const laneId = lane.id || state.selectedLane || "default";
 
@@ -88,10 +88,10 @@ export class BridgeTerminal extends HTMLElement {
 
         <div class="terminal-toolbar">
           <div class="filter-group">
-            <button class="filter-btn active" data-level="ALL">${t("filterAll", lang)}</button>
-            <button class="filter-btn" data-level="INFO">INFO</button>
-            <button class="filter-btn" data-level="WARN">WARN</button>
-            <button class="filter-btn" data-level="ERROR">ERROR</button>
+            <button class="filter-btn ${filterLevel === "ALL" ? "active" : ""}" data-level="ALL">${t("filterAll", lang)}</button>
+            <button class="filter-btn ${filterLevel === "INFO" ? "active" : ""}" data-level="INFO">INFO</button>
+            <button class="filter-btn ${filterLevel === "WARN" ? "active" : ""}" data-level="WARN">WARN</button>
+            <button class="filter-btn ${filterLevel === "ERROR" ? "active" : ""}" data-level="ERROR">ERROR</button>
           </div>
 
           <div class="search-input-wrap">
@@ -101,7 +101,7 @@ export class BridgeTerminal extends HTMLElement {
 
           <div class="terminal-options">
             <label class="checkbox-label" title="${t("autoScroll", lang)}">
-              <input type="checkbox" id="t-autoscroll" checked>
+              <input type="checkbox" id="t-autoscroll" ${autoScroll ? "checked" : ""}>
               <span>${t("autoScroll", lang)}</span>
             </label>
           </div>
@@ -117,6 +117,7 @@ export class BridgeTerminal extends HTMLElement {
     this.searchInput = this.querySelector("#t-search");
     this.autoscrollCheck = this.querySelector("#t-autoscroll");
     this.filterBtns = this.querySelectorAll(".filter-btn");
+    this.searchInput.value = searchQuery || "";
   }
 
   setupEvents() {

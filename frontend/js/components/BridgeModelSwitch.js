@@ -52,7 +52,7 @@ export class BridgeModelSwitch extends HTMLElement {
       ? `<span class="badge-tag badge-cyan" style="text-transform:none; font-weight:600; font-size:11px; margin-left:6px;">${displayName(laneId, lane.label, flowNum, lang)}</span>`
       : "";
 
-    const isReady = lane.control === "on" && Boolean(lane.auth_ok);
+    const isReady = lane.reachable !== false && lane.control === "on" && Boolean(lane.auth_ok);
 
     this.innerHTML = `
       <div class="panel">
@@ -112,7 +112,7 @@ export class BridgeModelSwitch extends HTMLElement {
         : "";
     }
 
-    const isReady = lane.control === "on" && Boolean(lane.auth_ok);
+    const isReady = lane.reachable !== false && lane.control === "on" && Boolean(lane.auth_ok);
     if (this.warningBox) {
       this.warningBox.style.display = !isReady ? "flex" : "none";
     }
@@ -183,6 +183,11 @@ export class BridgeModelSwitch extends HTMLElement {
     const lane = this.getCurrentLane(state);
     const laneId = lane.id || state.selectedLane || "default";
     const model = this.selectEl.value;
+
+    if (lane.reachable === false) {
+      store.notifyToast(t("laneUnreachableAction", lang, { id: laneId }), "warning");
+      return;
+    }
 
     if (!model) {
       store.notifyToast(t("selectValidModel", lang), "error");

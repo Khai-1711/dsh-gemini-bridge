@@ -51,6 +51,86 @@ export class BridgeLanes extends HTMLElement {
     return tag ? `${prefix} (${tag})` : prefix;
   }
 
+  getLanePort(lane) {
+    const port = Number(lane.port);
+    if (Number.isInteger(port) && port > 0) return port;
+
+    try {
+      const url = new URL(lane.url);
+      return Number(url.port) || (url.protocol === "https:" ? 443 : 80);
+    } catch {
+      return 10000;
+    }
+  }
+
+  renderToggleButton(laneId, switchState, controllable, lang) {
+    if (switchState === "none") return "";
+
+    const isChecked = switchState === "on";
+    const isLocked = switchState === "locked" || !controllable;
+    const action = isChecked ? "disable" : "enable";
+    const label = t("toggleStateLabel", lang, {
+      state: isChecked ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF"),
+    });
+
+    return `
+      <button
+        type="button"
+        class="lane-toggle-btn ${isChecked ? "on" : "off"}"
+        role="switch"
+        aria-checked="${isChecked}"
+        aria-label="${t("chipSwitchAria", lang, { id: laneId })}"
+        data-lane-id="${laneId}"
+        data-action="${action}"
+        ${isLocked ? "disabled" : ""}
+        title="${!controllable ? t("missingLaneToken", lang) : (isChecked ? t("btnDisable", lang) : t("btnEnable", lang))}"
+      >
+        <span class="lane-toggle-knob"></span>
+        <span>${label}</span>
+      </button>
+    `;
+  }
+
+  updateToggleButton(row, laneId, lane, switchState, lang) {
+    const wrapper = row.querySelector(".lane-toggle-wrapper");
+    if (!wrapper) return;
+
+    let button = wrapper.querySelector(".lane-toggle-btn");
+    if (switchState === "none") {
+      button?.remove();
+      return;
+    }
+
+    if (!button) {
+      wrapper.innerHTML = this.renderToggleButton(
+        laneId,
+        switchState,
+        lane.controllable !== false,
+        lang
+      );
+      button = wrapper.querySelector(".lane-toggle-btn");
+      if (button) this.setupToggleButton(button);
+      return;
+    }
+
+    const isChecked = switchState === "on";
+    const isLocked = switchState === "locked" || lane.controllable === false;
+    button.className = `lane-toggle-btn ${isChecked ? "on" : "off"}`;
+    button.setAttribute("aria-checked", String(isChecked));
+    button.setAttribute("aria-label", t("chipSwitchAria", lang, { id: laneId }));
+    button.setAttribute("data-action", isChecked ? "disable" : "enable");
+    button.title = lane.controllable === false
+      ? t("missingLaneToken", lang)
+      : (isChecked ? t("btnDisable", lang) : t("btnEnable", lang));
+    button.disabled = isLocked;
+    const label = button.querySelector("span:last-child");
+    if (label) {
+      label.textContent = t("toggleStateLabel", lang, {
+        state: isChecked ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF"),
+      });
+    }
+  }
+
   render() {
     const { lang, lanes, selectedLane, instanceId } = store.getState();
     const laneList = Array.isArray(lanes) && lanes.length > 0 ? lanes : [];
@@ -141,32 +221,7 @@ export class BridgeLanes extends HTMLElement {
       switchState = "off";
     }
 
-    // Nút Toggle BẬT / TẮT
-    let toggleHtml = "";
-    if (switchState !== "none") {
-      const isChecked = switchState === "on";
-      const isLocked = switchState === "locked" || !controllable;
-      const switchClass = isChecked ? "on" : "off";
-      const switchAction = isChecked ? "disable" : "enable";
-      const toggleLabel = isChecked ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF");
-
-      toggleHtml = `
-        <button
-          type="button"
-          class="lane-toggle-btn ${switchClass}"
-          role="switch"
-          aria-checked="${isChecked}"
-          aria-label="${t("chipSwitchAria", lang, { id: laneId })}"
-          data-lane-id="${laneId}"
-          data-action="${switchAction}"
-          ${isLocked ? "disabled" : ""}
-          title="${!controllable ? t("missingLaneToken", lang) : (isChecked ? t("btnDisable", lang) : t("btnEnable", lang))}"
-        >
-          <span class="lane-toggle-knob"></span>
-          <span>${lang === "vi" ? `Toggle: ${toggleLabel}` : `Toggle: ${toggleLabel}`}</span>
-        </button>
-      `;
-    }
+    const toggleHtml = this.renderToggleButton(laneId, switchState, controllable, lang);
 
     // Dòng thống kê
     let statsStr = t("statsLabel", lang, { requests: reqCount });
@@ -194,10 +249,10 @@ export class BridgeLanes extends HTMLElement {
         <!-- Hàng 1: Tiêu đề luồng & Model -->
         <div class="lane-row-header">
           <div class="lane-row-title">
-            <span>${rowTitle}</span>
+            <span class="lane-row-title-label">${rowTitle}</span>
             ${laneId !== "default" ? `<span class="badge-tag" style="font-size:10.5px; opacity:0.75;">${laneId}</span>` : ""}
           </div>
-          ${lane.model ? `<span style="font-size:11px; color:var(--accent-cyan); font-family:var(--font-mono);">${lane.model}</span>` : ""}
+          <span class="lane-model" style="font-size:11px; color:var(--accent-cyan); font-family:var(--font-mono);" ${lane.model ? "" : "hidden"}>${lane.model || ""}</span>
         </div>
 
         <!-- Hàng 2: Trạng thái & Công tắc -->
@@ -205,11 +260,9 @@ export class BridgeLanes extends HTMLElement {
           <div class="lane-status-indicator">
             <span class="lane-dot-wrapper">${dotHtml}</span>
             <span class="lane-status-text" style="color:${ctrl === 'on' && !authOk ? '#f59e0b' : 'var(--text-primary)'};">${statusText}</span>
-            ${!authOk && ctrl === "on" ? `
-              <button type="button" class="btn btn-secondary btn-sm lane-action-cookie" data-lane-id="${laneId}" style="padding:2px 8px; font-size:11px; margin-left:6px;">
-                ${t("btnLoadCookie", lang)}
-              </button>
-            ` : ""}
+            <button type="button" class="btn btn-secondary btn-sm lane-action-cookie lane-action-cookie-quick" data-lane-id="${laneId}" style="padding:2px 8px; font-size:11px; margin-left:6px;" ${!authOk && ctrl === "on" ? "" : "hidden"} ${!isReachable ? "disabled" : ""}>
+              ${t("btnLoadCookie", lang)}
+            </button>
           </div>
           <div class="lane-toggle-wrapper">
             ${toggleHtml}
@@ -228,14 +281,14 @@ export class BridgeLanes extends HTMLElement {
           </summary>
           <div class="lane-details-box">
             <div style="display:flex; justify-content:space-between; align-items:center;">
-              <span>${t("activeAccountLabel", lang)} <b>${accDisplay}</b></span>
-              <span style="font-family:var(--font-mono); font-size:10.5px; opacity:0.8;">Port: ${lane.port || 10000}</span>
+              <span><span class="lane-active-account-label">${t("activeAccountLabel", lang)}</span> <b class="lane-active-account-value">${accDisplay}</b></span>
+              <span class="lane-port" style="font-family:var(--font-mono); font-size:10.5px; opacity:0.8;">Port: ${this.getLanePort(lane)}</span>
             </div>
-            ${lane.chat_key ? `<div><span>${t("chatKeyLabel", lang)}</span> <code style="font-size:10.5px;">${lane.chat_key}</code></div>` : ""}
+            <div class="lane-chat-key" ${lane.chat_key ? "" : "hidden"}><span>${t("chatKeyLabel", lang)}</span> <code style="font-size:10.5px;">${lane.chat_key || ""}</code></div>
             <div style="display:flex; gap:8px; margin-top:4px; flex-wrap:wrap;">
-              <button type="button" class="btn btn-secondary btn-sm lane-action-cookie" data-lane-id="${laneId}">🔑 ${t("btnLoadCookie", lang)}</button>
-              <button type="button" class="btn btn-secondary btn-sm lane-action-reauth" data-lane-id="${laneId}">🔄 ${t("btnTryReauth", lang)}</button>
-              <button type="button" class="btn btn-secondary btn-sm lane-action-reset" data-lane-id="${laneId}">⚠️ Reset</button>
+              <button type="button" class="btn btn-secondary btn-sm lane-action-cookie" data-lane-id="${laneId}" ${!isReachable ? "disabled" : ""}>🔑 ${t("btnLoadCookie", lang)}</button>
+              <button type="button" class="btn btn-secondary btn-sm lane-action-reauth" data-lane-id="${laneId}" ${!isReachable ? "disabled" : ""}>🔄 ${t("btnTryReauth", lang)}</button>
+              <button type="button" class="btn btn-secondary btn-sm lane-action-reset" data-lane-id="${laneId}" ${!isReachable ? "disabled" : ""}>⚠️ Reset</button>
             </div>
           </div>
         </details>
@@ -318,21 +371,39 @@ export class BridgeLanes extends HTMLElement {
         statusTextEl.textContent = statusText;
         statusTextEl.style.color = ctrl === "on" && !authOk ? "#f59e0b" : "var(--text-primary)";
       }
+      row.classList.toggle("unreachable", !isReachable);
 
-      // Cập nhật công tắc
-      const toggleBtn = row.querySelector(".lane-toggle-btn");
-      if (toggleBtn && switchState !== "none") {
-        const isChecked = switchState === "on";
-        const isLocked = switchState === "locked" || lane.controllable === false;
-        const toggleLabel = isChecked ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF");
+      const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : index + 1);
+      const titleEl = row.querySelector(".lane-row-title-label");
+      const modelEl = row.querySelector(".lane-model");
+      const activeAccountEl = row.querySelector(".lane-active-account-value");
+      const portEl = row.querySelector(".lane-port");
+      const chatKeyEl = row.querySelector(".lane-chat-key");
+      const quickCookieButton = row.querySelector(".lane-action-cookie-quick");
 
-        toggleBtn.className = `lane-toggle-btn ${isChecked ? "on" : "off"}`;
-        toggleBtn.setAttribute("aria-checked", isChecked);
-        toggleBtn.setAttribute("data-action", isChecked ? "disable" : "enable");
-        toggleBtn.disabled = isLocked;
-        const labelEl = toggleBtn.querySelector("span:last-child");
-        if (labelEl) labelEl.textContent = `Toggle: ${toggleLabel}`;
+      if (titleEl) titleEl.textContent = this.getLaneTitle(laneId, lane.label, flowNum, lang);
+      if (modelEl) {
+        modelEl.textContent = lane.model || "";
+        modelEl.hidden = !lane.model;
       }
+      const activeAccount = lane.active_account || {};
+      if (activeAccountEl) {
+        const label = activeAccount.label || (lang === "vi" ? "Chính" : "Primary");
+        const accountIndex = (activeAccount.index !== undefined ? activeAccount.index : 0) + 1;
+        const accountTotal = activeAccount.total || 1;
+        activeAccountEl.textContent = `${label} (${accountIndex}/${accountTotal})`;
+      }
+      if (portEl) portEl.textContent = `Port: ${this.getLanePort(lane)}`;
+      if (chatKeyEl) {
+        chatKeyEl.hidden = !lane.chat_key;
+        const code = chatKeyEl.querySelector("code");
+        if (code) code.textContent = lane.chat_key || "";
+      }
+      if (quickCookieButton) quickCookieButton.hidden = !(ctrl === "on" && !authOk);
+      row.querySelectorAll(".lane-action-cookie, .lane-action-reauth, .lane-action-reset").forEach((button) => {
+        button.disabled = !isReachable;
+      });
+      this.updateToggleButton(row, laneId, lane, switchState, lang);
 
       // Cập nhật dòng thống kê
       const statsLine = row.querySelector(".lane-stats-line");
@@ -342,6 +413,46 @@ export class BridgeLanes extends HTMLElement {
           statsStr = t("statsWithErrors", lang, { requests: reqCount, errors: errCount });
         }
         statsLine.textContent = statsStr;
+      }
+    });
+  }
+
+  setupToggleButton(btn) {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const laneId = btn.getAttribute("data-lane-id");
+      const action = btn.getAttribute("data-action");
+      const { lang, lanes } = store.getState();
+      const lane = (lanes || []).find((l) => l.id === laneId) || {};
+
+      if (action === "enable") {
+        btn.disabled = true;
+        try {
+          await api.enableLane(laneId);
+        } catch (err) {
+          store.notifyToast(err.message, "error");
+        } finally {
+          btn.disabled = false;
+        }
+      } else if (action === "disable") {
+        const inflight = lane.inflight || 0;
+        const label = lane.label || laneId;
+        const msg = t("confirmDisableLane", lang, {
+          id: laneId,
+          label,
+          n: inflight,
+        });
+
+        if (!window.confirm(msg)) return;
+
+        btn.disabled = true;
+        try {
+          await api.disableLane(laneId);
+        } catch (err) {
+          store.notifyToast(err.message, "error");
+        } finally {
+          btn.disabled = false;
+        }
       }
     });
   }
@@ -359,6 +470,8 @@ export class BridgeLanes extends HTMLElement {
           return;
         }
 
+        if (row.classList.contains("unreachable")) return;
+
         const laneId = row.getAttribute("data-row-lane");
         if (laneId && laneId !== store.getState().selectedLane) {
           store.setState({ selectedLane: laneId });
@@ -367,53 +480,7 @@ export class BridgeLanes extends HTMLElement {
     });
 
     // Công tắc BẬT / TẮT
-    this.querySelectorAll(".lane-toggle-btn").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const laneId = btn.getAttribute("data-lane-id");
-        const action = btn.getAttribute("data-action");
-        const { lang, lanes } = store.getState();
-        const lane = (lanes || []).find((l) => l.id === laneId) || {};
-
-        if (action === "enable") {
-          // BẬT ngay lập tức, không hỏi xác nhận
-          btn.disabled = true;
-          try {
-            const res = await api.enableLane(laneId);
-            if (res && res.error) {
-              store.notifyToast(res.error.message || "Failed to enable lane", "error");
-            }
-          } catch (err) {
-            store.notifyToast(err.message, "error");
-          } finally {
-            btn.disabled = false;
-          }
-        } else if (action === "disable") {
-          // TẮT: Hỏi xác nhận
-          const inflight = lane.inflight || 0;
-          const label = lane.label || laneId;
-          const msg = t("confirmDisableLane", lang, {
-            id: laneId,
-            label,
-            n: inflight,
-          });
-
-          if (!window.confirm(msg)) return;
-
-          btn.disabled = true;
-          try {
-            const res = await api.disableLane(laneId);
-            if (res && res.error) {
-              store.notifyToast(res.error.message || "Failed to disable lane", "error");
-            }
-          } catch (err) {
-            store.notifyToast(err.message, "error");
-          } finally {
-            btn.disabled = false;
-          }
-        }
-      });
-    });
+    this.querySelectorAll(".lane-toggle-btn").forEach((btn) => this.setupToggleButton(btn));
 
     // Nút [Nạp cookie] nhanh
     this.querySelectorAll(".lane-action-cookie").forEach((btn) => {

@@ -248,8 +248,9 @@ export const api = {
   /**
    * Lấy danh sách trạng thái các luồng (T37)
    */
-  async getLanes() {
-    const res = await authFetch(`${API_BASE}/v1/lanes`);
+  async getLanes(forceRefresh = false) {
+    const refreshQuery = forceRefresh ? "?refresh=true" : "";
+    const res = await authFetch(`${API_BASE}/v1/lanes${refreshQuery}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   },

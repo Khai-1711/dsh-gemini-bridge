@@ -17,7 +17,11 @@ export class BridgeNavbar extends HTMLElement {
         !prevState ||
         state.lang !== prevState.lang ||
         state.theme !== prevState.theme ||
-        (state.latency >= 0) !== (prevState.latency >= 0)
+        state.dashboardApiStatus !== prevState.dashboardApiStatus ||
+        (state.latency === null) !== (prevState.latency === null) ||
+        (state.latency >= 0) !== (prevState.latency >= 0) ||
+        state.selectedLane !== prevState.selectedLane ||
+        JSON.stringify(state.lanes) !== JSON.stringify(prevState.lanes)
       ) {
         this.render();
         this.setupEvents();
@@ -35,9 +39,10 @@ export class BridgeNavbar extends HTMLElement {
   }
 
   render() {
-    const { lang, theme, latency } = store.getState();
+    const { lang, theme, latency, dashboardApiStatus, lanes, selectedLane } = store.getState();
     const isDark = theme === "dark";
     const isOnline = latency >= 0;
+    const isChecking = latency === null;
 
     this.innerHTML = `
       <header class="top-nav">
@@ -59,7 +64,13 @@ export class BridgeNavbar extends HTMLElement {
         <div class="nav-actions">
           <!-- Server Health Badge: ● Server OK / ✕ Mất liên lạc với server -->
           ${
-            isOnline
+            isChecking
+              ? `
+            <div class="server-status-pill" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:var(--bg-surface-hover); border:1px solid var(--border-subtle); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:var(--text-secondary);">
+              <span>${t("serverChecking", lang)}</span>
+            </div>
+          `
+              : isOnline
               ? `
             <div class="server-status-pill ok" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#10b981;">
               <span class="pulse-dot" style="background:#10b981;"></span>
@@ -73,6 +84,42 @@ export class BridgeNavbar extends HTMLElement {
               <span>${t("serverLost", lang)}</span>
             </div>
           `
+          }
+
+          ${
+            isOnline && dashboardApiStatus
+              ? `
+            <div class="server-status-pill error" title="${t(dashboardApiStatus === "auth_error" ? "dashboardApiAuthError" : "dashboardApiDataError", lang)}" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(245,158,11,0.12); border:1px solid rgba(245,158,11,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#f59e0b;">
+              <span>${t(dashboardApiStatus === "auth_error" ? "dashboardApiAuthError" : "dashboardApiDataError", lang)}</span>
+            </div>
+          `
+              : ""
+          }
+
+          <!-- Lane Switcher Pills (Chỉ hiện khi có >= 2 luồng) -->
+          ${
+            Array.isArray(lanes) && lanes.length >= 2
+              ? `
+            <div class="toggle-pill-group lane-pill-group" style="margin-right:2px;">
+              ${lanes
+                .map((l, i) => {
+                  const flowId = l.id || `acc${i + 1}`;
+                  const flowNum = flowId === "acc1" ? 1 : (flowId === "acc2" ? 2 : i + 1);
+                  const isSel = (selectedLane || lanes[0]?.id) === flowId;
+                  const isOff = l.control === "off";
+                  const dotColor = l.reachable === false ? "#ef4444" : (isOff ? "var(--text-muted)" : (l.auth_ok ? "#10b981" : "#f59e0b"));
+                  const flowTitle = l.label && l.label !== flowId ? l.label : (lang === "vi" ? `Luồng ${flowNum}` : `Flow ${flowNum}`);
+                  return `
+                    <button class="toggle-pill-btn ${isSel ? "active" : ""}" data-lane-id="${flowId}" title="${flowTitle} (${flowId}) · Port: ${l.port || (flowId === "acc2" ? 10001 : 10000)}" style="display:inline-flex; align-items:center; gap:6px;">
+                      <span style="width:7px; height:7px; border-radius:50%; background:${dotColor};"></span>
+                      <span>${flowTitle}</span>
+                    </button>
+                  `;
+                })
+                .join("")}
+            </div>
+          `
+              : ""
           }
 
           <!-- Language Switcher Pill -->
@@ -91,7 +138,7 @@ export class BridgeNavbar extends HTMLElement {
           </button>
 
           <!-- Manual Refresh Button -->
-          <button class="btn btn-secondary btn-icon" id="nav-refresh-btn" title="${t("refreshData", lang)} (Ctrl+R)">
+          <button class="btn btn-secondary btn-icon" id="nav-refresh-btn" title="${t("refreshData", lang)}">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/>
             </svg>
@@ -111,6 +158,16 @@ export class BridgeNavbar extends HTMLElement {
   }
 
   setupEvents() {
+    this.querySelectorAll(".lane-pill-group .toggle-pill-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const laneId = btn.getAttribute("data-lane-id");
+        if (laneId && laneId !== store.getState().selectedLane) {
+          store.setState({ selectedLane: laneId });
+          window.dispatchEvent(new CustomEvent("refresh-request"));
+        }
+      });
+    });
+
     this.querySelector("#nav-forget-key-btn")?.addEventListener("click", () => {
       clearStoredApiKey();
       store.notifyToast(t("accessKeyCleared", store.getState().lang), "info");

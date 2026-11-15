@@ -17,17 +17,26 @@ import "./components/BridgeQuickActions.js";
 
 let pollTimeoutId = null;
 let isSyncing = false;
+let forceLaneRefreshOnNextSync = false;
+
+function getDashboardApiStatus(err) {
+  const message = String((err && err.message) || err);
+  return /^HTTP (401|403)\b/.test(message) ? "auth_error" : "data_error";
+}
 
 async function syncData() {
   if (isSyncing) return;
   if (document.hidden) return; // Tạm dừng poll khi tab bị ẩn (T40.4)
 
+  const forceLaneRefresh = forceLaneRefreshOnNextSync;
+  forceLaneRefreshOnNextSync = false;
   isSyncing = true;
-  const startTime = performance.now();
+  const healthCheck = api.getHealth()
+    .then(({ latency }) => store.setState({ latency }))
+    .catch(() => store.setState({ latency: -1 }));
 
   try {
-    const lanesData = await api.getLanes();
-    const latency = Math.round(performance.now() - startTime);
+    const lanesData = await api.getLanes(forceLaneRefresh);
 
     const lanes = Array.isArray(lanesData.lanes) ? lanesData.lanes : [];
     const selfId = lanesData.self || (lanes[0] ? lanes[0].id : "acc1");
@@ -43,33 +52,52 @@ async function syncData() {
     store.setState({
       lanes,
       selectedLane,
-      latency,
       instanceId: selfId,
+      dashboardApiStatus: "",
     });
 
-    // Đồng bộ Logs cho luồng đang chọn
-    try {
-      const logData = await api.getLaneLogs(selectedLane, 60);
-      store.setState({ rawLogs: logData.logs || [] });
-    } catch (e) {
-      console.warn(`Lỗi tải logs cho ${selectedLane}:`, e);
-    }
+    const selectedLaneState = lanes.find((lane) => lane.id === selectedLane);
+    const selectedLaneIsActive =
+      selectedLaneState &&
+      selectedLaneState.reachable !== false &&
+      selectedLaneState.control !== "off";
+    let dataStatus = "";
 
-    // Đồng bộ danh sách Models cho luồng đang chọn
-    try {
-      const modelData = await api.getLaneModels(selectedLane);
-      const avail = modelData.available || [];
+    if (!selectedLaneIsActive) {
       store.setState({
-        availableModels: avail.map((m) => (typeof m === "string" ? m : m.id || m.name)),
-        modelDetails: avail,
-        model: modelData.current || "unspecified",
+        rawLogs: [],
+        availableModels: [],
+        modelDetails: [],
       });
-    } catch (e) {
-      console.warn(`Lỗi tải models cho ${selectedLane}:`, e);
+    } else {
+      // Đồng bộ Logs cho luồng đang chọn
+      try {
+        const logData = await api.getLaneLogs(selectedLane, 60);
+        store.setState({ rawLogs: logData.logs || [] });
+      } catch (e) {
+        dataStatus = getDashboardApiStatus(e);
+        console.warn(`Lỗi tải logs cho ${selectedLane}:`, e);
+      }
+
+      // Đồng bộ danh sách Models cho luồng đang chọn
+      try {
+        const modelData = await api.getLaneModels(selectedLane);
+        const avail = modelData.available || [];
+        store.setState({
+          availableModels: avail.map((m) => (typeof m === "string" ? m : m.id || m.name)),
+          modelDetails: avail,
+          model: modelData.current || "unspecified",
+        });
+      } catch (e) {
+        dataStatus = getDashboardApiStatus(e);
+        console.warn(`Lỗi tải models cho ${selectedLane}:`, e);
+      }
     }
+    store.setState({ dashboardApiStatus: dataStatus });
   } catch (err) {
-    store.setState({ latency: -1 });
+    store.setState({ dashboardApiStatus: getDashboardApiStatus(err) });
   } finally {
+    await healthCheck;
     isSyncing = false;
     scheduleNextPoll();
   }
@@ -98,6 +126,7 @@ function scheduleNextPoll(delayMs = null) {
 
 function setupGlobalShortcuts() {
   window.addEventListener("refresh-request", () => {
+    forceLaneRefreshOnNextSync = true;
     scheduleNextPoll(0);
   });
 

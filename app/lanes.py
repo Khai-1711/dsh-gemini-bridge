@@ -5,6 +5,15 @@ import asyncio
 import json
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
+
+
+def _port_from_url(url: str) -> Optional[int]:
+    try:
+        parsed = urlsplit(url)
+        return parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return None
 
 
 def _parse_uptime(uptime_val: Any) -> int:
@@ -45,6 +54,7 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
         "id": instance_id or "default",
         "label": instance_label or (instance_id or "default"),
         "url": f"http://127.0.0.1:{port}",
+        "port": port,
         "is_self": True,
         "reachable": True,
         "control": getattr(manager, "state", "off"),
@@ -95,6 +105,7 @@ def _format_remote_status(lane_id: str, base_url: str, data: dict, controllable:
         "id": lane_id,
         "label": data.get("instance_label") or lane_id,
         "url": base_url,
+        "port": _port_from_url(base_url),
         "is_self": False,
         "reachable": True,
         "control": ctrl_state,
@@ -157,13 +168,28 @@ class LaneRegistry:
         self.peers = peers or {}
         self.token = token or ""
         self.http_call = http_call
+        self._peer_status_cache: Dict[str, Dict[str, Any]] = {}
 
-    async def list_lanes(self, local_status: dict) -> List[Dict[str, Any]]:
+    async def list_lanes(self, local_status: dict, force_refresh: bool = False) -> List[Dict[str, Any]]:
         lanes = [local_status]
         tasks = []
         peer_ids = []
+        peer_results = {}
 
         for peer_id, base_url in self.peers.items():
+            cached = self._peer_status_cache.get(peer_id)
+            if not force_refresh and cached and (
+                cached.get("reachable") is False or cached.get("control") == "off"
+            ):
+                cached_lane = dict(cached)
+                cached_lane.update({
+                    "url": base_url,
+                    "port": _port_from_url(base_url),
+                    "controllable": bool(self.token),
+                })
+                peer_results[peer_id] = cached_lane
+                continue
+
             peer_ids.append((peer_id, base_url))
             headers = {}
             if self.token:
@@ -176,32 +202,37 @@ class LaneRegistry:
             for (p_id, p_url), res in zip(peer_ids, results):
                 if isinstance(res, Exception) or not isinstance(res, tuple) or res[0] == 0:
                     err_msg = res[1].get("error", "unreachable") if (isinstance(res, tuple) and len(res) > 1 and isinstance(res[1], dict)) else str(res)
-                    lanes.append({
+                    lane = {
                         "id": p_id,
                         "label": p_id,
                         "url": p_url,
+                        "port": _port_from_url(p_url),
                         "is_self": False,
                         "reachable": False,
                         "error": err_msg,
                         "control": "off",
                         "controllable": bool(self.token),
-                    })
+                    }
                 else:
                     status_code, data = res
                     if status_code == 200 and isinstance(data, dict):
                         lane = _format_remote_status(p_id, p_url, data, controllable=bool(self.token))
-                        lanes.append(lane)
                     else:
-                        lanes.append({
+                        lane = {
                             "id": p_id,
                             "label": p_id,
                             "url": p_url,
+                            "port": _port_from_url(p_url),
                             "is_self": False,
                             "reachable": False,
                             "error": f"HTTP {status_code}",
                             "control": "off",
                             "controllable": bool(self.token),
-                        })
+                        }
+                self._peer_status_cache[p_id] = dict(lane)
+                peer_results[p_id] = lane
+
+        lanes.extend(peer_results[peer_id] for peer_id in self.peers if peer_id in peer_results)
         return lanes
 
     async def control(self, lane_id: str, action: str, local_fn: Callable) -> Tuple[int, dict]:
@@ -234,7 +265,43 @@ class LaneRegistry:
         status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=timeout)
         if status_code == 0:
             err = body.get("error") if isinstance(body, dict) else "unreachable"
+            self._peer_status_cache[lane_id] = {
+                "id": lane_id,
+                "label": lane_id,
+                "url": peer_url,
+                "port": _port_from_url(peer_url),
+                "is_self": False,
+                "reachable": False,
+                "error": err,
+                "control": "off",
+                "controllable": bool(self.token),
+            }
             return 502, {"error": {"code": "peer_unreachable", "message": f"Không kết nối được tới luồng {lane_id}: {err}"}}
+
+        if 200 <= status_code < 300:
+            cached = dict(self._peer_status_cache.get(lane_id, {}))
+            cached.update({
+                "id": lane_id,
+                "label": (body.get("instance_label") or lane_id) if isinstance(body, dict) else lane_id,
+                "url": peer_url,
+                "port": _port_from_url(peer_url),
+                "is_self": False,
+                "reachable": True,
+                "controllable": bool(self.token),
+            })
+            if isinstance(body, dict):
+                cached.update({key: body[key] for key in ("control", "state", "auth_ok") if key in body})
+                if "state" in body:
+                    cached["control"] = body["state"]
+                elif action == "enable":
+                    cached["control"] = "starting"
+                elif action == "disable":
+                    cached["control"] = "stopping"
+            elif action == "enable":
+                cached["control"] = "starting"
+            elif action == "disable":
+                cached["control"] = "stopping"
+            self._peer_status_cache[lane_id] = cached
         return status_code, body or {}
 
     async def proxy_request(
@@ -267,6 +334,18 @@ class LaneRegistry:
         )
         if status_code == 0:
             err = resp_body.get("error") if isinstance(resp_body, dict) else "unreachable"
+            cached = dict(self._peer_status_cache.get(lane_id, {}))
+            cached.update({
+                "id": lane_id,
+                "label": cached.get("label") or lane_id,
+                "url": peer_url,
+                "port": _port_from_url(peer_url),
+                "is_self": False,
+                "reachable": False,
+                "error": err,
+                "controllable": bool(self.token),
+            })
+            self._peer_status_cache[lane_id] = cached
             return 502, {
                 "error": {
                     "code": "peer_unreachable",

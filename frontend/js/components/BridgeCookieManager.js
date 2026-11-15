@@ -41,11 +41,44 @@ export class BridgeCookieManager extends HTMLElement {
     return lanes.find((l) => l.id === sel) || lanes[0] || {};
   }
 
+  getSlotOptionText(slot, accounts, lang) {
+    const account = accounts[slot];
+    const name = slot === 0 ? t("slotPrimary", lang) : t("slotBackup", lang, { n: slot });
+    const accountLabel = account && account.label ? `[${account.label}] ` : "";
+
+    if (account) {
+      return `${name} ${accountLabel}· ${account.status || "ready"}`;
+    }
+    if (slot === accounts.length) {
+      return `${name} · ${t("slotCanAdd", lang)}`;
+    }
+    return `${name} · ${t("slotRequiresPrevious", lang, { n: slot - 1 })}`;
+  }
+
+  updateSlotOptions(accounts, lang) {
+    for (let slot = 0; slot <= 4; slot++) {
+      const option = this.slotSelect?.querySelector(`option[value="${slot}"]`);
+      if (!option) continue;
+
+      option.textContent = this.getSlotOptionText(slot, accounts, lang);
+      option.disabled = slot > accounts.length;
+    }
+  }
+
+  getSelectableSlot(slot, accountCount) {
+    const value = Number(slot);
+    const maxSelectable = Math.min(accountCount, 4);
+    return Number.isInteger(value) && value >= 0 && value <= maxSelectable
+      ? String(value)
+      : String(maxSelectable);
+  }
+
   render() {
     const state = store.getState();
     const { lang, lanes } = state;
     const lane = this.getCurrentLane(state);
     const laneId = lane.id || state.selectedLane || "default";
+    const laneReachable = lane.reachable !== false;
     const accounts = lane.accounts || [];
 
     const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
@@ -61,23 +94,7 @@ export class BridgeCookieManager extends HTMLElement {
 
     // Tạo các tùy chọn cho slot 0..4
     const slotOptionsHtml = [0, 1, 2, 3, 4]
-      .map((slot) => {
-        const acc = accounts[slot];
-        let name = slot === 0 ? t("slotPrimary", lang) : t("slotBackup", lang, { n: slot });
-        let statusTag = "";
-        let accLabel = "";
-
-        if (acc) {
-          accLabel = acc.label ? `[${acc.label}]` : "";
-          const st = acc.status || "ready";
-          statusTag = `· ${st}`;
-        } else {
-          statusTag = slot === 0 ? "· (chưa nạp)" : "· (trống - có thể thêm)";
-        }
-
-        const isSelected = String(slot) === savedSlot ? "selected" : "";
-        return `<option value="${slot}" ${isSelected}>${name} ${accLabel} ${statusTag}</option>`;
-      })
+      .map((slot) => `<option value="${slot}"></option>`)
       .join("");
 
     this.innerHTML = `
@@ -118,7 +135,7 @@ export class BridgeCookieManager extends HTMLElement {
               <span class="field-hint">${t("psidHint", lang)}</span>
             </label>
             <div class="input-container">
-              <input type="password" class="input-text code-font" id="cm-psid" placeholder="g.a000...">
+              <input type="password" class="input-text code-font" id="cm-psid" placeholder="g.a000..." required>
               <button type="button" class="input-toggle-btn" data-target="cm-psid" title="${t("toggleVisibility", lang)}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
               </button>
@@ -132,14 +149,14 @@ export class BridgeCookieManager extends HTMLElement {
               <span class="field-hint">${t("psidtsHint", lang)}</span>
             </label>
             <div class="input-container">
-              <input type="password" class="input-text code-font" id="cm-psidts" placeholder="sidts-...">
+              <input type="password" class="input-text code-font" id="cm-psidts" placeholder="sidts-..." required>
               <button type="button" class="input-toggle-btn" data-target="cm-psidts" title="${t("toggleVisibility", lang)}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
               </button>
             </div>
           </div>
 
-          <button class="btn btn-primary" id="cm-save-btn">
+          <button class="btn btn-primary" id="cm-save-btn" ${!laneReachable ? "disabled" : ""} title="${laneReachable ? "" : t("laneUnreachableAction", lang, { id: laneId })}">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
             ${t("saveCookiesBtn", lang)}
           </button>
@@ -154,7 +171,8 @@ export class BridgeCookieManager extends HTMLElement {
     this.saveBtn = this.querySelector("#cm-save-btn");
 
     if (this.slotSelect) {
-      this.slotSelect.value = savedSlot;
+      this.updateSlotOptions(accounts, lang);
+      this.slotSelect.value = this.getSelectableSlot(savedSlot, accounts.length);
     }
   }
 
@@ -177,34 +195,16 @@ export class BridgeCookieManager extends HTMLElement {
     if (this.slotSelect) {
       const currentSelectedVal = this.slotSelect.value;
       const accounts = lane.accounts || [];
-
-      for (let slot = 0; slot <= 4; slot++) {
-        const opt = this.slotSelect.querySelector(`option[value="${slot}"]`);
-        if (opt) {
-          const acc = accounts[slot];
-          let name = slot === 0 ? t("slotPrimary", state.lang) : t("slotBackup", state.lang, { n: slot });
-          let statusTag = "";
-          let accLabel = "";
-
-          if (acc) {
-            accLabel = acc.label ? `[${acc.label}]` : "";
-            const st = acc.status || "ready";
-            statusTag = `· ${st}`;
-          } else {
-            statusTag = slot === 0 ? "· (chưa nạp)" : "· (trống - có thể thêm)";
-          }
-
-          const newText = `${name} ${accLabel} ${statusTag}`;
-          if (opt.textContent !== newText) {
-            opt.textContent = newText;
-          }
-        }
-      }
+      this.updateSlotOptions(accounts, state.lang);
 
       // Giữ nguyên giá trị người dùng đang chọn
-      if (this.slotSelect.value !== currentSelectedVal) {
-        this.slotSelect.value = currentSelectedVal;
-      }
+      this.slotSelect.value = this.getSelectableSlot(currentSelectedVal, accounts.length);
+    }
+    if (this.saveBtn && !this.saveBtn.dataset.busy) {
+      this.saveBtn.disabled = lane.reachable === false;
+      this.saveBtn.title = lane.reachable === false
+        ? t("laneUnreachableAction", state.lang, { id: laneId })
+        : "";
     }
   }
 
@@ -254,6 +254,10 @@ export class BridgeCookieManager extends HTMLElement {
     const { lang } = state;
     const lane = this.getCurrentLane(state);
     const laneId = lane.id || state.selectedLane || "default";
+    if (lane.reachable === false) {
+      store.notifyToast(t("laneUnreachableAction", lang, { id: laneId }), "warning");
+      return;
+    }
     const slot = parseInt(this.slotSelect.value, 10);
     const label = this.labelInput.value.trim();
     const psid = this.psidInput.value.trim();
@@ -262,6 +266,11 @@ export class BridgeCookieManager extends HTMLElement {
     if (!psid) {
       store.notifyToast(t("enterPsidRequired", lang), "error");
       this.psidInput.focus();
+      return;
+    }
+    if (!psidts) {
+      store.notifyToast(t("enterPsidtsRequired", lang), "error");
+      this.psidtsInput.focus();
       return;
     }
 
@@ -276,6 +285,7 @@ export class BridgeCookieManager extends HTMLElement {
     }
 
     this.saveBtn.disabled = true;
+    this.saveBtn.dataset.busy = "true";
     this.saveBtn.innerText = t("verifyingCookies", lang);
 
     try {
@@ -299,7 +309,8 @@ export class BridgeCookieManager extends HTMLElement {
       // Khi lỗi: GIỮ NGUYÊN các ô nhập để người dùng không phải gõ lại
       store.notifyToast(`Error: ${err.message}`, "error");
     } finally {
-      this.saveBtn.disabled = false;
+      delete this.saveBtn.dataset.busy;
+      this.saveBtn.disabled = this.getCurrentLane(store.getState()).reachable === false;
       this.saveBtn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> ${t("saveCookiesBtn", lang)}`;
     }
   }
