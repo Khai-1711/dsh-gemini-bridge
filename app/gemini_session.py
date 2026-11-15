@@ -21,6 +21,7 @@ from app.accounts import (
 )
 from app.config import (
     ACCOUNT_CHAIN,
+    ALLOW_GUEST_MODE,
     AUTH_COOLDOWN_MINUTES,
     BACKUP_1PSID,
     BACKUP_1PSIDTS,
@@ -217,6 +218,8 @@ class SingleChatManager:
         self.start_time = time.time()
         self._consecutive_auth_errors = 0
         self._using_backup = self.active_index > 0
+        self.allow_guest: bool = ALLOW_GUEST_MODE
+        self.is_guest: bool = False
         self.auth_ok: bool = False
         self.account_status_name: str = "UNKNOWN"
         self.cookie_source: str = ""
@@ -288,12 +291,15 @@ class SingleChatManager:
         source = str(getattr(self.client, "_cookie_source", "") or "")
         self.cookie_source = source
         self.account_status_name = getattr(status, "name", str(status))
-        self.auth_ok = (
-            status == AccountStatus.AVAILABLE and source.lower() != "guest"
-        )
+        self.is_guest = (status != AccountStatus.AVAILABLE or source.lower() == "guest")
+        self.auth_ok = not self.is_guest
         if self.auth_ok:
             logger.info(
                 f"[AUTH] Đã đăng nhập OK (nguồn cookie: {source or 'n/a'})."
+            )
+        elif self.allow_guest:
+            logger.info(
+                f"[AUTH] Chạy ở chế độ KHÁCH (Guest Mode) mặc định (nguồn: {source or 'n/a'})."
             )
         else:
             logger.critical(
@@ -310,9 +316,8 @@ class SingleChatManager:
         source = str(getattr(self.client, "_cookie_source", "") or "")
         self.cookie_source = source
         self.account_status_name = getattr(status, "name", str(status))
-        self.auth_ok = (
-            status == AccountStatus.AVAILABLE and source.lower() != "guest"
-        )
+        self.is_guest = (status != AccountStatus.AVAILABLE or source.lower() == "guest")
+        self.auth_ok = not self.is_guest
 
     def _chat_metadata_snapshot(self):
         """Chụp metadata (cid, rid, rcid) của đoạn chat hiện tại để giữ lại khi tạo lại session."""
@@ -331,11 +336,11 @@ class SingleChatManager:
         return hashlib.sha256(cid.encode("utf-8")).hexdigest()[:8] if cid else "new"
 
     async def ensure_authenticated(self) -> bool:
-        """Trả True nếu đang đăng nhập. Nếu không, thử phục hồi tối đa 1 lần/60 giây."""
+        """Trả True nếu đang đăng nhập hoặc ở Guest Mode hợp lệ. Nếu không, thử phục hồi tối đa 1 lần/60 giây."""
         if self.state == "off":
             return False
         self._refresh_auth_flags_quietly()
-        if self.auth_ok:
+        if self.auth_ok or (self.allow_guest and self.is_guest):
             return True
 
         now = time.time()
@@ -362,9 +367,9 @@ class SingleChatManager:
                 saved = self._chat_metadata_snapshot()
                 self._create_new_chat_session(preserve_metadata=saved)
                 return True
-            if await self._try_failover_to_backup():
+            if len(self.chain) > 1 and await self._try_failover_to_backup():
                 return True
-            return False
+            return bool(self.allow_guest and self.is_guest)
 
     def _emit(self, **fields) -> None:
         if self.on_event:
@@ -520,13 +525,15 @@ class SingleChatManager:
 
         self._consecutive_auth_errors = 0
         if not self._evaluate_auth():
-            # Thử tài khoản dự phòng; nếu vẫn lỗi thì server VẪN chạy (auth_ok=False)
-            # để người dùng còn vào Dashboard cập nhật cookie. KHÔNG sys.exit.
-            await self._try_failover_to_backup()
+            # Thử tài khoản dự phòng nếu có chuỗi dự phòng; nếu vẫn lỗi thì server VẪN chạy (auth_ok=False)
+            # để người dùng còn vào Dashboard cập nhật cookie hoặc chạy Guest Mode. KHÔNG sys.exit.
+            if len(self.chain) > 1:
+                await self._try_failover_to_backup()
 
         if not self.auth_ok:
             self._create_new_chat_session()
-            logger.info(f"SingleChatManager sẵn sàng (chưa xác thực)! Model: [{self.default_model}]")
+            msg = "ở chế độ KHÁCH (Guest Mode)" if (self.allow_guest and self.is_guest) else "chưa xác thực"
+            logger.info(f"SingleChatManager sẵn sàng ({msg})! Model: [{self.default_model}]")
             return
 
         saved = load_saved_session() if self.auth_ok else None
@@ -908,7 +915,7 @@ class SingleChatManager:
 
     async def _try_failover_to_backup(self) -> bool:
         """Chuyển sang tài khoản kế tiếp CÒN DÙNG ĐƯỢC. Thử lần lượt cho tới khi được hoặc hết."""
-        if self.state == "off":
+        if self.state == "off" or not self.chain or len(self.chain) <= 1:
             return False
         start_index = self.active_index
         tried_any = False
@@ -1100,9 +1107,12 @@ class SingleChatManager:
             })
 
         active_label = (
-            self.chain[self.active_index]["label"]
-            if (self.chain and 0 <= self.active_index < len(self.chain))
-            else "unknown"
+            "Guest" if (getattr(self, "is_guest", False) and not self.chain)
+            else (
+                self.chain[self.active_index]["label"]
+                if (self.chain and 0 <= self.active_index < len(self.chain))
+                else "unknown"
+            )
         )
 
         is_on = (self.state == "on")
@@ -1132,6 +1142,7 @@ class SingleChatManager:
             "enabled": is_on,
             "enabled_since": enabled_since_iso,
             "auth_ok": auth_ok,
+            "is_guest": getattr(self, "is_guest", False),
             "account_status": account_status,
             "cookie_source": cookie_source,
             "instance_id": INSTANCE_ID or "default",
@@ -1208,7 +1219,7 @@ class SingleChatManager:
             # ─────────────────────────────────────────────────────
             # TẦNG 1: Gửi ảnh trực tiếp lên Gemini (nếu có ảnh)
             # ─────────────────────────────────────────────────────
-            if image_files and self.vision_upload_available:
+            if image_files and self.vision_upload_available and not self.is_guest:
                 try:
                     logger.info(
                         f"[Vision Layer 1] Upload {len(image_files)} ảnh lên Gemini..."
@@ -1234,7 +1245,7 @@ class SingleChatManager:
                     self._save_session()
                     return reply
                 except Exception as img_exc:
-                    if self._is_auth_error(img_exc) or not self._evaluate_auth():
+                    if (self._is_auth_error(img_exc) or not self._evaluate_auth()) and not (self.allow_guest and self.is_guest):
                         raise BridgeAuthError("Gemini chưa đăng nhập (guest/cookie hết hạn).")
                     logger.warning(
                         f"Upload ảnh thất bại ({img_exc}). --> Chuyển sang Local OCR!"
@@ -1338,12 +1349,12 @@ class SingleChatManager:
                     )
 
                     # Cảnh báo cookie hết hạn
-                    if self._consecutive_auth_errors >= 2:
+                    if self._consecutive_auth_errors >= 2 and not self.is_guest:
                         logger.critical(
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
                             "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
                         )
-                        if await self._try_failover_to_backup():
+                        if len(self.chain) > 1 and await self._try_failover_to_backup():
                             continue
 
                     if attempt == 0:
@@ -1363,10 +1374,11 @@ class SingleChatManager:
                             logger.error(f"Init lại client thất bại: {init_exc}")
                             raise BridgeUpstreamError(f"Lỗi kết nối Gemini Web: {init_exc}")
                         if not self._evaluate_auth():
-                            if await self._try_failover_to_backup():
+                            if len(self.chain) > 1 and await self._try_failover_to_backup():
                                 attempt += 1
                                 continue
-                            raise BridgeAuthError("Gemini chưa đăng nhập (guest/cookie hết hạn).")
+                            if not (self.allow_guest and self.is_guest):
+                                raise BridgeAuthError("Gemini chưa đăng nhập (guest/cookie hết hạn).")
                         self._create_new_chat_session(preserve_metadata=saved_meta)
                         attempt += 1
                     else:
@@ -1427,7 +1439,7 @@ class SingleChatManager:
             base_prompt = prompt_to_send
 
             # Tầng 1: stream kèm ảnh trực tiếp (nếu có)
-            if image_files and self.vision_upload_available:
+            if image_files and self.vision_upload_available and not self.is_guest:
                 try:
                     logger.info(
                         f"[Vision Layer 1] Stream {len(image_files)} ảnh lên Gemini..."
@@ -1459,7 +1471,7 @@ class SingleChatManager:
                     self.vision_disabled_until = time.time() + 300
                     full_text = ""
                 except Exception as img_exc:
-                    if self._is_auth_error(img_exc) or not self._evaluate_auth():
+                    if (self._is_auth_error(img_exc) or not self._evaluate_auth()) and not (self.allow_guest and self.is_guest):
                         yield "error", {
                             "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
                             "type": BridgeAuthError.err_type,
@@ -1583,12 +1595,12 @@ class SingleChatManager:
                     logger.warning(
                         f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {exc}"
                     )
-                    if self._consecutive_auth_errors >= 2:
+                    if self._consecutive_auth_errors >= 2 and not self.is_guest:
                         logger.critical(
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
                             "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
                         )
-                        if await self._try_failover_to_backup():
+                        if len(self.chain) > 1 and await self._try_failover_to_backup():
                             continue
                     if attempt == 0:
                         saved_meta = self._chat_metadata_snapshot()
@@ -1609,15 +1621,16 @@ class SingleChatManager:
                             }
                             return
                         if not self._evaluate_auth():
-                            if await self._try_failover_to_backup():
+                            if len(self.chain) > 1 and await self._try_failover_to_backup():
                                 attempt += 1
                                 continue
-                            yield "error", {
-                                "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
-                                "type": BridgeAuthError.err_type,
-                                "code": BridgeAuthError.code,
-                            }
-                            return
+                            if not (self.allow_guest and self.is_guest):
+                                yield "error", {
+                                    "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
+                                    "type": BridgeAuthError.err_type,
+                                    "code": BridgeAuthError.code,
+                                }
+                                return
                         self._create_new_chat_session(preserve_metadata=saved_meta)
                         full_text = ""
                         attempt += 1

@@ -135,6 +135,11 @@ ENABLE_RESPONSE_CACHE = os.getenv("ENABLE_RESPONSE_CACHE", "false").strip().lowe
 from app.accounts import build_account_chain
 
 ACCOUNT_CHAIN = build_account_chain(os.environ)
+ALLOW_GUEST_MODE = os.getenv("ALLOW_GUEST_MODE", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 QUOTA_COOLDOWN_HOURS = float(os.getenv("QUOTA_COOLDOWN_HOURS", "24"))
 AUTH_COOLDOWN_MINUTES = float(os.getenv("AUTH_COOLDOWN_MINUTES", "60"))
 HANDOFF_ENABLE = os.getenv("HANDOFF_ENABLE", "true").strip().lower() in (
@@ -201,7 +206,7 @@ if PEER_LANES and not LANE_ADMIN_TOKEN:
 # 6. STARTUP VALIDATION (Fail-fast)
 # =====================================================================
 def validate_config():
-    """Kiểm tra cấu hình bắt buộc ngay khi khởi động. Dừng sớm nếu thiếu."""
+    """Kiểm tra cấu hình bắt buộc ngay khi khởi động. Dừng sớm nếu thiếu (trừ khi bật ALLOW_GUEST_MODE)."""
     errors = []
     if not ACCOUNT_CHAIN:
         errors.append("SECURE_1PSID is empty!")
@@ -210,6 +215,12 @@ def validate_config():
     elif not SECURE_1PSIDTS:
         errors.append("SECURE_1PSIDTS is empty!")
     if errors:
+        if ALLOW_GUEST_MODE:
+            logger.info(
+                "[CONFIG] Không có cookie SECURE_1PSID/SECURE_1PSIDTS. "
+                "Cấu hình ALLOW_GUEST_MODE=true -> Bridge sẽ chạy ở chế độ KHÁCH (Guest Mode) mặc định."
+            )
+            return
         for e in errors:
             logger.error(f"[CONFIG] {e}")
         logger.error(

@@ -289,11 +289,14 @@ async def update_cookies(request: Request):
 
 
 async def _local_switch_model(model_name: str, keep_chat: bool = True) -> Tuple[int, dict]:
-    if session_manager.state != "on" or not session_manager.auth_ok:
+    is_ready = session_manager.state == "on" and (
+        session_manager.auth_ok or (session_manager.allow_guest and session_manager.is_guest)
+    )
+    if not is_ready:
         return 409, {
             "error": {
                 "code": "lane_not_ready",
-                "message": "Luồng chưa BẬT hoặc chưa đăng nhập.",
+                "message": "Luồng chưa BẬT hoặc chưa sẵn sàng.",
             }
         }
 

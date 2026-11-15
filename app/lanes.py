@@ -49,6 +49,8 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
     total_accs = len(accounts_in)
     active_idx = getattr(manager, "active_index", 0)
     uptime_s = int(time.time() - getattr(manager, "start_time", time.time()))
+    is_on = getattr(manager, "state", "off") == "on"
+    is_guest = getattr(manager, "is_guest", False) is True
 
     return {
         "id": instance_id or "default",
@@ -59,8 +61,11 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
         "reachable": True,
         "control": getattr(manager, "state", "off"),
         "inflight": getattr(manager, "_inflight", 0),
-        "auth_ok": bool(manager.auth_ok) if getattr(manager, "state", "off") == "on" else False,
-        "account_status": (getattr(manager, "account_status_name", "UNKNOWN") or "UNKNOWN") if getattr(manager, "state", "off") == "on" else "UNKNOWN",
+        "auth_ok": bool(manager.auth_ok) if is_on else False,
+        "account_status": (
+            "GUEST" if is_guest
+            else (getattr(manager, "account_status_name", "UNKNOWN") or "UNKNOWN")
+        ) if is_on else "UNKNOWN",
         "active_account": {
             "label": str(active_acc_label),
             "index": active_idx,

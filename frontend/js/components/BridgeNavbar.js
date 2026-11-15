@@ -1,6 +1,6 @@
 import { store } from "../state.js";
 import { t } from "../i18n.js";
-import { getStoredApiKey, clearStoredApiKey } from "../api.js";
+import { api, getStoredApiKey, clearStoredApiKey } from "../api.js";
 
 /**
  * <bridge-navbar> Component
