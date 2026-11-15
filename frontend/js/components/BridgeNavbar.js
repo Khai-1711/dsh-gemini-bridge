@@ -96,31 +96,35 @@ export class BridgeNavbar extends HTMLElement {
               : ""
           }
 
-          <!-- Lane Switcher Pills (Chỉ hiện khi có >= 2 luồng) -->
-          ${
-            Array.isArray(lanes) && lanes.length >= 2
-              ? `
-            <div class="toggle-pill-group lane-pill-group" style="margin-right:2px;">
-              ${lanes
-                .map((l, i) => {
-                  const flowId = l.id || `acc${i + 1}`;
-                  const flowNum = flowId === "acc1" ? 1 : (flowId === "acc2" ? 2 : i + 1);
-                  const isSel = (selectedLane || lanes[0]?.id) === flowId;
-                  const isOff = l.control === "off";
-                  const dotColor = l.reachable === false ? "#ef4444" : (isOff ? "var(--text-muted)" : (l.auth_ok ? "#10b981" : "#f59e0b"));
-                  const flowTitle = l.label && l.label !== flowId ? l.label : (lang === "vi" ? `Luồng ${flowNum}` : `Flow ${flowNum}`);
-                  return `
-                    <button class="toggle-pill-btn ${isSel ? "active" : ""}" data-lane-id="${flowId}" title="${flowTitle} (${flowId}) · Port: ${l.port || (flowId === "acc2" ? 10001 : 10000)}" style="display:inline-flex; align-items:center; gap:6px;">
+          <!-- Lane Switcher Pills với công tắc BẬT / TẮT trực tiếp -->
+          <div class="toggle-pill-group lane-pill-group" style="margin-right:2px; display:inline-flex; align-items:center; gap:4px; padding:2px 4px;">
+            ${(lanes && lanes.length > 0 ? lanes : [{ id: "default", label: "Default", control: "off" }])
+              .map((l, i) => {
+                const flowId = l.id || `acc${i + 1}`;
+                const flowNum = flowId === "acc1" ? 1 : (flowId === "acc2" ? 2 : i + 1);
+                const isSel = (selectedLane || lanes[0]?.id || "default") === flowId;
+                const ctrl = l.control || "off";
+                const isOn = ctrl === "on";
+                const isReachable = l.reachable !== false;
+                const isStarting = ctrl === "starting";
+                const isStopping = ctrl === "stopping";
+                const dotColor = !isReachable ? "#ef4444" : (!isOn ? "var(--text-muted)" : (l.auth_ok ? "#10b981" : "#f59e0b"));
+                const flowTitle = l.label && l.label !== flowId ? l.label : (lang === "vi" ? `Luồng ${flowNum}` : `Flow ${flowNum}`);
+                const btnText = isStarting ? "..." : (isStopping ? "..." : (isOn ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF")));
+                return `
+                  <div class="toggle-pill-btn ${isSel ? "active" : ""}" style="display:inline-flex; align-items:center; gap:6px; padding:3px 8px;">
+                    <span class="lane-select-trigger" data-lane-id="${flowId}" title="${flowTitle} (${flowId}) · Port: ${l.port || (flowId === "acc2" ? 10001 : 10000)}" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
                       <span style="width:7px; height:7px; border-radius:50%; background:${dotColor};"></span>
                       <span>${flowTitle}</span>
+                    </span>
+                    <button type="button" class="lane-power-trigger" data-lane-id="${flowId}" data-action="${isOn ? "disable" : "enable"}" ${!isReachable || isStarting || isStopping ? "disabled" : ""} style="padding:1px 6px; border-radius:8px; font-size:10px; font-weight:700; cursor:pointer; border:1px solid ${isOn ? "rgba(16,185,129,0.5)" : "var(--border-medium)"}; background:${isOn ? "rgba(16,185,129,0.2)" : "var(--bg-secondary)"}; color:${isOn ? "#10b981" : "var(--text-muted)"};">
+                      ${btnText}
                     </button>
-                  `;
-                })
-                .join("")}
-            </div>
-          `
-              : ""
-          }
+                  </div>
+                `;
+              })
+              .join("")}
+          </div>
 
           <!-- Language Switcher Pill -->
           <div class="toggle-pill-group">
@@ -158,12 +162,60 @@ export class BridgeNavbar extends HTMLElement {
   }
 
   setupEvents() {
-    this.querySelectorAll(".lane-pill-group .toggle-pill-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const laneId = btn.getAttribute("data-lane-id");
+    this.querySelectorAll(".lane-select-trigger").forEach((el) => {
+      el.addEventListener("click", () => {
+        const laneId = el.getAttribute("data-lane-id");
         if (laneId && laneId !== store.getState().selectedLane) {
           store.setState({ selectedLane: laneId });
           window.dispatchEvent(new CustomEvent("refresh-request"));
+        }
+      });
+    });
+
+    this.querySelectorAll(".lane-power-trigger").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const laneId = btn.getAttribute("data-lane-id");
+        const action = btn.getAttribute("data-action");
+        const { lang, lanes } = store.getState();
+        const lane = (lanes || []).find((l) => l.id === laneId) || {};
+
+        if (action === "enable") {
+          btn.disabled = true;
+          store.notifyToast(lang === "vi" ? `Đang bật luồng ${laneId}...` : `Enabling lane ${laneId}...`, "info");
+          try {
+            const res = await api.enableLane(laneId);
+            if (res && res.error) {
+              store.notifyToast(res.error.message || "Failed to enable lane", "error");
+            } else {
+              store.notifyToast(lang === "vi" ? `Luồng ${laneId} đã BẬT!` : `Lane ${laneId} enabled!`, "success");
+            }
+          } catch (err) {
+            store.notifyToast(err.message, "error");
+          } finally {
+            btn.disabled = false;
+            window.dispatchEvent(new CustomEvent("refresh-request"));
+          }
+        } else if (action === "disable") {
+          const inflight = lane.inflight || 0;
+          const label = lane.label || laneId;
+          const msg = t("confirmDisableLane", lang, { id: laneId, label, n: inflight });
+          if (!window.confirm(msg)) return;
+
+          btn.disabled = true;
+          try {
+            const res = await api.disableLane(laneId);
+            if (res && res.error) {
+              store.notifyToast(res.error.message || "Failed to disable lane", "error");
+            } else {
+              store.notifyToast(lang === "vi" ? `Luồng ${laneId} đã TẮT.` : `Lane ${laneId} disabled.`, "info");
+            }
+          } catch (err) {
+            store.notifyToast(err.message, "error");
+          } finally {
+            btn.disabled = false;
+            window.dispatchEvent(new CustomEvent("refresh-request"));
+          }
         }
       });
     });

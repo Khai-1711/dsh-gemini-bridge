@@ -55,7 +55,38 @@ export class BridgeQuickActions extends HTMLElement {
     const lane = this.getCurrentLane(state);
     const laneId = lane.id || state.selectedLane || "default";
     const laneReachable = lane.reachable !== false;
+    const ctrl = lane.control || "off";
+    const isOn = ctrl === "on";
+    const isStarting = ctrl === "starting";
+    const isStopping = ctrl === "stopping";
+    const isLocked = !laneReachable || isStarting || isStopping;
     const unavailableTitle = t("laneUnreachableAction", lang, { id: laneId });
+
+    let powerText = "";
+    let powerIcon = "";
+    let powerClass = "";
+
+    if (!laneReachable) {
+      powerText = lang === "vi" ? `Luồng ${laneId} không phản hồi` : `Lane ${laneId} unreachable`;
+      powerIcon = `✕`;
+      powerClass = "btn-secondary";
+    } else if (isStarting) {
+      powerText = lang === "vi" ? "Đang bật..." : "Starting...";
+      powerIcon = `◐`;
+      powerClass = "btn-secondary";
+    } else if (isStopping) {
+      powerText = lang === "vi" ? "Đang tắt..." : "Stopping...";
+      powerIcon = `◐`;
+      powerClass = "btn-secondary";
+    } else if (isOn) {
+      powerText = lang === "vi" ? `TẮT Luồng (${laneId})` : `Disable Lane (${laneId})`;
+      powerIcon = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
+      powerClass = "btn-danger";
+    } else {
+      powerText = lang === "vi" ? `BẬT Luồng (${laneId})` : `Enable Lane (${laneId})`;
+      powerIcon = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
+      powerClass = "btn-primary";
+    }
 
     const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : 1);
     const showLaneTag = Array.isArray(lanes) && lanes.length >= 2;
@@ -73,8 +104,16 @@ export class BridgeQuickActions extends HTMLElement {
           </div>
         </div>
         <div class="panel-body">
+          <!-- Công tắc BẬT / TẮT luồng -->
+          <div style="margin-bottom: 10px;">
+            <button class="btn ${powerClass}" id="qa-power-btn" style="width: 100%; justify-content: center; font-weight: 600; padding: 8px 12px; gap: 8px;" ${isLocked ? "disabled" : ""}>
+              ${powerIcon}
+              <span>${powerText}</span>
+            </button>
+          </div>
+
           <div class="btn-group">
-            <button class="btn btn-danger" id="qa-reset-btn" style="flex: 1;" title="${laneReachable ? t("resetSessionTitle", lang) : unavailableTitle}" ${!laneReachable ? "disabled" : ""}>
+            <button class="btn btn-secondary" id="qa-reset-btn" style="flex: 1;" title="${laneReachable ? t("resetSessionTitle", lang) : unavailableTitle}" ${!laneReachable ? "disabled" : ""}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
               ${t("resetSessionBtn", lang)}
             </button>
@@ -89,8 +128,66 @@ export class BridgeQuickActions extends HTMLElement {
   }
 
   setupEvents() {
+    this.querySelector("#qa-power-btn")?.addEventListener("click", () => this.handlePowerToggle());
     this.querySelector("#qa-reset-btn")?.addEventListener("click", () => this.handleReset());
     this.querySelector("#qa-clear-cache-btn")?.addEventListener("click", () => this.handleClearCache());
+  }
+
+  async handlePowerToggle() {
+    const state = store.getState();
+    const { lang, lanes } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+    if (lane.reachable === false) {
+      store.notifyToast(t("laneUnreachableAction", lang, { id: laneId }), "warning");
+      return;
+    }
+
+    const ctrl = lane.control || "off";
+    const btn = this.querySelector("#qa-power-btn");
+
+    if (ctrl === "off") {
+      if (btn) btn.disabled = true;
+      store.notifyToast(lang === "vi" ? `Đang bật luồng ${laneId}...` : `Enabling lane ${laneId}...`, "info");
+      try {
+        const res = await api.enableLane(laneId);
+        if (res && res.error) {
+          store.notifyToast(res.error.message || "Failed to enable lane", "error");
+        } else {
+          store.notifyToast(lang === "vi" ? `Luồng ${laneId} đã BẬT thành công!` : `Lane ${laneId} enabled!`, "success");
+        }
+      } catch (err) {
+        store.notifyToast(err.message, "error");
+      } finally {
+        if (btn) btn.disabled = false;
+        window.dispatchEvent(new CustomEvent("refresh-request"));
+      }
+    } else if (ctrl === "on") {
+      const inflight = lane.inflight || 0;
+      const label = lane.label || laneId;
+      const msg = t("confirmDisableLane", lang, {
+        id: laneId,
+        label,
+        n: inflight,
+      });
+
+      if (!window.confirm(msg)) return;
+
+      if (btn) btn.disabled = true;
+      try {
+        const res = await api.disableLane(laneId);
+        if (res && res.error) {
+          store.notifyToast(res.error.message || "Failed to disable lane", "error");
+        } else {
+          store.notifyToast(lang === "vi" ? `Luồng ${laneId} đã TẮT.` : `Lane ${laneId} disabled.`, "info");
+        }
+      } catch (err) {
+        store.notifyToast(err.message, "error");
+      } finally {
+        if (btn) btn.disabled = false;
+        window.dispatchEvent(new CustomEvent("refresh-request"));
+      }
+    }
   }
 
   updateAvailability(state) {
