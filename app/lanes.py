@@ -3,9 +3,14 @@ Không import app.config ở phạm vi toàn cục để dễ test và tránh ph
 """
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
+from app.lane_security import is_loopback_url
 
 
 def _port_from_url(url: str) -> Optional[int]:
@@ -30,6 +35,48 @@ def _parse_uptime(uptime_val: Any) -> int:
         except Exception:
             return 0
     return 0
+
+
+def spawn_local_lane(lane_id: str) -> bool:
+    """Tự động khởi chạy tiến trình luồng con trên máy cục bộ (Windows / Linux)."""
+    try:
+        base_dir = Path(__file__).resolve().parent.parent
+        env_file = base_dir / f".env.{lane_id}"
+        if not env_file.exists():
+            return False
+
+        env = os.environ.copy()
+        env["BRIDGE_INSTANCE"] = lane_id
+
+        log_dir = base_dir / "logs"
+        log_dir.mkdir(exist_ok=True)
+        spawn_log = open(log_dir / f"spawn_{lane_id}.log", "a", encoding="utf-8")
+
+        if sys.platform == "win32":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen(
+                [sys.executable, str(base_dir / "main.py")],
+                cwd=str(base_dir),
+                env=env,
+                creationflags=flags,
+                stdout=spawn_log,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+        else:
+            subprocess.Popen(
+                [sys.executable, str(base_dir / "main.py")],
+                cwd=str(base_dir),
+                env=env,
+                stdout=spawn_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return True
+    except Exception:
+        return False
 
 
 def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", instance_label: str = "", cache_enabled: bool = False) -> Dict[str, Any]:
@@ -171,12 +218,21 @@ async def urllib_call(method: str, url: str, headers: dict = None, body: bytes =
 class LaneRegistry:
     """Bộ điều phối danh bạ và gọi chéo giữa các luồng agent."""
 
-    def __init__(self, self_id: str, peers: Dict[str, str], token: str, http_call: Callable = urllib_call, cache_ttl: float = 4.0):
+    def __init__(
+        self,
+        self_id: str,
+        peers: Dict[str, str],
+        token: str,
+        http_call: Callable = urllib_call,
+        cache_ttl: float = 4.0,
+        spawn_fn: Optional[Callable[[str], bool]] = None,
+    ):
         self.self_id = self_id or "default"
         self.peers = peers or {}
         self.token = token or ""
         self.http_call = http_call
         self.cache_ttl = cache_ttl
+        self.spawn_fn = spawn_fn
         self._peer_status_cache: Dict[str, Dict[str, Any]] = {}
         self._peer_cache_ts: Dict[str, float] = {}
 
@@ -275,7 +331,22 @@ class LaneRegistry:
             "X-Lane-Token": self.token,
             "Content-Type": "application/json",
         }
-        status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=timeout)
+        cached = self._peer_status_cache.get(lane_id)
+        is_known_down = bool(cached and cached.get("reachable") is False)
+        call_timeout = 2.0 if (action == "enable" and (is_known_down or self.spawn_fn)) else timeout
+        status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=call_timeout)
+        if status_code == 0 and action == "enable" and self.spawn_fn and is_loopback_url(peer_url):
+            if self.spawn_fn(lane_id):
+                for _ in range(12):
+                    await asyncio.sleep(0.8)
+                    st_code, st_body = await self.http_call("GET", f"{peer_url}/v1/lanes/{lane_id}/status", headers=headers, body=None, timeout=2.0)
+                    if st_code == 200 and isinstance(st_body, dict):
+                        if st_body.get("state") != "on":
+                            status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=timeout)
+                        else:
+                            status_code, body = 200, st_body
+                        break
+
         if status_code == 0:
             err = body.get("error") if isinstance(body, dict) else "unreachable"
             self._peer_status_cache[lane_id] = {

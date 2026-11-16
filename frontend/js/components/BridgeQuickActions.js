@@ -59,7 +59,7 @@ export class BridgeQuickActions extends HTMLElement {
     const isOn = ctrl === "on";
     const isStarting = ctrl === "starting";
     const isStopping = ctrl === "stopping";
-    const isLocked = !laneReachable || isStarting || isStopping;
+    const isLocked = isStarting || isStopping;
     const unavailableTitle = t("laneUnreachableAction", lang, { id: laneId });
 
     let powerText = "";
@@ -67,9 +67,9 @@ export class BridgeQuickActions extends HTMLElement {
     let powerClass = "";
 
     if (!laneReachable) {
-      powerText = lang === "vi" ? `Luồng ${laneId} không phản hồi` : `Lane ${laneId} unreachable`;
-      powerIcon = `✕`;
-      powerClass = "btn-secondary";
+      powerText = lang === "vi" ? `Khởi động Luồng (${laneId})` : `Start Lane (${laneId})`;
+      powerIcon = `▶`;
+      powerClass = "btn-primary";
     } else if (isStarting) {
       powerText = lang === "vi" ? "Đang bật..." : "Starting...";
       powerIcon = `◐`;
@@ -138,10 +138,6 @@ export class BridgeQuickActions extends HTMLElement {
     const { lang, lanes } = state;
     const lane = this.getCurrentLane(state);
     const laneId = lane.id || state.selectedLane || "default";
-    if (lane.reachable === false) {
-      store.notifyToast(t("laneUnreachableAction", lang, { id: laneId }), "warning");
-      return;
-    }
 
     const ctrl = lane.control || "off";
     const btn = this.querySelector("#qa-power-btn");

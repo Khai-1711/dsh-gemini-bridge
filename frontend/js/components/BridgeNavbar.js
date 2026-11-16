@@ -117,7 +117,7 @@ export class BridgeNavbar extends HTMLElement {
                       <span style="width:7px; height:7px; border-radius:50%; background:${dotColor};"></span>
                       <span>${flowTitle}</span>
                     </span>
-                    <button type="button" class="lane-power-trigger" data-lane-id="${flowId}" data-action="${isOn ? "disable" : "enable"}" ${!isReachable || isStarting || isStopping ? "disabled" : ""} style="padding:1px 6px; border-radius:8px; font-size:10px; font-weight:700; cursor:pointer; border:1px solid ${isOn ? "rgba(16,185,129,0.5)" : "var(--border-medium)"}; background:${isOn ? "rgba(16,185,129,0.2)" : "var(--bg-secondary)"}; color:${isOn ? "#10b981" : "var(--text-muted)"};">
+                    <button type="button" class="lane-power-trigger" data-lane-id="${flowId}" data-action="${isOn ? "disable" : "enable"}" ${isStarting || isStopping ? "disabled" : ""} style="padding:1px 6px; border-radius:8px; font-size:10px; font-weight:700; cursor:pointer; border:1px solid ${isOn ? "rgba(16,185,129,0.5)" : "var(--border-medium)"}; background:${isOn ? "rgba(16,185,129,0.2)" : "var(--bg-secondary)"}; color:${isOn ? "#10b981" : "var(--text-muted)"};">
                       ${btnText}
                     </button>
                   </div>

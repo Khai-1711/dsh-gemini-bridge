@@ -60,7 +60,7 @@ from app.lane_security import (
     is_loopback_url,
     lane_token_ok,
 )
-from app.lanes import LaneRegistry, build_local_lane_status
+from app.lanes import LaneRegistry, build_local_lane_status, spawn_local_lane
 from app.prompt_builder import build_incremental_prompt_and_files, compile_tools_prompt
 from app.streaming import ToolCallAwareStreamer
 from app.tool_parser import parse_tool_calls_from_reply
@@ -422,6 +422,7 @@ lane_registry = LaneRegistry(
     self_id=INSTANCE_ID or "default",
     peers=PEER_LANES,
     token=LANE_ADMIN_TOKEN,
+    spawn_fn=spawn_local_lane,
 )
 
 

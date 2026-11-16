@@ -198,7 +198,7 @@ export class BridgeLanes extends HTMLElement {
     if (!isReachable) {
       dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; border:1.5px dashed #ef4444; color:#ef4444; text-align:center; font-size:7px; line-height:8px;">✕</span>`;
       statusText = t("stateUnreachableText", lang, { id: laneId });
-      switchState = "none";
+      switchState = "off";
     } else if (ctrl === "starting") {
       dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border:2px solid #3b82f6; border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite;"></span>`;
       statusText = t("stateStartingText", lang);
@@ -343,7 +343,7 @@ export class BridgeLanes extends HTMLElement {
       if (!isReachable) {
         dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; border:1.5px dashed #ef4444; color:#ef4444; text-align:center; font-size:7px; line-height:8px;">✕</span>`;
         statusText = t("stateUnreachableText", lang, { id: laneId });
-        switchState = "none";
+        switchState = "off";
       } else if (ctrl === "starting") {
         dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border:2px solid #3b82f6; border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite;"></span>`;
         statusText = t("stateStartingText", lang);
@@ -482,8 +482,6 @@ export class BridgeLanes extends HTMLElement {
         ) {
           return;
         }
-
-        if (row.classList.contains("unreachable")) return;
 
         const laneId = row.getAttribute("data-row-lane");
         if (laneId && laneId !== store.getState().selectedLane) {
