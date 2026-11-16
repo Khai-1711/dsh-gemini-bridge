@@ -53,6 +53,21 @@ export class BridgeLanes extends HTMLElement {
     return tag ? `${prefix} (${tag})` : prefix;
   }
 
+  renderEnvBadge(lane, lang) {
+    if (!lane) return "";
+    const hasEnv = Boolean(lane.has_env_id);
+    const envFile = lane.env_file || (lane.id ? `.env.${lane.id}` : ".env");
+    const idStatus = lane.id_status || (hasEnv ? (lane.auth_ok ? "valid" : (lane.control === "on" ? "expired" : "ready")) : "missing");
+
+    if (hasEnv && idStatus === "expired") {
+      return `<span class="badge-tag" style="background: rgba(239, 68, 68, 0.18); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.4); font-size: 10px; font-weight: 600; margin-left: 4px;" title="${t("idExpiredTitle", lang, { file: envFile })}">❌ ${envFile} (${lang === "vi" ? "Hết hạn" : "Expired"})</span>`;
+    }
+    if (hasEnv) {
+      return `<span class="badge-tag" style="background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.35); font-size: 10px; font-weight: 600; margin-left: 4px;" title="${t("idLoadedFromEnv", lang, { file: envFile })}">✅ ${envFile}</span>`;
+    }
+    return `<span class="badge-tag" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border: 1px solid rgba(245, 158, 11, 0.35); font-size: 10px; margin-left: 4px;" title="${t("idMissingFromEnv", lang, { file: envFile })}">⚠️ ${envFile}</span>`;
+  }
+
   getLanePort(lane) {
     const port = Number(lane.port);
     if (Number.isInteger(port) && port > 0) return port;
@@ -191,6 +206,8 @@ export class BridgeLanes extends HTMLElement {
     const errCount = lane.errors || 0;
 
     const rowTitle = this.getLaneTitle(laneId, lane.label, flowNum, lang);
+    const hasEnv = Boolean(lane.has_env_id);
+    const envFile = lane.env_file || (laneId !== "default" ? `.env.${laneId}` : ".env");
 
     // Trạng thái (chấm + chữ)
     let dotHtml = "";
@@ -214,8 +231,8 @@ export class BridgeLanes extends HTMLElement {
       statusText = t("stateActiveText", lang);
       switchState = "on";
     } else if (ctrl === "on" && !authOk) {
-      dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#f59e0b; box-shadow:0 0 5px rgba(245,158,11,0.7);"></span>`;
-      statusText = t("stateUnauthText", lang);
+      dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ef4444; box-shadow:0 0 5px rgba(239,68,68,0.7);"></span>`;
+      statusText = hasEnv ? t("stateExpiredText", lang, { file: envFile }) : t("stateUnauthText", lang);
       switchState = "on";
     } else {
       dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; border:1.5px solid var(--text-muted); background:transparent;"></span>`;
@@ -250,9 +267,10 @@ export class BridgeLanes extends HTMLElement {
       <div class="${rowClass}" data-row-lane="${laneId}">
         <!-- Hàng 1: Tiêu đề luồng & Model -->
         <div class="lane-row-header">
-          <div class="lane-row-title">
+          <div class="lane-row-title" style="display:flex; align-items:center; flex-wrap:wrap; gap:4px;">
             <span class="lane-row-title-label">${rowTitle}</span>
             ${laneId !== "default" ? `<span class="badge-tag" style="font-size:10.5px; opacity:0.75;">${laneId}</span>` : ""}
+            <span class="lane-env-badge-container">${this.renderEnvBadge(lane, lang)}</span>
           </div>
           <span class="lane-model" style="font-size:11px; color:var(--accent-cyan); font-family:var(--font-mono);" ${lane.model ? "" : "hidden"}>${lane.model || ""}</span>
         </div>
@@ -261,9 +279,9 @@ export class BridgeLanes extends HTMLElement {
         <div class="lane-row-status-line">
           <div class="lane-status-indicator">
             <span class="lane-dot-wrapper">${dotHtml}</span>
-            <span class="lane-status-text" style="color:${ctrl === 'on' && !authOk ? '#f59e0b' : 'var(--text-primary)'};">${statusText}</span>
-            <button type="button" class="btn btn-secondary btn-sm lane-action-cookie lane-action-cookie-quick" data-lane-id="${laneId}" style="padding:2px 8px; font-size:11px; margin-left:6px;" ${!authOk && ctrl === "on" ? "" : "hidden"} ${!isReachable ? "disabled" : ""}>
-              ${t("btnLoadCookie", lang)}
+            <span class="lane-status-text" style="color:${ctrl === 'on' && !authOk ? '#ef4444' : 'var(--text-primary)'}; font-weight:${ctrl === 'on' && !authOk ? '600' : 'normal'};">${statusText}</span>
+            <button type="button" class="btn btn-secondary btn-sm lane-action-cookie lane-action-cookie-quick" data-lane-id="${laneId}" style="padding:2px 8px; font-size:11px; margin-left:6px; ${ctrl === 'on' && !authOk ? 'color:#ef4444; border-color:rgba(239,68,68,0.4);' : ''}" ${!authOk && ctrl === "on" ? "" : "hidden"} ${!isReachable ? "disabled" : ""}>
+              🔑 ${hasEnv ? t("btnLoadNewId", lang) : t("btnLoadCookie", lang)}
             </button>
           </div>
           <div class="lane-toggle-wrapper">
@@ -337,6 +355,8 @@ export class BridgeLanes extends HTMLElement {
       // Cập nhật trạng thái
       const dotWrapper = row.querySelector(".lane-dot-wrapper");
       const statusTextEl = row.querySelector(".lane-status-text");
+      const hasEnv = Boolean(lane.has_env_id);
+      const envFile = lane.env_file || (laneId !== "default" ? `.env.${laneId}` : ".env");
 
       let dotHtml = "";
       let statusText = "";
@@ -359,8 +379,8 @@ export class BridgeLanes extends HTMLElement {
         statusText = t("stateActiveText", lang);
         switchState = "on";
       } else if (ctrl === "on" && !authOk) {
-        dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#f59e0b; box-shadow:0 0 5px rgba(245,158,11,0.7);"></span>`;
-        statusText = t("stateUnauthText", lang);
+        dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ef4444; box-shadow:0 0 5px rgba(239,68,68,0.7);"></span>`;
+        statusText = hasEnv ? t("stateExpiredText", lang, { file: envFile }) : t("stateUnauthText", lang);
         switchState = "on";
       } else {
         dotHtml = `<span class="lane-status-dot" style="display:inline-block; width:8px; height:8px; border-radius:50%; border:1.5px solid var(--text-muted); background:transparent;"></span>`;
@@ -371,9 +391,15 @@ export class BridgeLanes extends HTMLElement {
       if (dotWrapper) dotWrapper.innerHTML = dotHtml;
       if (statusTextEl) {
         statusTextEl.textContent = statusText;
-        statusTextEl.style.color = ctrl === "on" && !authOk ? "#f59e0b" : "var(--text-primary)";
+        statusTextEl.style.color = ctrl === "on" && !authOk ? "#ef4444" : "var(--text-primary)";
+        statusTextEl.style.fontWeight = ctrl === "on" && !authOk ? "600" : "normal";
       }
       row.classList.toggle("unreachable", !isReachable);
+
+      const envBadgeContainer = row.querySelector(".lane-env-badge-container");
+      if (envBadgeContainer) {
+        envBadgeContainer.innerHTML = this.renderEnvBadge(lane, lang);
+      }
 
       const flowNum = laneId === "acc1" ? 1 : (laneId === "acc2" ? 2 : index + 1);
       const titleEl = row.querySelector(".lane-row-title-label");
@@ -401,7 +427,10 @@ export class BridgeLanes extends HTMLElement {
         const code = chatKeyEl.querySelector("code");
         if (code) code.textContent = lane.chat_key || "";
       }
-      if (quickCookieButton) quickCookieButton.hidden = !(ctrl === "on" && !authOk);
+      if (quickCookieButton) {
+        quickCookieButton.hidden = !(ctrl === "on" && !authOk);
+        quickCookieButton.innerHTML = `🔑 ${hasEnv ? t("btnLoadNewId", lang) : t("btnLoadCookie", lang)}`;
+      }
       row.querySelectorAll(".lane-action-cookie, .lane-action-reauth, .lane-action-reset").forEach((button) => {
         button.disabled = !isReachable;
       });

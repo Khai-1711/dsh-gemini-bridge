@@ -1134,6 +1134,28 @@ class SingleChatManager:
 
         status_str = "off" if self.state == "off" else ("ok" if self.auth_ok else "degraded")
 
+        env_path = INSTANCE_PATHS.get("env_file") if isinstance(INSTANCE_PATHS, dict) else None
+        env_file_name = env_path.name if env_path else (".env." + INSTANCE_ID if INSTANCE_ID else ".env")
+        has_env_id = bool(self._active_psid or (self.chain and len(self.chain) > 0 and self.chain[0].get("psid")))
+        if not has_env_id and env_path and env_path.exists():
+            try:
+                for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if line.startswith("SECURE_1PSID=") and len(line.split("=", 1)[1].strip()) >= 10:
+                        has_env_id = True
+                        break
+            except Exception:
+                pass
+
+        if not has_env_id:
+            id_status = "missing"
+        elif is_on and not self.auth_ok:
+            id_status = "expired"
+        elif is_on and self.auth_ok:
+            id_status = "valid"
+        else:
+            id_status = "ready"
+
         last_act = None
         if self.last_request_ts > 0:
             try:
@@ -1174,6 +1196,9 @@ class SingleChatManager:
             "inflight": self._inflight,
             "chat_key": self.current_chat_key(),
             "last_activity_ts": last_act,
+            "has_env_id": has_env_id,
+            "env_file": env_file_name,
+            "id_status": id_status,
         }
 
     async def send_prepared_turn(

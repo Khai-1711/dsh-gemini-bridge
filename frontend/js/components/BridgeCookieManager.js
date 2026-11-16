@@ -43,27 +43,93 @@ export class BridgeCookieManager extends HTMLElement {
     return lanes.find((l) => l.id === sel) || lanes[0] || {};
   }
 
-  getSlotOptionText(slot, accounts, lang) {
-    const account = accounts[slot];
+  renderEnvIdBanner(lane, lang) {
+    if (!lane) return "";
+    const envFile = lane.env_file || (lane.id ? `.env.${lane.id}` : ".env");
+    const hasEnv = Boolean(lane.has_env_id);
+    const idStatus = lane.id_status || (hasEnv ? (lane.auth_ok ? "valid" : (lane.control === "on" ? "expired" : "ready")) : "missing");
+
+    if (hasEnv && idStatus === "expired") {
+      return `
+        <div class="env-id-banner expired" style="margin-bottom: 14px; padding: 12px 14px; border-radius: 8px; background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.4); color: #ef4444;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 18px; line-height: 1;">❌</span>
+              <strong style="font-size: 13px; color: #ef4444;">${t("idExpiredTitle", lang, { file: envFile })}</strong>
+            </div>
+            <span class="badge-tag" style="background: #ef4444; color: #fff; font-weight: 700; font-size: 10px; padding: 2px 6px; border-radius: 4px;">CẦN ID MỚI</span>
+          </div>
+          <div style="margin-top: 6px; font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding-left: 26px;">
+            ⚠️ ${t("idExpiredAction", lang, { file: envFile })}
+          </div>
+        </div>
+      `;
+    }
+
+    if (hasEnv) {
+      return `
+        <div class="env-id-banner ready" style="margin-bottom: 14px; padding: 10px 14px; border-radius: 8px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.35); color: #10b981;">
+          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 18px; line-height: 1;">✅</span>
+              <div>
+                <strong style="font-size: 13px; color: #10b981;">${t("idLoadedFromEnv", lang, { file: envFile })}</strong>
+                <div style="font-size: 11.5px; opacity: 0.85; margin-top: 2px;">${t("idReadyDesc", lang, { file: envFile })}</div>
+              </div>
+            </div>
+            <span class="badge-tag badge-success" style="font-size: 10.5px; font-weight: 700;">READY</span>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="env-id-banner missing" style="margin-bottom: 14px; padding: 10px 14px; border-radius: 8px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.35); color: #f59e0b;">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 18px; line-height: 1;">⚠️</span>
+            <div>
+              <strong style="font-size: 13px; color: #f59e0b;">${t("idMissingFromEnv", lang, { file: envFile })}</strong>
+              <div style="font-size: 11.5px; opacity: 0.85; margin-top: 2px;">${t("idMissingDesc", lang, { file: envFile })}</div>
+            </div>
+          </div>
+          <span class="badge-tag badge-warning" style="font-size: 10.5px; font-weight: 700;">MISSING</span>
+        </div>
+      </div>
+    `;
+  }
+
+  getSlotOptionText(slot, accounts, lang, lane) {
+    const account = accounts && accounts[slot];
     const name = slot === 0 ? t("slotPrimary", lang) : t("slotBackup", lang, { n: slot });
     const accountLabel = account && account.label ? `[${account.label}] ` : "";
+
+    if (slot === 0 && lane && lane.has_env_id) {
+      const envFile = lane.env_file || (lane.id ? `.env.${lane.id}` : ".env");
+      if (lane.id_status === "expired") {
+        return `${name} ${accountLabel}· ${t("slotExpiredFromEnv", lang)} (${envFile})`;
+      }
+      return `${name} ${accountLabel}· ${t("slotLoadedFromEnv", lang, { file: envFile })}`;
+    }
 
     if (account) {
       return `${name} ${accountLabel}· ${account.status || "ready"}`;
     }
-    if (slot === accounts.length) {
+    const accLen = accounts ? accounts.length : 0;
+    if (slot === accLen) {
       return `${name} · ${t("slotCanAdd", lang)}`;
     }
     return `${name} · ${t("slotRequiresPrevious", lang, { n: slot - 1 })}`;
   }
 
-  updateSlotOptions(accounts, lang) {
+  updateSlotOptions(accounts, lang, lane) {
     for (let slot = 0; slot <= 4; slot++) {
       const option = this.slotSelect?.querySelector(`option[value="${slot}"]`);
       if (!option) continue;
 
-      option.textContent = this.getSlotOptionText(slot, accounts, lang);
-      option.disabled = slot > accounts.length;
+      option.textContent = this.getSlotOptionText(slot, accounts, lang, lane);
+      const accLen = accounts ? accounts.length : 0;
+      option.disabled = slot > Math.max(accLen, (lane && lane.has_env_id) ? 1 : 0);
     }
   }
 
@@ -110,6 +176,10 @@ export class BridgeCookieManager extends HTMLElement {
           <span class="badge-tag badge-success">${t("hotReloadTag", lang)}</span>
         </div>
         <div class="panel-body">
+          <div id="cm-env-banner-container">
+            ${this.renderEnvIdBanner(lane, lang)}
+          </div>
+
           <!-- Chọn ô tài khoản Slot 0..4 -->
           <div class="form-field">
             <label class="field-label" for="cm-slot">
@@ -173,8 +243,8 @@ export class BridgeCookieManager extends HTMLElement {
     this.saveBtn = this.querySelector("#cm-save-btn");
 
     if (this.slotSelect) {
-      this.updateSlotOptions(accounts, lang);
-      this.slotSelect.value = this.getSelectableSlot(savedSlot, accounts.length);
+      this.updateSlotOptions(accounts, lang, lane);
+      this.slotSelect.value = this.getSelectableSlot(savedSlot, Math.max(accounts.length, lane.has_env_id ? 1 : 0));
     }
   }
 
@@ -193,14 +263,20 @@ export class BridgeCookieManager extends HTMLElement {
         : "";
     }
 
+    // Cập nhật banner trạng thái ID từ .env
+    const bannerContainer = this.querySelector("#cm-env-banner-container");
+    if (bannerContainer) {
+      bannerContainer.innerHTML = this.renderEnvIdBanner(lane, state.lang);
+    }
+
     // Cập nhật text của các option trong #cm-slot mà KHÔNG thay đổi select.value
     if (this.slotSelect) {
       const currentSelectedVal = this.slotSelect.value;
       const accounts = lane.accounts || [];
-      this.updateSlotOptions(accounts, state.lang);
+      this.updateSlotOptions(accounts, state.lang, lane);
 
       // Giữ nguyên giá trị người dùng đang chọn
-      this.slotSelect.value = this.getSelectableSlot(currentSelectedVal, accounts.length);
+      this.slotSelect.value = this.getSelectableSlot(currentSelectedVal, Math.max(accounts.length, lane.has_env_id ? 1 : 0));
     }
     if (this.saveBtn && !this.saveBtn.dataset.busy) {
       this.saveBtn.disabled = lane.reachable === false;

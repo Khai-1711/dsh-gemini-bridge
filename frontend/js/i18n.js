@@ -146,6 +146,16 @@ export const translations = {
     startingGateway: "Đang bật lại Cổng 10000...",
     gatewayStartedSuccess: "Cổng 10000 đã BẬT thành công!",
     gatewayManualStartTip: "Cổng 10000 đang tắt. Hãy chạy file run_frontend.bat hoặc run_all.bat để bật lại.",
+    btnLoadNewId: "Nạp ID mới",
+    idLoadedFromEnv: "✅ Đã nạp từ {file} (ID Sẵn sàng)",
+    idReadyDesc: "ID / Cookie phiên Gemini đã sẵn sàng trong {file}.",
+    idExpiredTitle: "❌ ID từ {file} đã hết hạn!",
+    idExpiredAction: "Vui lòng nạp ID/Cookie mới vào các ô bên dưới để cập nhật lại {file}.",
+    idMissingFromEnv: "⚠️ Chưa có ID trong {file}",
+    idMissingDesc: "Luồng này chưa được cấu hình cookie. Vui lòng nạp ID/Cookie mới vào ô bên dưới.",
+    slotLoadedFromEnv: "✅ Đã nạp từ {file}",
+    slotExpiredFromEnv: "❌ ID hết hạn",
+    stateExpiredText: "❌ ID từ {file} hết hạn - Cần nạp ID mới",
   },
 
   en: {
@@ -291,6 +301,16 @@ export const translations = {
     startingGateway: "Starting Port 10000...",
     gatewayStartedSuccess: "Port 10000 started successfully!",
     gatewayManualStartTip: "Port 10000 is stopped. Run run_frontend.bat or run_all.bat to start it.",
+    btnLoadNewId: "Enter New ID",
+    idLoadedFromEnv: "✅ Loaded from {file} (ID Ready)",
+    idReadyDesc: "Gemini session ID / Cookie is ready in {file}.",
+    idExpiredTitle: "❌ ID from {file} has expired!",
+    idExpiredAction: "Please enter a new ID/Cookie in the fields below to update {file}.",
+    idMissingFromEnv: "⚠️ No ID configured in {file}",
+    idMissingDesc: "This lane does not have cookies configured yet. Please enter a new ID/Cookie below.",
+    slotLoadedFromEnv: "✅ Loaded from {file}",
+    slotExpiredFromEnv: "❌ ID expired",
+    stateExpiredText: "❌ ID from {file} expired - Needs new ID",
   },
 };
 

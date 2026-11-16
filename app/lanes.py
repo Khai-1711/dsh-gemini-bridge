@@ -3,6 +3,7 @@ Không import app.config ở phạm vi toàn cục để dễ test và tránh ph
 """
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -11,6 +12,41 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 from app.lane_security import is_loopback_url
+
+logger = logging.getLogger("dsh.lanes")
+
+
+def check_env_file_id(lane_id: str, base_dir: Optional[Path] = None) -> Tuple[bool, str]:
+    """Kiểm tra xem file .env tương ứng với lane_id có chứa SECURE_1PSID hợp lệ không (Zero-Leak).
+    Trả về (has_env_id, env_filename).
+    """
+    if base_dir is None:
+        base_dir = Path(__file__).resolve().parent.parent
+    is_gw = lane_id in ("frontend", "gateway", "10000", "default", "")
+    env_name = ".env" if is_gw else f".env.{lane_id}"
+    env_path = base_dir / env_name
+    if not env_path.exists():
+        if not is_gw and lane_id == "default":
+            env_path = base_dir / ".env"
+            env_name = ".env"
+        if not env_path.exists():
+            return False, env_name
+
+    try:
+        content = env_path.read_text(encoding="utf-8", errors="replace")
+        for line in content.splitlines():
+            line = line.strip()
+            if line.startswith("#") or not line:
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k == "SECURE_1PSID" and len(v) >= 10:
+                    return True, env_name
+    except Exception:
+        pass
+    return False, env_name
 
 
 def _port_from_url(url: str) -> Optional[int]:
@@ -87,7 +123,7 @@ def spawn_local_lane(lane_id: str) -> bool:
 
 def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", instance_label: str = "", cache_enabled: bool = False) -> Dict[str, Any]:
     """Dựng trạng thái của chính luồng này theo đúng lược đồ JSON chuẩn."""
-    status = manager.get_status()
+    status = manager.get_status() if hasattr(manager, "get_status") else {}
     accounts_in = status.get("accounts", [])
     accs = []
     for a in accounts_in:
@@ -104,6 +140,26 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
     uptime_s = int(time.time() - getattr(manager, "start_time", time.time()))
     is_on = getattr(manager, "state", "off") == "on"
     is_guest = getattr(manager, "is_guest", False) is True
+
+    has_env_id = status.get("has_env_id") if isinstance(status, dict) else None
+    env_file = status.get("env_file") if isinstance(status, dict) else None
+    id_status = status.get("id_status") if isinstance(status, dict) else None
+
+    if has_env_id is None or env_file is None or id_status is None:
+        chk_has, chk_file = check_env_file_id(instance_id)
+        if has_env_id is None:
+            has_env_id = chk_has
+        if env_file is None:
+            env_file = chk_file
+        if id_status is None:
+            if not has_env_id:
+                id_status = "missing"
+            elif is_on and not getattr(manager, "auth_ok", False):
+                id_status = "expired"
+            elif is_on and getattr(manager, "auth_ok", False):
+                id_status = "valid"
+            else:
+                id_status = "ready"
 
     return {
         "id": instance_id or "default",
@@ -133,6 +189,9 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
         "last_activity_ts": status.get("last_activity_ts"),
         "cache_enabled": bool(cache_enabled),
         "controllable": True,
+        "has_env_id": bool(has_env_id),
+        "env_file": str(env_file),
+        "id_status": str(id_status),
     }
 
 
@@ -158,6 +217,26 @@ def _format_remote_status(lane_id: str, base_url: str, data: dict, controllable:
             break
 
     uptime_s = data.get("uptime_seconds", 0) or _parse_uptime(data.get("uptime"))
+
+    has_env_id = data.get("has_env_id") if isinstance(data, dict) else None
+    env_file = data.get("env_file") if isinstance(data, dict) else None
+    id_status = data.get("id_status") if isinstance(data, dict) else None
+
+    if has_env_id is None or env_file is None or id_status is None:
+        chk_has, chk_file = check_env_file_id(lane_id)
+        if has_env_id is None:
+            has_env_id = chk_has
+        if env_file is None:
+            env_file = chk_file
+        if id_status is None:
+            if not has_env_id:
+                id_status = "missing"
+            elif ctrl_state == "on" and not bool(data.get("auth_ok", False)):
+                id_status = "expired"
+            elif ctrl_state == "on" and bool(data.get("auth_ok", False)):
+                id_status = "valid"
+            else:
+                id_status = "ready"
 
     return {
         "id": lane_id,
@@ -187,6 +266,9 @@ def _format_remote_status(lane_id: str, base_url: str, data: dict, controllable:
         "last_activity_ts": data.get("last_activity_ts"),
         "cache_enabled": bool(data.get("cache_enabled", False)),
         "controllable": controllable,
+        "has_env_id": bool(has_env_id),
+        "env_file": str(env_file),
+        "id_status": str(id_status),
     }
 
 
@@ -258,10 +340,14 @@ class LaneRegistry:
                 cached.get("reachable") is False or cached.get("control") == "off"
             ):
                 cached_lane = dict(cached)
+                chk_has, chk_file = check_env_file_id(peer_id)
                 cached_lane.update({
                     "url": base_url,
                     "port": _port_from_url(base_url),
                     "controllable": bool(self.token),
+                    "has_env_id": cached.get("has_env_id", chk_has),
+                    "env_file": cached.get("env_file", chk_file),
+                    "id_status": cached.get("id_status", "ready" if chk_has else "missing"),
                 })
                 peer_results[peer_id] = cached_lane
                 continue
@@ -277,6 +363,7 @@ class LaneRegistry:
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for (p_id, p_url), res in zip(peer_ids, results):
+                chk_has, chk_file = check_env_file_id(p_id)
                 if isinstance(res, Exception) or not isinstance(res, tuple) or res[0] == 0:
                     err_msg = res[1].get("error", "unreachable") if (isinstance(res, tuple) and len(res) > 1 and isinstance(res[1], dict)) else str(res)
                     lane = {
@@ -289,6 +376,9 @@ class LaneRegistry:
                         "error": err_msg,
                         "control": "off",
                         "controllable": bool(self.token),
+                        "has_env_id": chk_has,
+                        "env_file": chk_file,
+                        "id_status": "ready" if chk_has else "missing",
                     }
                 else:
                     status_code, data = res
@@ -305,6 +395,9 @@ class LaneRegistry:
                             "error": f"HTTP {status_code}",
                             "control": "off",
                             "controllable": bool(self.token),
+                            "has_env_id": chk_has,
+                            "env_file": chk_file,
+                            "id_status": "ready" if chk_has else "missing",
                         }
                 self._peer_status_cache[p_id] = dict(lane)
                 self._peer_cache_ts[p_id] = time.time()

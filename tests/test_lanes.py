@@ -13,6 +13,7 @@ from app.lanes import (
     LaneRegistry,
     build_local_lane_status,
     _format_remote_status,
+    check_env_file_id,
 )
 from starlette.requests import Request
 
@@ -56,7 +57,8 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
             "id", "label", "url", "port", "is_self", "reachable", "control",
             "inflight", "auth_ok", "account_status", "active_account",
             "accounts", "model", "requests", "errors", "uptime_s",
-            "chat_key", "last_activity_ts", "cache_enabled", "controllable"
+            "chat_key", "last_activity_ts", "cache_enabled", "controllable",
+            "has_env_id", "env_file", "id_status"
         }
         self.assertEqual(set(st.keys()), expected_fields)
         self.assertEqual(st["id"], "acc1")
@@ -78,6 +80,9 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st["last_activity_ts"], "2026-11-15T10:00:00+09:00")
         self.assertFalse(st["cache_enabled"])
         self.assertTrue(st["controllable"])
+        self.assertIn("has_env_id", st)
+        self.assertIn("env_file", st)
+        self.assertIn("id_status", st)
 
         # Bảo đảm tuyệt đối không rò rỉ cookie hoặc token bí mật
         dumped = json.dumps(st)
@@ -481,6 +486,29 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
             req_clr = Request({"type": "http", "headers": []})
             resp_clr = await lane_cache_clear("acc2", req_clr)
             self.assertEqual(resp_clr.status_code, 200)
+
+    def test_check_env_file_id(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+            # Luồng acc1 có SECURE_1PSID
+            (tmppath / ".env.acc1").write_text("SECURE_1PSID=abcdefghijklmnop123456\nPORT=10001", encoding="utf-8")
+            has_id, env_f = check_env_file_id("acc1", base_dir=tmppath)
+            self.assertTrue(has_id)
+            self.assertEqual(env_f, ".env.acc1")
+
+            # Luồng acc2 thiếu SECURE_1PSID
+            (tmppath / ".env.acc2").write_text("PORT=10002", encoding="utf-8")
+            has_id2, env_f2 = check_env_file_id("acc2", base_dir=tmppath)
+            self.assertFalse(has_id2)
+            self.assertEqual(env_f2, ".env.acc2")
+
+            # Luồng không tồn tại file
+            has_id3, env_f3 = check_env_file_id("nonexistent", base_dir=tmppath)
+            self.assertFalse(has_id3)
+            self.assertEqual(env_f3, ".env.nonexistent")
+
 
 
 if __name__ == "__main__":
