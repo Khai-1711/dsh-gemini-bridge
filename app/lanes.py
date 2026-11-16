@@ -226,6 +226,7 @@ class LaneRegistry:
         http_call: Callable = urllib_call,
         cache_ttl: float = 4.0,
         spawn_fn: Optional[Callable[[str], bool]] = None,
+        is_frontend_gateway: bool = False,
     ):
         self.self_id = self_id or "default"
         self.peers = peers or {}
@@ -233,11 +234,12 @@ class LaneRegistry:
         self.http_call = http_call
         self.cache_ttl = cache_ttl
         self.spawn_fn = spawn_fn
+        self.is_frontend_gateway = is_frontend_gateway
         self._peer_status_cache: Dict[str, Dict[str, Any]] = {}
         self._peer_cache_ts: Dict[str, float] = {}
 
     async def list_lanes(self, local_status: dict, force_refresh: bool = False) -> List[Dict[str, Any]]:
-        lanes = [local_status]
+        lanes = [] if self.is_frontend_gateway else [local_status]
         tasks = []
         peer_ids = []
         peer_results = {}
@@ -263,7 +265,8 @@ class LaneRegistry:
             if self.token:
                 headers["X-Lane-Token"] = self.token
             url = f"{base_url}/v1/lanes/{peer_id}/status"
-            tasks.append(self.http_call("GET", url, headers=headers, body=None, timeout=2.0))
+            probe_timeout = 0.8 if is_loopback_url(base_url) else 2.0
+            tasks.append(self.http_call("GET", url, headers=headers, body=None, timeout=probe_timeout))
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)

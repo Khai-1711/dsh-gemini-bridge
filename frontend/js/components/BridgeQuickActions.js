@@ -4,6 +4,8 @@ import { store } from "../state.js";
 import { t } from "../i18n.js";
 import { displayName } from "../lane-name.js";
 
+const getApi = () => (typeof api !== "undefined" && api ? api : (window.api || {}));
+
 /**
  * <bridge-quick-actions> Component (T40E)
  * Handles Session Reset & Cache Invalidation routed to selectedLane.
@@ -146,7 +148,7 @@ export class BridgeQuickActions extends HTMLElement {
       if (btn) btn.disabled = true;
       store.notifyToast(lang === "vi" ? `Đang bật luồng ${laneId}...` : `Enabling lane ${laneId}...`, "info");
       try {
-        const res = await api.enableLane(laneId);
+        const res = await getApi().enableLane(laneId);
         if (res && res.error) {
           store.notifyToast(res.error.message || "Failed to enable lane", "error");
         } else {
@@ -171,7 +173,7 @@ export class BridgeQuickActions extends HTMLElement {
 
       if (btn) btn.disabled = true;
       try {
-        const res = await api.disableLane(laneId);
+        const res = await getApi().disableLane(laneId);
         if (res && res.error) {
           store.notifyToast(res.error.message || "Failed to disable lane", "error");
         } else {
@@ -225,7 +227,7 @@ export class BridgeQuickActions extends HTMLElement {
     }
 
     try {
-      await api.resetLaneSession(laneId);
+      await getApi().resetLaneSession(laneId);
       store.notifyToast(t("sessionResetSuccess", lang), "success");
       window.dispatchEvent(new CustomEvent("refresh-request"));
     } catch (err) {
@@ -244,7 +246,7 @@ export class BridgeQuickActions extends HTMLElement {
     }
 
     try {
-      const data = await api.clearLaneCache(laneId);
+      const data = await getApi().clearLaneCache(laneId);
       store.notifyToast(t("cacheClearedSuccess", lang, { count: data.cleared_entries || 0 }), "success");
       window.dispatchEvent(new CustomEvent("refresh-request"));
     } catch (err) {

@@ -23,5 +23,8 @@ export function displayName(laneId, label, n = 1, lang = "vi") {
   }
 
   const prefix = lang === "en" ? `Flow ${n}` : `Luồng ${n}`;
+  if (name.toLowerCase() === prefix.toLowerCase()) {
+    name = cleanId;
+  }
   return name ? `${prefix} · ${name}` : prefix;
 }

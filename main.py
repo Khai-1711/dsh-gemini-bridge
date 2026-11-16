@@ -78,7 +78,9 @@ async def lifespan(app: FastAPI):
     if msg:
         logger.critical(msg)
 
-    if API_START_ON:
+    if is_frontend_gateway:
+        logger.info(f"[GATEWAY] Khởi động Cổng Frontend Gateway trên port {PORT}. Sẵn sàng điều phối các luồng.")
+    elif API_START_ON:
         try:
             await session_manager.enable()
         except Exception as exc:
@@ -142,7 +144,12 @@ async def security_middleware(request: Request, call_next):
                 },
             )
 
-    return await call_next(request)
+    response = await call_next(request)
+    if path.startswith("/frontend") or path in ("/", "/dashboard"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
 
 
 # =====================================================================
@@ -418,11 +425,18 @@ async def clear_exhausted():
     return {"status": "ok"}
 
 
+is_frontend_gateway = (
+    PORT == 10000
+    and (not INSTANCE_ID or INSTANCE_ID in ("default", "frontend", "gateway"))
+    and bool(PEER_LANES)
+)
+
 lane_registry = LaneRegistry(
-    self_id=INSTANCE_ID or "default",
+    self_id=INSTANCE_ID or ("frontend" if is_frontend_gateway else "default"),
     peers=PEER_LANES,
     token=LANE_ADMIN_TOKEN,
     spawn_fn=spawn_local_lane,
+    is_frontend_gateway=is_frontend_gateway,
 )
 
 
@@ -548,9 +562,16 @@ async def list_lanes(refresh: bool = False):
         lanes = await lane_registry.list_lanes(local_st, force_refresh=True)
     else:
         lanes = await lane_registry.list_lanes(local_st)
+
+    self_val = INSTANCE_ID or "default"
+    if lane_registry.is_frontend_gateway:
+        self_val = lanes[0]["id"] if lanes else "acc1"
+
     return {
-        "self": INSTANCE_ID or "default",
+        "self": self_val,
         "lanes": lanes,
+        "is_gateway": lane_registry.is_frontend_gateway,
+        "gateway_port": PORT if lane_registry.is_frontend_gateway else None,
     }
 
 

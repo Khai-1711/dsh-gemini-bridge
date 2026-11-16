@@ -4,6 +4,8 @@ import { store } from "../state.js";
 import { t } from "../i18n.js";
 import { displayName } from "../lane-name.js";
 
+const getApi = () => (typeof api !== "undefined" && api ? api : (window.api || {}));
+
 /**
  * <bridge-model-switch> Component (T40E)
  * Dynamic Gemini Model switching routed to selectedLane + i18n
@@ -199,7 +201,7 @@ export class BridgeModelSwitch extends HTMLElement {
     this.applyBtn.innerText = t("switching", lang);
 
     try {
-      await api.switchLaneModel(laneId, model, true);
+      await getApi().switchLaneModel(laneId, model, true);
       store.notifyToast(`${t("modelSwitched", lang)} ${model} (${laneId})`, "success");
       window.dispatchEvent(new CustomEvent("refresh-request"));
     } catch (err) {

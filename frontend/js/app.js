@@ -5,6 +5,10 @@
 import { api } from "./api.js";
 import { store } from "./state.js";
 
+if (typeof window !== "undefined") {
+  window.api = api;
+}
+
 // Import components to register W3C Custom Elements
 import "./components/BridgeToast.js";
 import "./components/BridgeNavbar.js";
@@ -53,6 +57,7 @@ async function syncData() {
       lanes,
       selectedLane,
       instanceId: selfId,
+      isGateway: Boolean(lanesData.is_gateway),
       dashboardApiStatus: "",
     });
 

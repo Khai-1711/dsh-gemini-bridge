@@ -360,3 +360,8 @@ export const api = {
     return data;
   },
 };
+
+if (typeof window !== "undefined") {
+  window.api = api;
+}
+

@@ -193,10 +193,13 @@ from app.lane_security import parse_peer_lanes
 
 PEER_LANES = parse_peer_lanes(os.getenv("PEER_LANES", ""), INSTANCE_ID)
 if PEER_LANES and not INSTANCE_ID:
-    logger.warning(
-        "[LANE] Đang chạy KHÔNG có BRIDGE_INSTANCE (ID 'default') nhưng có PEER_LANES. "
-        "Hai luồng cần ID acc1/acc2 (dùng run_acc1.bat / run_acc2.bat)."
-    )
+    if PORT == 10000:
+        logger.info("[GATEWAY] Chạy chế độ Frontend Gateway trên port 10000. Các luồng worker: %s", list(PEER_LANES.keys()))
+    else:
+        logger.warning(
+            "[LANE] Đang chạy KHÔNG có BRIDGE_INSTANCE (ID 'default') nhưng có PEER_LANES. "
+            "Hai luồng cần ID acc1/acc2 (dùng run_acc1.bat / run_acc2.bat)."
+        )
 if PEER_LANES and not LANE_ADMIN_TOKEN:
     logger.warning(
         "[LANE] Có PEER_LANES nhưng thiếu LANE_ADMIN_TOKEN: chỉ XEM được luồng kia, KHÔNG điều khiển được."

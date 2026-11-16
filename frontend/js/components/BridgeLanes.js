@@ -3,6 +3,8 @@ import { t } from "../i18n.js";
 import { api } from "../api.js";
 import { displayName } from "../lane-name.js";
 
+const getApi = () => (typeof api !== "undefined" && api ? api : (window.api || {}));
+
 /**
  * <bridge-lanes> Component (T40 - Bố cục CHỦ DỰ ÁN CHỐT)
  * Khung "⚡ Quản Lý Luồng Agent (API Flows)"
@@ -59,7 +61,7 @@ export class BridgeLanes extends HTMLElement {
       const url = new URL(lane.url);
       return Number(url.port) || (url.protocol === "https:" ? 443 : 80);
     } catch {
-      return 10000;
+      return lane.id === "acc2" ? 10002 : (lane.id === "acc1" ? 10001 : 10000);
     }
   }
 
@@ -429,7 +431,7 @@ export class BridgeLanes extends HTMLElement {
         btn.disabled = true;
         store.notifyToast(lang === "vi" ? `Đang bật luồng ${laneId}...` : `Enabling lane ${laneId}...`, "info");
         try {
-          const res = await api.enableLane(laneId);
+          const res = await getApi().enableLane(laneId);
           if (res && res.error) {
             store.notifyToast(res.error.message || "Failed to enable lane", "error");
           } else {
@@ -454,7 +456,7 @@ export class BridgeLanes extends HTMLElement {
 
         btn.disabled = true;
         try {
-          const res = await api.disableLane(laneId);
+          const res = await getApi().disableLane(laneId);
           if (res && res.error) {
             store.notifyToast(res.error.message || "Failed to disable lane", "error");
           } else {
@@ -516,7 +518,7 @@ export class BridgeLanes extends HTMLElement {
         btn.disabled = true;
         store.notifyToast(t("verifyingCookies", store.getState().lang), "info");
         try {
-          const res = await api.reauthLane(laneId);
+          const res = await getApi().reauthLane(laneId);
           if (res && res.auth_ok) {
             store.notifyToast(t("cookiesUpdatedSuccess", store.getState().lang), "success");
           } else {
@@ -543,7 +545,7 @@ export class BridgeLanes extends HTMLElement {
 
         btn.disabled = true;
         try {
-          const res = await api.resetLaneSession(laneId);
+          const res = await getApi().resetLaneSession(laneId);
           if (res && res.error) {
             store.notifyToast(res.error.message || "Reset failed", "error");
           } else {

@@ -2,6 +2,8 @@ import { store } from "../state.js";
 import { t } from "../i18n.js";
 import { api, getStoredApiKey, clearStoredApiKey } from "../api.js";
 
+const getApi = () => (typeof api !== "undefined" && api ? api : (window.api || {}));
+
 /**
  * <bridge-navbar> Component
  * Top Bar: Brand, Language (EN/VI), Theme (Dark/Light), Server Health Badge, Refresh, Forget Key.
@@ -39,10 +41,14 @@ export class BridgeNavbar extends HTMLElement {
   }
 
   render() {
-    const { lang, theme, latency, dashboardApiStatus, lanes, selectedLane } = store.getState();
+    const { lang, theme, latency, dashboardApiStatus, lanes, selectedLane, isGateway } = store.getState();
     const isDark = theme === "dark";
     const isOnline = latency >= 0;
     const isChecking = latency === null;
+    const isGw = Boolean(isGateway || window.location.port === "10000");
+    const serverLabel = isGw
+      ? (lang === "vi" ? "Cổng Frontend" : "Frontend Gateway")
+      : t("serverOk", lang);
 
     this.innerHTML = `
       <header class="top-nav">
@@ -74,7 +80,7 @@ export class BridgeNavbar extends HTMLElement {
               ? `
             <div class="server-status-pill ok" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#10b981;">
               <span class="pulse-dot" style="background:#10b981;"></span>
-              <span>${t("serverOk", lang)}</span>
+              <span>${serverLabel}</span>
               <span id="nav-latency" style="font-size:11px; opacity:0.8; font-family:var(--font-mono);">${latency > 0 ? latency + " ms" : ""}</span>
             </div>
           `
@@ -113,7 +119,7 @@ export class BridgeNavbar extends HTMLElement {
                 const btnText = isStarting ? "..." : (isStopping ? "..." : (isOn ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF")));
                 return `
                   <div class="toggle-pill-btn ${isSel ? "active" : ""}" style="display:inline-flex; align-items:center; gap:6px; padding:3px 8px;">
-                    <span class="lane-select-trigger" data-lane-id="${flowId}" title="${flowTitle} (${flowId}) · Port: ${l.port || (flowId === "acc2" ? 10001 : 10000)}" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
+                    <span class="lane-select-trigger" data-lane-id="${flowId}" title="${flowTitle} (${flowId}) · Port: ${l.port || (flowId === "acc2" ? 10002 : (flowId === "acc1" ? 10001 : 10000))}" style="display:inline-flex; align-items:center; gap:6px; cursor:pointer;">
                       <span style="width:7px; height:7px; border-radius:50%; background:${dotColor};"></span>
                       <span>${flowTitle}</span>
                     </span>
@@ -184,7 +190,7 @@ export class BridgeNavbar extends HTMLElement {
           btn.disabled = true;
           store.notifyToast(lang === "vi" ? `Đang bật luồng ${laneId}...` : `Enabling lane ${laneId}...`, "info");
           try {
-            const res = await api.enableLane(laneId);
+            const res = await getApi().enableLane(laneId);
             if (res && res.error) {
               store.notifyToast(res.error.message || "Failed to enable lane", "error");
             } else {
@@ -204,7 +210,7 @@ export class BridgeNavbar extends HTMLElement {
 
           btn.disabled = true;
           try {
-            const res = await api.disableLane(laneId);
+            const res = await getApi().disableLane(laneId);
             if (res && res.error) {
               store.notifyToast(res.error.message || "Failed to disable lane", "error");
             } else {

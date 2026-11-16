@@ -4,6 +4,8 @@ import { store } from "../state.js";
 import { t } from "../i18n.js";
 import { displayName } from "../lane-name.js";
 
+const getApi = () => (typeof api !== "undefined" && api ? api : (window.api || {}));
+
 /**
  * <bridge-cookie-manager> Component (T40E)
  * Cookie Manager supporting slots 0..4 (Chính, Dự phòng 1..4) routed to selectedLane.
@@ -289,7 +291,7 @@ export class BridgeCookieManager extends HTMLElement {
     this.saveBtn.innerText = t("verifyingCookies", lang);
 
     try {
-      const res = await api.updateLaneCookies(laneId, slot, psid, psidts, label);
+      const res = await getApi().updateLaneCookies(laneId, slot, psid, psidts, label);
       if (res.persisted === false) {
         store.notifyToast(
           lang === "vi"
