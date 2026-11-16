@@ -116,7 +116,10 @@ def _format_remote_status(lane_id: str, base_url: str, data: dict, controllable:
         "control": ctrl_state,
         "inflight": data.get("inflight", 0),
         "auth_ok": bool(data.get("auth_ok", False)),
-        "account_status": data.get("account_status", "UNKNOWN") or "UNKNOWN",
+        "account_status": (
+            "GUEST" if bool(data.get("is_guest"))
+            else (data.get("account_status", "UNKNOWN") or "UNKNOWN")
+        ),
         "active_account": {
             "label": str(active_acc_label),
             "index": active_idx,
@@ -168,22 +171,26 @@ async def urllib_call(method: str, url: str, headers: dict = None, body: bytes =
 class LaneRegistry:
     """Bộ điều phối danh bạ và gọi chéo giữa các luồng agent."""
 
-    def __init__(self, self_id: str, peers: Dict[str, str], token: str, http_call: Callable = urllib_call):
+    def __init__(self, self_id: str, peers: Dict[str, str], token: str, http_call: Callable = urllib_call, cache_ttl: float = 4.0):
         self.self_id = self_id or "default"
         self.peers = peers or {}
         self.token = token or ""
         self.http_call = http_call
+        self.cache_ttl = cache_ttl
         self._peer_status_cache: Dict[str, Dict[str, Any]] = {}
+        self._peer_cache_ts: Dict[str, float] = {}
 
     async def list_lanes(self, local_status: dict, force_refresh: bool = False) -> List[Dict[str, Any]]:
         lanes = [local_status]
         tasks = []
         peer_ids = []
         peer_results = {}
+        now = time.time()
 
         for peer_id, base_url in self.peers.items():
             cached = self._peer_status_cache.get(peer_id)
-            if not force_refresh and cached and (
+            cached_age = now - self._peer_cache_ts.get(peer_id, 0.0)
+            if not force_refresh and cached and (cached_age < self.cache_ttl) and (
                 cached.get("reachable") is False or cached.get("control") == "off"
             ):
                 cached_lane = dict(cached)
@@ -235,6 +242,7 @@ class LaneRegistry:
                             "controllable": bool(self.token),
                         }
                 self._peer_status_cache[p_id] = dict(lane)
+                self._peer_cache_ts[p_id] = time.time()
                 peer_results[p_id] = lane
 
         lanes.extend(peer_results[peer_id] for peer_id in self.peers if peer_id in peer_results)
@@ -281,6 +289,7 @@ class LaneRegistry:
                 "control": "off",
                 "controllable": bool(self.token),
             }
+            self._peer_cache_ts[lane_id] = time.time()
             return 502, {"error": {"code": "peer_unreachable", "message": f"Không kết nối được tới luồng {lane_id}: {err}"}}
 
         if 200 <= status_code < 300:
@@ -307,6 +316,7 @@ class LaneRegistry:
             elif action == "disable":
                 cached["control"] = "stopping"
             self._peer_status_cache[lane_id] = cached
+            self._peer_cache_ts[lane_id] = 0.0
         return status_code, body or {}
 
     async def proxy_request(
@@ -351,6 +361,7 @@ class LaneRegistry:
                 "controllable": bool(self.token),
             })
             self._peer_status_cache[lane_id] = cached
+            self._peer_cache_ts[lane_id] = time.time()
             return 502, {
                 "error": {
                     "code": "peer_unreachable",

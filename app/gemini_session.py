@@ -1117,7 +1117,10 @@ class SingleChatManager:
 
         is_on = (self.state == "on")
         auth_ok = self.auth_ok if is_on else None
-        account_status = self.account_status_name if is_on else None
+        account_status = (
+            "GUEST" if getattr(self, "is_guest", False)
+            else self.account_status_name
+        ) if is_on else None
         cookie_source = self.cookie_source if is_on else None
 
         enabled_since_iso = None

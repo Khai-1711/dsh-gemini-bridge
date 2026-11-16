@@ -101,7 +101,7 @@ PORT = int(os.getenv("PORT", "10000").strip())
 INSTANCE_LABEL = os.getenv("INSTANCE_LABEL", "").strip()   # nhãn dễ đọc, vd "Frontend"
 BRIDGE_LOG_FILE = INSTANCE_PATHS["log_file"]
 
-API_START_ON = parse_start_state(os.getenv("API_START_STATE", "off"))
+API_START_ON = parse_start_state(os.getenv("API_START_STATE", "on"))
 DISABLE_DRAIN_TIMEOUT = float(os.getenv("DISABLE_DRAIN_TIMEOUT", "120"))
 
 # Giới hạn cứng 90s (< 120s của gemini_webapi)

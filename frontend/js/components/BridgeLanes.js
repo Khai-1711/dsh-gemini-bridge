@@ -427,12 +427,19 @@ export class BridgeLanes extends HTMLElement {
 
       if (action === "enable") {
         btn.disabled = true;
+        store.notifyToast(lang === "vi" ? `Đang bật luồng ${laneId}...` : `Enabling lane ${laneId}...`, "info");
         try {
-          await api.enableLane(laneId);
+          const res = await api.enableLane(laneId);
+          if (res && res.error) {
+            store.notifyToast(res.error.message || "Failed to enable lane", "error");
+          } else {
+            store.notifyToast(lang === "vi" ? `Luồng ${laneId} đã BẬT!` : `Lane ${laneId} enabled!`, "success");
+          }
         } catch (err) {
           store.notifyToast(err.message, "error");
         } finally {
           btn.disabled = false;
+          window.dispatchEvent(new CustomEvent("refresh-request"));
         }
       } else if (action === "disable") {
         const inflight = lane.inflight || 0;
@@ -447,11 +454,17 @@ export class BridgeLanes extends HTMLElement {
 
         btn.disabled = true;
         try {
-          await api.disableLane(laneId);
+          const res = await api.disableLane(laneId);
+          if (res && res.error) {
+            store.notifyToast(res.error.message || "Failed to disable lane", "error");
+          } else {
+            store.notifyToast(lang === "vi" ? `Luồng ${laneId} đã TẮT!` : `Lane ${laneId} disabled!`, "info");
+          }
         } catch (err) {
           store.notifyToast(err.message, "error");
         } finally {
           btn.disabled = false;
+          window.dispatchEvent(new CustomEvent("refresh-request"));
         }
       }
     });
@@ -515,6 +528,7 @@ export class BridgeLanes extends HTMLElement {
           store.notifyToast(err.message, "error");
         } finally {
           btn.disabled = false;
+          window.dispatchEvent(new CustomEvent("refresh-request"));
         }
       });
     });
@@ -541,6 +555,7 @@ export class BridgeLanes extends HTMLElement {
           store.notifyToast(err.message, "error");
         } finally {
           btn.disabled = false;
+          window.dispatchEvent(new CustomEvent("refresh-request"));
         }
       });
     });
