@@ -140,6 +140,12 @@ export const translations = {
     slotCanAdd: "(trống - có thể thêm)",
     slotRequiresPrevious: "(nạp slot {n} trước)",
     enterPsidtsRequired: "Vui lòng nhập SECURE_1PSIDTS!",
+    confirmStopGateway: "Bạn có chắc chắn muốn TẮT Cổng 10000 (Frontend Gateway)? Sau khi tắt, giao diện Dashboard sẽ ngắt kết nối.",
+    stoppingGateway: "Đang tắt Cổng 10000...",
+    gatewayStoppedSuccess: "Cổng 10000 đã TẮT thành công! Bạn có thể đóng tab trình duyệt.",
+    startingGateway: "Đang bật lại Cổng 10000...",
+    gatewayStartedSuccess: "Cổng 10000 đã BẬT thành công!",
+    gatewayManualStartTip: "Cổng 10000 đang tắt. Hãy chạy file run_frontend.bat hoặc run_all.bat để bật lại.",
   },
 
   en: {
@@ -279,6 +285,12 @@ export const translations = {
     slotCanAdd: "(empty - available)",
     slotRequiresPrevious: "(load slot {n} first)",
     enterPsidtsRequired: "SECURE_1PSIDTS is required!",
+    confirmStopGateway: "Are you sure you want to STOP Port 10000 (Frontend Gateway)? The Dashboard will disconnect.",
+    stoppingGateway: "Stopping Port 10000...",
+    gatewayStoppedSuccess: "Port 10000 stopped successfully! You can close this tab.",
+    startingGateway: "Starting Port 10000...",
+    gatewayStartedSuccess: "Port 10000 started successfully!",
+    gatewayManualStartTip: "Port 10000 is stopped. Run run_frontend.bat or run_all.bat to start it.",
   },
 };
 

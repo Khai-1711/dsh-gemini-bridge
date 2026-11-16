@@ -359,6 +359,36 @@ export const api = {
     if (!res.ok) throw new Error(data.error?.message || data.error || `HTTP ${res.status}`);
     return data;
   },
+
+  /**
+   * Tắt Cổng Frontend 10000
+   */
+  async shutdownGateway() {
+    const res = await authFetch(`${API_BASE}/v1/gateway/shutdown`, { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error?.message || data.error || `HTTP ${res.status}`);
+    return data;
+  },
+
+  /**
+   * Thử bật lại Cổng 10000 thông qua các luồng worker
+   */
+  async spawnGateway() {
+    for (const port of [10001, 10002]) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/v1/gateway/spawn`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        });
+        if (res.ok) {
+          return await res.json();
+        }
+      } catch (e) {
+        // thử cổng tiếp theo
+      }
+    }
+    throw new Error("Không thể kết nối tới các luồng để khởi chạy lại Cổng 10000.");
+  },
 };
 
 if (typeof window !== "undefined") {

@@ -277,6 +277,58 @@ class TestSingleChatManagerControl(unittest.IsolatedAsyncioTestCase):
 
 
 class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_rejects_unavailable_requested_model(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "model": "Gemini_4.1",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch("main._local_switch_model", new_callable=AsyncMock) as switch_model, \
+             patch("main.activity.write"):
+            switch_model.return_value = (
+                400,
+                {"error": {"code": "model_not_available", "message": "unknown model"}},
+            )
+            response = await chat_completions(request)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"]["code"],
+            "model_not_available",
+        )
+        switch_model.assert_awaited_once_with("Gemini_4.1", keep_chat=True)
+
+    async def test_stream_reports_unparseable_tool_call(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "run the task"}],
+            "stream": True,
+        }
+
+        async def malformed_stream(prompt, image_files):
+            yield "done", '<tool_call>{"name":"pwsh","arguments": }</tool_call>'
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "send_prepared_turn_stream", new=malformed_stream), \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+            chunks = [
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        body = "".join(chunks)
+        self.assertIn("invalid_tool_call", body)
+        self.assertNotIn('"finish_reason":"stop"', body)
+
     async def test_control_and_chat_endpoints_when_off(self):
         from main import (
             chat_completions,

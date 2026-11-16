@@ -538,6 +538,44 @@ async def control_disable(request: Request):
     return res
 
 
+async def _delayed_gateway_shutdown():
+    await asyncio.sleep(0.5)
+    logger.warning(f"[GATEWAY] Đang dừng tiến trình Port {PORT}...")
+    os._exit(0)
+
+
+@app.post("/v1/gateway/shutdown")
+@app.post("/v1/gateway/stop")
+async def gateway_shutdown(request: Request):
+    """Tắt hoàn toàn Cổng Frontend 10000 từ giao diện Dashboard."""
+    if not is_origin_allowed(request.headers.get("origin"), PORT):
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": "Origin không được phép.", "code": "origin_not_allowed"}},
+        )
+    logger.warning(f"[GATEWAY] Nhận lệnh TẮT Cổng Frontend {PORT} từ Dashboard.")
+    asyncio.create_task(_delayed_gateway_shutdown())
+    return {"status": "ok", "message": f"Cổng {PORT} đang dừng tiến trình..."}
+
+
+@app.post("/v1/gateway/spawn")
+async def gateway_spawn(request: Request):
+    """Khởi chạy lại Cổng Frontend 10000 khi đang offline (gọi qua luồng worker)."""
+    if not is_origin_allowed(request.headers.get("origin"), PORT):
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": "Origin không được phép.", "code": "origin_not_allowed"}},
+        )
+    ok = spawn_local_lane("frontend")
+    if ok:
+        logger.info(f"[{INSTANCE_ID or 'worker'}] Đã spawn Cổng Frontend 10000 thành công.")
+        return {"status": "ok", "message": "Đã gửi lệnh bật lại Cổng 10000."}
+    return JSONResponse(
+        status_code=500,
+        content={"error": {"message": "Không thể spawn Cổng 10000.", "code": "spawn_failed"}},
+    )
+
+
 @app.post("/v1/reauth")
 async def local_reauth(request: Request):
     if not is_origin_allowed(request.headers.get("origin"), PORT):
@@ -951,7 +989,8 @@ async def chat_completions(request: Request):
         c = last.get("content")
         task_hint = (c if isinstance(c, str) else str(c))[:100]
 
-    model_id = body.get("model", session_manager.default_model)
+    requested_model = str(body.get("model") or session_manager.default_model).strip()
+    model_id = requested_model or session_manager.default_model
     is_stream = body.get("stream", False)
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_ts = int(t0)
@@ -980,6 +1019,24 @@ async def chat_completions(request: Request):
                 }
             },
         )
+
+    if model_id not in ("unspecified", session_manager.default_model):
+        model_status, model_data = await _local_switch_model(model_id, keep_chat=True)
+        if model_status != 200:
+            activity.write(
+                request_id=chat_id,
+                model=model_id,
+                stream=is_stream,
+                chat_key=session_manager.current_chat_key(),
+                auth_ok=session_manager.auth_ok,
+                task_hint=task_hint,
+                latency_ms=int((time.time() - t0) * 1000),
+                outcome=f"error:{model_data.get('error', {}).get('code', 'model_not_available')}",
+            )
+            return JSONResponse(status_code=model_status, content=model_data)
+        model_id = model_data["active_model"]
+    else:
+        model_id = session_manager.default_model
 
     # Ghi nhận hội thoại và sổ sự thật (Ledger)
     session_manager.remember_transcript(messages)
@@ -1099,6 +1156,25 @@ async def chat_completions(request: Request):
 
                 reply_text = done_text if done_text is not None else splitter.full_text
                 tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
+                if "<tool_call>" in reply_text and not tool_calls:
+                    error = {
+                        "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
+                        "type": "upstream_error",
+                        "code": "invalid_tool_call",
+                    }
+                    activity.write(
+                        request_id=chat_id,
+                        model=model_id,
+                        stream=True,
+                        chat_key=session_manager.current_chat_key(),
+                        auth_ok=session_manager.auth_ok,
+                        task_hint=task_hint,
+                        latency_ms=int((time.time() - t0) * 1000),
+                        outcome="error:invalid_tool_call",
+                    )
+                    yield f"data: {json.dumps({'error': error}, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 session_manager.ledger.note_tool_calls(tool_calls)
                 session_manager.ledger.note_assistant(reply_text)
 
@@ -1200,6 +1276,26 @@ async def chat_completions(request: Request):
             content={"error": {"message": e.message, "type": e.err_type, "code": e.code}},
         )
     tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
+    if "<tool_call>" in reply_text and not tool_calls:
+        error = {
+            "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
+            "type": "upstream_error",
+            "code": "invalid_tool_call",
+        }
+        activity.write(
+            request_id=chat_id,
+            model=model_id,
+            stream=False,
+            chat_key=session_manager.current_chat_key(),
+            auth_ok=session_manager.auth_ok,
+            task_hint=task_hint,
+            latency_ms=int((time.time() - t0) * 1000),
+            outcome="error:invalid_tool_call",
+        )
+        return JSONResponse(
+            status_code=502,
+            content={"error": error},
+        )
     session_manager.ledger.note_tool_calls(tool_calls)
     session_manager.ledger.note_assistant(reply_text)
 

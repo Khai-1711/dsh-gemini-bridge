@@ -80,6 +80,54 @@ def _extract_tag_contents(text: str, open_tag: str, close_tag: str) -> List[str]
     return results
 
 
+def _loads_tool_json(raw_json: str) -> Any:
+    try:
+        return json.loads(raw_json, strict=False)
+    except json.JSONDecodeError as exc:
+        if "Invalid \\escape" not in exc.msg:
+            raise
+
+    repaired = []
+    in_string = False
+    i = 0
+    while i < len(raw_json):
+        char = raw_json[i]
+        if not in_string:
+            repaired.append(char)
+            if char == '"':
+                in_string = True
+            i += 1
+            continue
+
+        if char == '"':
+            repaired.append(char)
+            in_string = False
+            i += 1
+            continue
+
+        if char == "\\":
+            if i + 1 < len(raw_json) and raw_json[i + 1] in '"\\/bfnrt':
+                repaired.extend((char, raw_json[i + 1]))
+                i += 2
+                continue
+            if (
+                i + 5 < len(raw_json)
+                and raw_json[i + 1] == "u"
+                and all(c in "0123456789abcdefABCDEF" for c in raw_json[i + 2:i + 6])
+            ):
+                repaired.extend(raw_json[i:i + 6])
+                i += 6
+                continue
+            repaired.extend(("\\\\",))
+            i += 1
+            continue
+
+        repaired.append(char)
+        i += 1
+
+    return json.loads("".join(repaired), strict=False)
+
+
 def parse_tool_calls_from_reply(
     reply_text: str, tools_map: Dict[str, Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -114,7 +162,7 @@ def parse_tool_calls_from_reply(
 
     for raw_json, is_tagged in candidates:
         try:
-            data = json.loads(raw_json, strict=False)
+            data = _loads_tool_json(raw_json)
             if isinstance(data, dict) and "name" in data:
                 fn_name = str(data["name"]).strip()
                 for prefix in ("functions.", "tools."):
@@ -132,10 +180,19 @@ def parse_tool_calls_from_reply(
                     accept = bool(tools_map) and (fn_name in tools_map)
 
                 if accept:
-                    raw_args = data.get("arguments", data.get("parameters", {}))
+                    if "arguments" in data:
+                        raw_args = data["arguments"]
+                    elif "parameters" in data:
+                        raw_args = data["parameters"]
+                    else:
+                        raw_args = {
+                            key: value
+                            for key, value in data.items()
+                            if key not in {"name", "type", "id"}
+                        }
                     if isinstance(raw_args, str):
                         try:
-                            raw_args = json.loads(raw_args, strict=False)
+                            raw_args = _loads_tool_json(raw_args)
                         except Exception as arg_exc:
                             logger.warning(
                                 f"[PARSER] Không parse được raw_args JSON: {arg_exc} | đầu: {raw_args[:200]!r}"

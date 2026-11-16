@@ -68,29 +68,19 @@ export class BridgeNavbar extends HTMLElement {
         </div>
 
         <div class="nav-actions">
-          <!-- Server Health Badge: ● Server OK / ✕ Mất liên lạc với server -->
-          ${
-            isChecking
-              ? `
-            <div class="server-status-pill" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:var(--bg-surface-hover); border:1px solid var(--border-subtle); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:var(--text-secondary);">
-              <span>${t("serverChecking", lang)}</span>
+          <!-- Cổng Frontend 10000 với công tắc BẬT / TẮT trực tiếp -->
+          <div class="toggle-pill-group gateway-pill-group" style="margin-right:2px; display:inline-flex; align-items:center; gap:4px; padding:2px 4px;">
+            <div class="toggle-pill-btn active" style="display:inline-flex; align-items:center; gap:6px; padding:3px 8px; border-color:${isOnline ? 'rgba(16,185,129,0.35)' : 'rgba(239,68,68,0.35)'}; background:${isOnline ? 'rgba(16,185,129,0.1)' : 'rgba(239,68,68,0.1)'};">
+              <span style="display:inline-flex; align-items:center; gap:6px; cursor:default;" title="${serverLabel} (Port 10000)">
+                <span class="pulse-dot" style="width:7px; height:7px; border-radius:50%; background:${isChecking ? '#f59e0b' : (isOnline ? '#10b981' : '#ef4444')};"></span>
+                <span style="font-weight:600; font-size:12px; color:${isChecking ? '#f59e0b' : (isOnline ? '#10b981' : '#ef4444')};">${isChecking ? t("serverChecking", lang) : (lang === "vi" ? "Cổng 10000" : "Port 10000")}</span>
+                <span id="nav-latency" style="font-size:11px; opacity:0.85; font-family:var(--font-mono); color:${isOnline ? '#10b981' : '#ef4444'};">${isOnline && latency > 0 ? latency + " ms" : ""}</span>
+              </span>
+              <button type="button" class="gateway-power-trigger" data-action="${isOnline ? "disable" : "enable"}" style="padding:1px 6px; border-radius:8px; font-size:10px; font-weight:700; cursor:pointer; border:1px solid ${isOnline ? "rgba(16,185,129,0.5)" : "rgba(239,68,68,0.5)"}; background:${isOnline ? "rgba(16,185,129,0.2)" : "rgba(239,68,68,0.2)"}; color:${isOnline ? "#10b981" : "#ef4444"};" title="${isOnline ? (lang === 'vi' ? 'Tắt Cổng 10000' : 'Stop Port 10000') : (lang === 'vi' ? 'Bật Cổng 10000' : 'Start Port 10000')}">
+                ${isOnline ? (lang === "vi" ? "BẬT" : "ON") : (lang === "vi" ? "TẮT" : "OFF")}
+              </button>
             </div>
-          `
-              : isOnline
-              ? `
-            <div class="server-status-pill ok" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(16,185,129,0.12); border:1px solid rgba(16,185,129,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#10b981;">
-              <span class="pulse-dot" style="background:#10b981;"></span>
-              <span>${serverLabel}</span>
-              <span id="nav-latency" style="font-size:11px; opacity:0.8; font-family:var(--font-mono);">${latency > 0 ? latency + " ms" : ""}</span>
-            </div>
-          `
-              : `
-            <div class="server-status-pill error" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:rgba(239,68,68,0.12); border:1px solid rgba(239,68,68,0.3); border-radius:var(--radius-md); font-size:12px; font-weight:600; color:#ef4444;">
-              <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:#ef4444;"></span>
-              <span>${t("serverLost", lang)}</span>
-            </div>
-          `
-          }
+          </div>
 
           ${
             isOnline && dashboardApiStatus
@@ -174,6 +164,49 @@ export class BridgeNavbar extends HTMLElement {
         if (laneId && laneId !== store.getState().selectedLane) {
           store.setState({ selectedLane: laneId });
           window.dispatchEvent(new CustomEvent("refresh-request"));
+        }
+      });
+    });
+
+    this.querySelectorAll(".gateway-power-trigger").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const action = btn.getAttribute("data-action");
+        const { lang } = store.getState();
+
+        if (action === "disable") {
+          const msg = t("confirmStopGateway", lang);
+          if (!window.confirm(msg)) return;
+
+          btn.disabled = true;
+          btn.innerText = "...";
+          store.notifyToast(t("stoppingGateway", lang), "info");
+
+          try {
+            await getApi().shutdownGateway();
+            store.notifyToast(t("gatewayStoppedSuccess", lang), "success");
+            store.setState({ latency: -1 });
+          } catch (err) {
+            store.notifyToast(err.message, "error");
+          } finally {
+            btn.disabled = false;
+          }
+        } else if (action === "enable") {
+          btn.disabled = true;
+          btn.innerText = "...";
+          store.notifyToast(t("startingGateway", lang), "info");
+
+          try {
+            await getApi().spawnGateway();
+            store.notifyToast(t("gatewayStartedSuccess", lang), "success");
+            setTimeout(() => {
+              window.dispatchEvent(new CustomEvent("refresh-request"));
+            }, 1200);
+          } catch (err) {
+            store.notifyToast(t("gatewayManualStartTip", lang), "warning");
+          } finally {
+            btn.disabled = false;
+          }
         }
       });
     });

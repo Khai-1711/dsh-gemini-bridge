@@ -138,7 +138,7 @@ In DeepSeek Harness, navigate to **Settings → Model Providers**:
 | **API Protocol** | `OpenAI Chat Completions`                                       |
 | **Base URL**     | `http://127.0.0.1:10000/v1`                                     |
 | **API Key**      | Any string (or matching your `API_KEY` from `.env`)             |
-| **Model ID**     | `gemini-flash`                                                  |
+| **Model ID**     | An exact ID returned by the `/v1/models` endpoint                |
 
 ---
 
@@ -150,26 +150,27 @@ The bridge supports running up to 2 completely isolated DSH agents from the **sa
 
 | ID | Account | Port | DSH Agent | Config File | Session State | Process Log | Activity Journal |
 |---|---|---|---|---|---|---|---|
-| `acc1` | Google A | 10000 | DSH 1 (project 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
-| `acc2` | Google B | 10001 | DSH 2 (project 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
-| *(default)* | - | 10000 | Single legacy | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
+| `acc1` | Google A | 10001 | DSH 1 (project 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
+| `acc2` | Google B | 10002 | DSH 2 (project 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
+| *(default/gateway)* | - | 10000 | Dashboard / gateway | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
 
 ### Configuration & Startup
 
 1. **Create Configuration Files:**
-   - Copy `.env.example` to `.env.acc1` (`PORT=10000`, Google Account A cookies, `INSTANCE_LABEL="Agent-1"`).
-   - Copy `.env.example` to `.env.acc2` (`PORT=10001`, Google Account B cookies, `INSTANCE_LABEL="Agent-2"`).
+   - Copy `.env.example` to `.env.acc1` (`PORT=10001`, Google Account A cookies, `INSTANCE_LABEL="Agent-1"`).
+   - Copy `.env.example` to `.env.acc2` (`PORT=10002`, Google Account B cookies, `INSTANCE_LABEL="Agent-2"`).
 2. **Launch Instances:**
-   - Double-click `run_acc1.bat` to launch `acc1` on port 10000.
-   - Double-click `run_acc2.bat` to launch `acc2` on port 10001.
+   - Double-click `run_acc1.bat` to launch `acc1` on port 10001.
+   - Double-click `run_acc2.bat` to launch `acc2` on port 10002.
 3. **Connect DeepSeek Harness:**
-   - Agent 1: Base URL `http://127.0.0.1:10000/v1`
-   - Agent 2: Base URL `http://127.0.0.1:10001/v1`
+   - Agent 1: Base URL `http://127.0.0.1:10001/v1`
+   - Agent 2: Base URL `http://127.0.0.1:10002/v1`
+   - Use an exact model ID returned by that worker's `GET /v1/models`. Port 10000 is the gateway/dashboard, not a worker chat endpoint.
 4. **Monitor Activity Separately:**
-   - Activities: `http://127.0.0.1:10000/v1/activity` and `http://127.0.0.1:10001/v1/activity`
-   - Dashboards: `http://127.0.0.1:10000/dashboard` and `http://127.0.0.1:10001/dashboard`
+   - Activities: `http://127.0.0.1:10001/v1/activity` and `http://127.0.0.1:10002/v1/activity`
+   - Dashboard: `http://127.0.0.1:10000/dashboard` (gateway) or the relevant worker port.
 5. **CRITICAL ACCOUNT NOTE:**
-   - Do NOT share cookies between instances. Log in to each Google account in separate Chrome profiles or Incognito windows, copy the cookies, and close the browser. Verify `account_key` differs at `/health` between both ports.
+   - Do NOT share cookies between instances. Log in to each Google account in separate Chrome profiles or Incognito windows, copy the cookies, and close the browser. Verify `account_key` differs at `/v1/status` on ports 10001 and 10002.
 
 ---
 

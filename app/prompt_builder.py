@@ -99,9 +99,11 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
         "<tool_call>\n"
         '{"name": "ToolName", "arguments": {"required_key": "value"}}\n'
         "</tool_call>\n"
-        '4. For `Pwsh`, ALWAYS include both `"command"` and `"description"`. '
+        "4. Put every tool parameter inside the `arguments` object; never put parameters at the top level. "
+        "Return valid JSON: escape backslashes as `\\\\` and encode newlines inside strings as `\\n`.\n"
+        '5. For `Pwsh`, ALWAYS include both `"command"` and `"description"`. '
         "Operate strictly on the D: drive (NEVER touch C:).\n"
-        "5. When user attaches an image, analyze it directly (do NOT call `read_image`).\n\n"
+        "6. When user attaches an image, analyze it directly (do NOT call `read_image`).\n\n"
     )
 
 

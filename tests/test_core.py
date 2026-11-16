@@ -1,3 +1,4 @@
+import json
 import logging
 import unittest
 
@@ -119,6 +120,55 @@ class TestToolParser(unittest.TestCase):
         calls = parse_tool_calls_from_reply(reply, {})
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["function"]["name"], "Pwsh")
+
+    def test_parse_tool_call_with_parameters_at_top_level(self):
+        reply = (
+            '<tool_call>{"name":"create_goal","objective":"Build backend",'
+            '"max_goal_rounds":5}</tool_call>'
+        )
+        tools = {
+            "create_goal": {
+                "parameters": {
+                    "properties": {
+                        "objective": {"type": "string"},
+                        "max_goal_rounds": {"type": "integer"},
+                    },
+                    "required": ["objective"],
+                }
+            }
+        }
+
+        calls = parse_tool_calls_from_reply(reply, tools)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            json.loads(calls[0]["function"]["arguments"]),
+            {"objective": "Build backend", "max_goal_rounds": 5},
+        )
+
+    def test_parse_tool_call_with_unescaped_windows_path(self):
+        reply = (
+            r'<tool_call>{"name":"Write","file_path":"D:\Users\me\main.py",'
+            r'"content":"print(1)"}</tool_call>'
+        )
+        tools = {
+            "Write": {
+                "parameters": {
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                }
+            }
+        }
+
+        calls = parse_tool_calls_from_reply(reply, tools)
+
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["file_path"], r"D:\Users\me\main.py")
+        self.assertEqual(args["content"], "print(1)")
 
     def test_parse_multiple_tool_calls(self):
         reply = (

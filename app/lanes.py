@@ -38,15 +38,19 @@ def _parse_uptime(uptime_val: Any) -> int:
 
 
 def spawn_local_lane(lane_id: str) -> bool:
-    """Tự động khởi chạy tiến trình luồng con trên máy cục bộ (Windows / Linux)."""
+    """Tự động khởi chạy tiến trình luồng con hoặc gateway trên máy cục bộ (Windows / Linux)."""
     try:
         base_dir = Path(__file__).resolve().parent.parent
-        env_file = base_dir / f".env.{lane_id}"
+        is_gw = lane_id in ("frontend", "gateway", "10000")
+        env_file = base_dir / ".env" if is_gw else base_dir / f".env.{lane_id}"
         if not env_file.exists():
             return False
 
         env = os.environ.copy()
-        env["BRIDGE_INSTANCE"] = lane_id
+        if not is_gw:
+            env["BRIDGE_INSTANCE"] = lane_id
+        else:
+            env.pop("BRIDGE_INSTANCE", None)
 
         log_dir = base_dir / "logs"
         log_dir.mkdir(exist_ok=True)
@@ -73,9 +77,11 @@ def spawn_local_lane(lane_id: str) -> bool:
                 stdout=spawn_log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                close_fds=True,
             )
         return True
-    except Exception:
+    except Exception as exc:
+        logger.error(f"[LANE] Lỗi spawn tiến trình '{lane_id}': {exc}")
         return False
 
 

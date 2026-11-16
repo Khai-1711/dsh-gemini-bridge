@@ -152,7 +152,7 @@ Vào giao diện **Settings → Model Providers** trên ứng dụng DeepSeek Ha
 | **API Protocol** | `OpenAI Chat Completions`                                       |
 | **Base URL**     | `http://127.0.0.1:10000/v1`                                     |
 | **API Key**      | Nhập chuỗi bất kỳ (hoặc khớp với biến `API_KEY` trong `.env`)   |
-| **Model ID**     | `gemini-flash`                                                  |
+| **Model ID**     | Một ID chính xác được trả về bởi endpoint `/v1/models`           |
 
 ---
 
@@ -164,43 +164,44 @@ Bridge hỗ trợ chạy tối đa 2 Agent DSH độc lập cùng lúc từ **c�
 
 | ID | Tài khoản | Cổng | Agent DSH | File cấu hình | File session | Log chạy | Nhật ký công việc |
 |---|---|---|---|---|---|---|---|
-| `acc1` | Google A | 10000 | DSH 1 (dự án 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
-| `acc2` | Google B | 10001 | DSH 2 (dự án 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
-| *(default)* | - | 10000 | Đơn lẻ (cũ) | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
+| `acc1` | Google A | 10001 | DSH 1 (dự án 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
+| `acc2` | Google B | 10002 | DSH 2 (dự án 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
+| *(default/gateway)* | - | 10000 | Dashboard / gateway | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
 
 ### Hướng Dẫn Cấu Hình & Chạy
 
 1. **Tạo 2 file môi trường:**
    - Copy `.env.example` thành `.env.acc1`:
      ```ini
-     PORT=10000
-     INSTANCE_LABEL="Frontend"
-     PEER_LANES="acc2=http://127.0.0.1:10001"
+     PORT=10001
+     INSTANCE_LABEL="Agent-1"
+     PEER_LANES="acc2=http://127.0.0.1:10002"
      LANE_ADMIN_TOKEN="<chuỗi ngẫu nhiên dài dùng chung cho cả 2 luồng>"
      ```
    - Copy `.env.example` thành `.env.acc2`:
      ```ini
-     PORT=10001
-     INSTANCE_LABEL="Backend"
-     PEER_LANES="acc1=http://127.0.0.1:10000"
+     PORT=10002
+     INSTANCE_LABEL="Agent-2"
+     PEER_LANES="acc1=http://127.0.0.1:10001"
      LANE_ADMIN_TOKEN="<cùng chuỗi token như ở .env.acc1>"
      ```
    - *Tạo token an toàn:* `python -c "import secrets; print(secrets.token_urlsafe(32))"`
    - *Lưu ý bảo mật:* `LANE_ADMIN_TOKEN` là bí mật xác thực giữa 2 luồng, không commit ra ngoài (tất cả file `.env.*` đã nằm trong `.gitignore`).
 2. **Khởi chạy:**
-   - Nhấp đúp `run_acc1.bat` để chạy con `acc1` (cổng 10000).
-   - Nhấp đúp `run_acc2.bat` để chạy con `acc2` (cổng 10001).
+   - Nhấp đúp `run_acc1.bat` để chạy con `acc1` (cổng 10001).
+   - Nhấp đúp `run_acc2.bat` để chạy con `acc2` (cổng 10002).
 3. **Cấu hình DeepSeek Harness:**
-   - DSH 1: Base URL `http://127.0.0.1:10000/v1`
-   - DSH 2: Base URL `http://127.0.0.1:10001/v1`
+   - DSH 1: Base URL `http://127.0.0.1:10001/v1`
+   - DSH 2: Base URL `http://127.0.0.1:10002/v1`
+   - Dùng Model ID chính xác từ `GET /v1/models` của worker tương ứng. Cổng 10000 là gateway/dashboard, không phải endpoint chat của worker.
 4. **Theo dõi công việc riêng biệt:**
-   - Nhật ký hoạt động: `http://127.0.0.1:10000/v1/activity` và `http://127.0.0.1:10001/v1/activity`
-   - Dashboard: `http://127.0.0.1:10000/dashboard` và `http://127.0.0.1:10001/dashboard`
+   - Nhật ký hoạt động: `http://127.0.0.1:10001/v1/activity` và `http://127.0.0.1:10002/v1/activity`
+   - Dashboard: `http://127.0.0.1:10000/dashboard` (gateway) hoặc cổng worker tương ứng.
 5. **CẢNH BÁO QUAN TRỌNG VỀ TÀI KHOẢN:**
    - TUYỆT ĐỐI KHÔNG dùng chung cookie giữa 2 instance (nếu dùng chung sẽ cùng vào 1 tài khoản).
    - `BACKUP_1PSID` của instance này không được trùng với tài khoản của instance kia.
    - Để lấy cookie: hãy đăng nhập mỗi tài khoản Google trong 1 Profile Chrome (hoặc cửa sổ ẩn danh Incognito) riêng biệt, copy cookie rồi đóng cửa sổ để tránh xoay cookie ngầm.
-   - Kiểm tra hai con có bị trùng tài khoản không bằng cách đối chiếu mã `account_key` tại `http://127.0.0.1:10000/health` và `http://127.0.0.1:10001/health` (2 mã hash 12 ký tự này bắt buộc phải khác nhau).
+   - Kiểm tra hai con có bị trùng tài khoản không bằng cách đối chiếu mã `account_key` tại `http://127.0.0.1:10001/v1/status` và `http://127.0.0.1:10002/v1/status` (2 mã hash 12 ký tự này bắt buộc phải khác nhau).
 
 ---
 
