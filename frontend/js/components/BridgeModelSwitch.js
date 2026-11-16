@@ -154,14 +154,8 @@ export class BridgeModelSwitch extends HTMLElement {
       let label = "";
       if (m === "unspecified") {
         label = state.lang === "vi" ? "Mặc định (unspecified)" : "Default (unspecified)";
-      } else if (state.lang === "en") {
-        label = info.display_name || (info.label || m).replace(/\s*\([^)]*\)$/, "");
-      } else if (info.label) {
-        label = info.label;
-      } else if (info.display_name) {
-        label = info.display_name;
       } else {
-        label = m;
+        label = info.label || info.display_name || m;
       }
 
       const opt = document.createElement("option");

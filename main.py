@@ -360,12 +360,15 @@ def _local_lane_models() -> dict:
             label = "Mặc định (unspecified)"
         else:
             meta = details.get(m, {})
-            disp = meta.get("display_name") or m
-            raw_disp = meta.get("raw_display_name")
-            if raw_disp and raw_disp != disp and raw_disp.lower() not in disp.lower():
-                label = f"{disp} ({raw_disp})"
-            else:
+            desc = meta.get("description", "").strip()
+            disp = meta.get("display_name", "").strip()
+            # Lấy thẳng tên do Google cung cấp: model_name kèm description
+            if desc and desc != m and desc.lower() not in m.lower():
+                label = f"{m} ({desc})"
+            elif disp and disp != m and not any(k in disp.lower() for k in ["trả lời", "trợ giúp", "nghiên cứu", "phức tạp"]):
                 label = disp
+            else:
+                label = m
         available.append({"id": m, "label": label})
     return {
         "current": session_manager.default_model,
