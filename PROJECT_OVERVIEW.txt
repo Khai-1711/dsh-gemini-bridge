@@ -13,9 +13,10 @@ Nhờ cầu nối này, các công cụ lập trình tự động (Coding Agents
 - DeepSeek Harness (pi-ai)
 - Cline / Roo Code
 - Cursor / Continue / Aider
-có thể kết nối trực tiếp vào tài khoản Google Gemini Web để đọc hiểu mã nguồn, 
-chạy lệnh terminal, tạo/sửa file và giải quyết bài toán lập trình phức tạp mà 
-KHÔNG CẦN mua API Key trả phí theo token thương mại.
+có thể kết nối với tài khoản Google Gemini Web để đọc hiểu mã nguồn, chạy lệnh
+terminal, tạo/sửa file và hỗ trợ các tác vụ lập trình. Việc dùng Gemini Web có
+thể tránh một số chi phí API tính theo token, nhưng vẫn phụ thuộc hạn mức, điều
+khoản và khả năng sẵn sàng của Google; không đảm bảo miễn phí hoặc luôn hoạt động.
 
 
 2. VẤN ĐỀ CỐT LÕI MÀ DỰ ÁN GIẢI QUYẾT (WHY?)
@@ -30,10 +31,10 @@ KHÔNG CẦN mua API Key trả phí theo token thương mại.
    - OpenAI Request  --> System Prompt + XML Tool Schema --> Gemini Web
    - Gemini Response --> Trích xuất thẻ XML <tool_call>  --> OpenAI Tool Calls
 
-3. Chống khóa tài khoản & Zero-Spam:
-   Nếu mỗi câu lệnh của Agent tạo ra 1 đoạn chat mới trên web, Google sẽ phát hiện 
-   hành vi bất thường và khóa tài khoản vì spam. Bridge gom toàn bộ chuỗi hàng chục 
-   lượt thực thi của Agent vào ĐÚNG 1 ĐOẠN CHAT DUY NHẤT.
+3. Duy trì phiên chat:
+   Bridge gom các lượt thực thi của Agent vào một phiên chat để duy trì ngữ cảnh
+   và giảm phần dữ liệu hội thoại phải gửi lặp lại. Cách này không đảm bảo tránh
+   giới hạn, rate limit hoặc biện pháp chống lạm dụng của Google.
 
 
 3. KIẾN TRÚC & LUỒNG HOẠT ĐỘNG (WORKFLOW ARCHITECTURE)
@@ -71,7 +72,8 @@ KHÔNG CẦN mua API Key trả phí theo token thương mại.
 
 2. Luồng Streaming SSE có Heartbeat chống Timeout:
    - Phát nhịp định kỳ ": keep-alive\n\n" mỗi 2.5 giây.
-   - Triệt tiêu hoàn toàn lỗi client bị ngắt kết nối do idle timeout khi model suy nghĩ lâu.
+   - Giảm khả năng client ngắt kết nối do idle timeout khi model suy nghĩ lâu; không
+     thể ngăn timeout do upstream, mạng hoặc client tự hủy.
    - Che giấu các thẻ XML thô, người dùng chỉ nhìn thấy nội dung văn bản giải thích.
 
 3. Tường lửa ổ đĩa & Sandbox nghiêm ngặt (Path & Shell Jail):
@@ -167,4 +169,85 @@ Bước 4: Cấu hình vào DeepSeek Harness (pi-ai) / Cline:
 
 Bước 5: Truy cập Web Dashboard:
    http://127.0.0.1:10000/dashboard
+
+
+7. NHỮNG PHẦN ĐÃ GIẢI QUYẾT / ĐÃ KIỂM TRA
+--------------------------------------------------------------------------------
+- Chuẩn hóa kết nối API cho coding agent, gồm phản hồi JSON và streaming SSE.
+- Tổ chức các instance tách biệt theo cổng: gateway 10000, acc1 10001 và
+  acc2 10002; đã sửa mapping peer và tên lane để dễ nhận biết.
+- Bổ sung các cải thiện Dashboard: cập nhật trạng thái lane, cổng và model;
+  giữ bộ lọc log; phân biệt lỗi API với lỗi kết nối; tránh thăm dò peer đang tắt.
+- Thêm timeout tổng cho yêu cầu có ảnh, timeout mặc định 90 giây (cấu hình tối
+  đa 120 giây), và giới hạn lượt gửi ảnh trực tiếp để dành thời gian cho OCR
+  cùng phản hồi dự phòng.
+- Chuyển lỗi trong SSE producer thành lỗi có cấu trúc gửi tới client.
+- Thêm regression tests cho session, timeout ảnh, fallback và SSE. Có 50 test
+  tập trung đã chạy đạt; đây không phải kết quả của toàn bộ test suite.
+- Các mục trên xác nhận hành vi của mã nguồn và test tương ứng, không đảm bảo
+  dịch vụ Gemini Web luôn sẵn sàng.
+
+
+8. NHỮNG PHẦN CHƯA GIẢI QUYẾT / CÒN CHƯA XÁC MINH
+--------------------------------------------------------------------------------
+- Đã có lần gửi hai ảnh qua Bridge bị timeout: lượt Vision trực tiếp hết thời
+  gian, OCR chạy, nhưng phản hồi text fallback cũng không về trước deadline.
+- Prompt text-only qua Bridge cũng đã timeout. Khi kiểm tra Gemini Chatbox trong
+  trình duyệt đã đăng nhập, prompt kiểm tra text-only tiếp tục quay hơn 90 giây
+  và phải dừng thủ công.
+- Trạng thái acc1 báo xác thực thành công/AVAILABLE, nhưng điều đó chỉ chứng
+  minh cookie được chấp nhận tại thời điểm kiểm tra; không chứng minh model sẽ
+  xử lý hoặc trả lời request.
+- Chưa xác định được nguyên nhân upstream. Rate limit, quota, mạng, phiên Gemini
+  hoặc thay đổi dịch vụ đều cần thêm bằng chứng; hiện chưa thể kết luận tài khoản
+  bị bóp hay bị đánh dấu bot.
+- Chưa hoàn thành phép đối chứng gửi cùng hai ảnh qua Gemini Chatbox, vì prompt
+  text-only trên Chatbox cũng bị treo.
+- Một số việc trong TODO_TASKS.txt vẫn cần làm: kiểm thử failover/hot-reload,
+  tool calling, kiểm soát truy cập khi triển khai mạng, troubleshooting và
+  hoàn thiện quan sát trạng thái failover trên dashboard.
+- Cookie Google và token quản trị là bí mật. Nếu từng được dán vào chat, log
+  hoặc nơi chia sẻ, cần thu hồi/đổi và cập nhật lại trong cấu hình local.
+
+
+9. HƯỚNG PHÁT TRIỂN TƯƠNG LAI
+--------------------------------------------------------------------------------
+Ưu tiên 1 - Ổn định và chẩn đoán:
+- Ghi nhận thời gian từng chặng (lock, upload, Vision, OCR, text fallback) mà
+  không ghi cookie, token hay dữ liệu nhạy cảm.
+- Chuẩn hóa lỗi upstream để phân biệt timeout, lỗi mạng, xác thực và quota khi
+  có bằng chứng; hiển thị hướng xử lý rõ ràng cho người dùng.
+- Thêm cooldown/backoff có giới hạn; không tự gửi lặp request đang treo.
+- Tạo smoke test ngắn, có deadline, dùng prompt tối thiểu và có thể bật/tắt
+  chủ động để tránh tạo tải không cần thiết lên tài khoản.
+
+Ưu tiên 2 - Bảo mật:
+- Rà soát xác thực cho API và endpoint điều khiển; chỉ mở mạng LAN khi có cấu
+  hình bảo vệ phù hợp, không đưa token vào log hoặc mã nguồn.
+- Bổ sung hướng dẫn xoay cookie/token và kiểm tra quyền thư mục làm việc.
+
+Ưu tiên 3 - Chất lượng và trải nghiệm:
+- Bổ sung kiểm thử tự động cho tool calling, request đồng thời, failover,
+  hot-reload cookie và các trạng thái SSE lỗi.
+- Cải thiện dashboard để thể hiện chặng bị chậm, trạng thái tài khoản dự phòng
+  và thời điểm cập nhật dữ liệu.
+- Hoàn thiện tài liệu troubleshooting và bảng mã lỗi.
+
+Ưu tiên 4 - Giảm phụ thuộc vào giao diện web:
+- Đánh giá Gemini API chính thức hoặc provider có API được hỗ trợ nếu cần vận
+  hành ổn định lâu dài. Giữ lớp API tương thích OpenAI để có thể thay backend
+  mà không phải đổi coding agent/client.
+
+
+10. TIÊU CHÍ HOÀN THÀNH GỢI Ý
+--------------------------------------------------------------------------------
+- Prompt text-only và prompt có ảnh đều trả lời hoặc trả lỗi dễ hiểu trong
+  deadline; không để client chờ vô hạn.
+- Khi upstream lỗi, Bridge ghi đúng giai đoạn và mã lỗi mà không lộ bí mật.
+- Các test cho session, streaming, tool calling, failover, lane và bảo mật đạt.
+- Gateway, acc1 và acc2 hoạt động đúng cổng; không gửi request đến peer đang tắt.
+- Không còn cookie hoặc token còn hiệu lực trong tài liệu, log hay nội dung chia sẻ.
+
+Lưu ý: Gemini Web là upstream bên ngoài Bridge. Tính năng có trong mã nguồn
+không đồng nghĩa upstream luôn sẵn sàng hoặc hoạt động ổn định.
 ================================================================================

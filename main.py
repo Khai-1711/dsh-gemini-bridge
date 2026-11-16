@@ -317,9 +317,9 @@ async def _local_switch_model(model_name: str, keep_chat: bool = True) -> Tuple[
 
     target = model_name
     is_valid = False
-    if target in ("unspecified", ""):
+    if target.lower() in ("unspecified", "", "1", "2", "acc1", "acc2", "default", "auto", "none"):
         is_valid = True
-        target = "unspecified"
+        target = session_manager.default_model or "unspecified"
     elif session_manager.available_models and target in session_manager.available_models:
         is_valid = True
     else:
@@ -991,6 +991,8 @@ async def chat_completions(request: Request):
 
     requested_model = str(body.get("model") or session_manager.default_model).strip()
     model_id = requested_model or session_manager.default_model
+    if model_id.lower() in ("1", "2", "acc1", "acc2", "default", "auto", "none", "unspecified"):
+        model_id = session_manager.default_model
     is_stream = body.get("stream", False)
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_ts = int(t0)
@@ -1102,6 +1104,19 @@ async def chat_completions(request: Request):
                         await queue.put(item)
                 except Exception as exc:  # defensive
                     logger.error(f"[SSE] producer error: {exc}")
+                    if isinstance(exc, BridgeError):
+                        error = {
+                            "message": exc.message,
+                            "type": exc.err_type,
+                            "code": exc.code,
+                        }
+                    else:
+                        error = {
+                            "message": "Streaming response failed before completion.",
+                            "type": "upstream_error",
+                            "code": "stream_producer_error",
+                        }
+                    await queue.put(("error", error))
                 finally:
                     producer_done.set()
 

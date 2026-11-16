@@ -21,3 +21,6 @@ logs/
 .bridge_accounts*.json
 .bridge_chain*.json
 handoff/
+
+# Scratch & temporary test scripts
+scratch/

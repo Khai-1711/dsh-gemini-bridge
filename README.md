@@ -198,7 +198,7 @@ The bridge supports running up to 2 completely isolated DSH agents from the **sa
 
 The bridge features an on-demand connection switch:
 - **Starts in OFF state by default:** The web server and dashboard start immediately, but **NO** connection to Gemini Web is established and **NO** background cookie refresh tasks run until explicitly enabled.
-- **Independent switches per instance:** Instance `acc1` (`:10000/dashboard`) and `acc2` (`:10001/dashboard`) maintain completely independent control switches. Control state is memory-only and initialized on startup based on `API_START_STATE`.
+- **Independent switches per instance:** Instance `acc1` (`:10001/dashboard`) and `acc2` (`:10002/dashboard`) maintain completely independent control switches. The gateway dashboard at `:10000/dashboard` can control both workers. Control state is memory-only and initialized on startup based on `API_START_STATE`.
 
 ### State Lifecycle Matrix
 
@@ -217,6 +217,10 @@ API_START_STATE=off
 
 # Maximum seconds to wait for in-flight requests to drain when disabling (default: 120s)
 DISABLE_DRAIN_TIMEOUT=120
+
+# Total deadline per image request, including upload, OCR fallback, and response (default: 90s, maximum: 120s).
+# Direct image processing uses at most half this budget, preserving time for OCR/text fallback.
+IMAGE_REQUEST_TIMEOUT=90
 ```
 
 ### LAN / Dual-Computer Support

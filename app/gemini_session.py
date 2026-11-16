@@ -35,6 +35,7 @@ from app.config import (
     HANDOFF_MAX_CHARS,
     HANDOFF_RECENT_TURNS,
     HANDOFF_SOURCE_MAX_CHARS,
+    IMAGE_REQUEST_TIMEOUT,
     INSTANCE_ID,
     INSTANCE_LABEL,
     INSTANCE_PATHS,
@@ -66,16 +67,6 @@ from app.handoff import (
 )
 from app.vision import cleanup_temp_images, extract_text_from_image_local
 
-# Python 3.11+ has asyncio.timeout; keep 3.10 compatibility with a no-op fallback.
-try:
-    from asyncio import timeout as _asyncio_timeout
-except ImportError:  # pragma: no cover
-    from contextlib import nullcontext
-
-    def _asyncio_timeout(_seconds):
-        return nullcontext()
-
-
 # =====================================================================
 # RESPONSE CACHE (TTL-based, tránh gọi lại prompt lặp)
 # =====================================================================
@@ -87,6 +78,36 @@ MAX_CACHE_SIZE = 50
 def _cache_key(prompt: str, model: str = "") -> str:
     material = f"{model}\x00{prompt}".encode("utf-8", errors="replace")
     return hashlib.sha256(material).hexdigest()[:16]
+
+
+def _request_deadline(timeout: float) -> float:
+    return asyncio.get_running_loop().time() + timeout
+
+
+def _remaining_timeout(deadline: float, maximum: Optional[float] = None) -> float:
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return min(remaining, maximum) if maximum is not None else remaining
+
+
+async def _await_with_deadline(awaitable, deadline: Optional[float]):
+    if deadline is None:
+        return await awaitable
+    return await asyncio.wait_for(awaitable, timeout=_remaining_timeout(deadline))
+
+
+async def _iterate_stream_until(stream, deadline: float):
+    """Iterate an async response stream against an absolute deadline."""
+    iterator = stream.__aiter__()
+    while True:
+        try:
+            item = await asyncio.wait_for(
+                iterator.__anext__(), timeout=_remaining_timeout(deadline)
+            )
+        except StopAsyncIteration:
+            return
+        yield item
 
 
 def get_cached_response(prompt: str, model: str = "") -> Optional[str]:
@@ -1220,6 +1241,9 @@ class SingleChatManager:
         self, prompt_to_send: str, image_files: List[str]
     ) -> str:
         self.total_requests += 1
+        image_deadline = (
+            _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
+        )
 
         # Kiểm tra cache (chỉ khi bật cache và prompt không có ảnh)
         if ENABLE_RESPONSE_CACHE and not image_files:
@@ -1229,17 +1253,33 @@ class SingleChatManager:
 
         # Lock với timeout — trả lỗi thay vì chờ vô hạn (M2)
         try:
-            await asyncio.wait_for(self.lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT)
+            lock_timeout = (
+                _remaining_timeout(image_deadline, LOCK_ACQUIRE_TIMEOUT)
+                if image_deadline is not None
+                else LOCK_ACQUIRE_TIMEOUT
+            )
+            await asyncio.wait_for(self.lock.acquire(), timeout=lock_timeout)
         except asyncio.TimeoutError:
             cleanup_temp_images(image_files)
             self.total_errors += 1
+            if image_deadline is not None and image_deadline <= asyncio.get_running_loop().time():
+                raise BridgeTimeoutError(
+                    f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline."
+                )
             raise BridgeBusyError("Bridge đang bận, thử lại sau vài giây.")
 
         try:
             # Giãn cách an toàn
             elapsed = time.time() - self.last_request_ts
             if elapsed < MIN_REQUEST_INTERVAL:
-                await asyncio.sleep(MIN_REQUEST_INTERVAL - elapsed)
+                delay = MIN_REQUEST_INTERVAL - elapsed
+                if image_deadline is not None:
+                    await asyncio.wait_for(
+                        asyncio.sleep(delay),
+                        timeout=_remaining_timeout(image_deadline),
+                    )
+                else:
+                    await asyncio.sleep(delay)
 
             if self.chat_session is None:
                 self._create_new_chat_session()
@@ -1261,7 +1301,15 @@ class SingleChatManager:
                         prompt_with_header, files=image_files
                     )
                     response = await asyncio.wait_for(
-                        coro, timeout=GEMINI_HARD_TIMEOUT
+                        coro,
+                        timeout=(
+                            _remaining_timeout(
+                                image_deadline,
+                                min(GEMINI_HARD_TIMEOUT, IMAGE_REQUEST_TIMEOUT / 2),
+                            )
+                            if image_deadline is not None
+                            else GEMINI_HARD_TIMEOUT
+                        ),
                     )
                     self.last_request_ts = time.time()
                     reply = (response.text or "").strip()
@@ -1275,6 +1323,11 @@ class SingleChatManager:
                     self._save_session()
                     return reply
                 except Exception as img_exc:
+                    if (
+                        image_deadline is not None
+                        and image_deadline <= asyncio.get_running_loop().time()
+                    ):
+                        raise asyncio.TimeoutError from img_exc
                     if (self._is_auth_error(img_exc) or not self._evaluate_auth()) and not (self.allow_guest and self.is_guest):
                         raise BridgeAuthError("Gemini chưa đăng nhập (guest/cookie hết hạn).")
                     logger.warning(
@@ -1291,9 +1344,13 @@ class SingleChatManager:
                     logger.info(
                         f"[Vision Layer 2] Quét chữ từ ảnh #{idx} bằng Local OCR..."
                     )
-                    ocr_text = await asyncio.to_thread(
-                        extract_text_from_image_local, img_p
-                    )
+                    ocr_task = asyncio.to_thread(extract_text_from_image_local, img_p)
+                    if image_deadline is not None:
+                        ocr_text = await asyncio.wait_for(
+                            ocr_task, timeout=_remaining_timeout(image_deadline)
+                        )
+                    else:
+                        ocr_text = await ocr_task
                     ocr_blocks.append(
                         f"=== [EXTRACTED TEXT FROM IMAGE #{idx}] ===\n"
                         f"{ocr_text}\n"
@@ -1326,7 +1383,12 @@ class SingleChatManager:
                     )
                     coro = self.chat_session.send_message(prompt_to_send)
                     response = await asyncio.wait_for(
-                        coro, timeout=GEMINI_HARD_TIMEOUT
+                        coro,
+                        timeout=(
+                            _remaining_timeout(image_deadline, GEMINI_HARD_TIMEOUT)
+                            if image_deadline is not None
+                            else GEMINI_HARD_TIMEOUT
+                        ),
                     )
                     self.last_request_ts = time.time()
                     reply = (response.text or "").strip()
@@ -1355,15 +1417,25 @@ class SingleChatManager:
                     return reply
 
                 except asyncio.TimeoutError:
-                    logger.error(f"Quá thời gian {GEMINI_HARD_TIMEOUT}s!")
+                    timeout = (
+                        IMAGE_REQUEST_TIMEOUT
+                        if (
+                            image_deadline is not None
+                            and image_deadline <= asyncio.get_running_loop().time()
+                        )
+                        else GEMINI_HARD_TIMEOUT
+                    )
+                    logger.error(f"Quá thời gian {timeout}s!")
                     self.total_errors += 1
                     raise BridgeTimeoutError(
-                        f"Gemini không phản hồi sau {GEMINI_HARD_TIMEOUT}s."
+                        f"Gemini không phản hồi sau {timeout}s."
                     )
 
                 except UsageLimitExceededError as exc:
                     logger.warning("[QUOTA] đang chuyển tài khoản, có thể mất 1-3 phút")
-                    if quota_switches < len(self.chain) and await self._handle_quota_exhausted(exc):
+                    if quota_switches < len(self.chain) and await _await_with_deadline(
+                        self._handle_quota_exhausted(exc), image_deadline
+                    ):
                         quota_switches += 1
                         continue
                     raise BridgeQuotaError("Tất cả tài khoản đều hết quota. Hãy thử lại sau hoặc nạp thêm tài khoản.")
@@ -1384,27 +1456,39 @@ class SingleChatManager:
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
                             "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
                         )
-                        if len(self.chain) > 1 and await self._try_failover_to_backup():
+                        if len(self.chain) > 1 and await _await_with_deadline(
+                            self._try_failover_to_backup(), image_deadline
+                        ):
                             continue
 
                     if attempt == 0:
                         saved_meta = self._chat_metadata_snapshot()
                         try:
-                            await self.client.close()
+                            await _await_with_deadline(self.client.close(), image_deadline)
                         except Exception:
                             pass
                         try:
-                            await self.client.init(
-                                timeout=60,
-                                auto_close=False,
-                                close_delay=300,
-                                auto_refresh=True,
+                            await _await_with_deadline(
+                                self.client.init(
+                                    timeout=60,
+                                    auto_close=False,
+                                    close_delay=300,
+                                    auto_refresh=True,
+                                ),
+                                image_deadline,
                             )
                         except Exception as init_exc:
+                            if (
+                                image_deadline is not None
+                                and image_deadline <= asyncio.get_running_loop().time()
+                            ):
+                                raise asyncio.TimeoutError from init_exc
                             logger.error(f"Init lại client thất bại: {init_exc}")
                             raise BridgeUpstreamError(f"Lỗi kết nối Gemini Web: {init_exc}")
                         if not self._evaluate_auth():
-                            if len(self.chain) > 1 and await self._try_failover_to_backup():
+                            if len(self.chain) > 1 and await _await_with_deadline(
+                                self._try_failover_to_backup(), image_deadline
+                            ):
                                 attempt += 1
                                 continue
                             if not (self.allow_guest and self.is_guest):
@@ -1415,6 +1499,14 @@ class SingleChatManager:
                         raise BridgeUpstreamError(f"Lỗi kết nối Gemini Web: {exc}")
 
             raise BridgeUpstreamError("Không nhận được phản hồi.")
+        except asyncio.TimeoutError as exc:
+            if image_deadline is None:
+                raise
+            self.total_errors += 1
+            logger.error(f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT}s deadline.")
+            raise BridgeTimeoutError(
+                f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline."
+            ) from exc
         finally:
             self.lock.release()
             cleanup_temp_images(image_files)
@@ -1444,12 +1536,27 @@ class SingleChatManager:
         self, prompt_to_send: str, image_files: List[str]
     ):
         self.total_requests += 1
+        image_deadline = (
+            _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
+        )
 
         try:
-            await asyncio.wait_for(self.lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT)
+            lock_timeout = (
+                _remaining_timeout(image_deadline, LOCK_ACQUIRE_TIMEOUT)
+                if image_deadline is not None
+                else LOCK_ACQUIRE_TIMEOUT
+            )
+            await asyncio.wait_for(self.lock.acquire(), timeout=lock_timeout)
         except asyncio.TimeoutError:
             cleanup_temp_images(image_files)
             self.total_errors += 1
+            if image_deadline is not None and image_deadline <= asyncio.get_running_loop().time():
+                yield "error", {
+                    "message": f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
+                    "type": BridgeTimeoutError.err_type,
+                    "code": BridgeTimeoutError.code,
+                }
+                return
             yield "error", {
                 "message": "Bridge đang bận, thử lại sau vài giây.",
                 "type": BridgeBusyError.err_type,
@@ -1461,7 +1568,14 @@ class SingleChatManager:
         try:
             elapsed = time.time() - self.last_request_ts
             if elapsed < MIN_REQUEST_INTERVAL:
-                await asyncio.sleep(MIN_REQUEST_INTERVAL - elapsed)
+                delay = MIN_REQUEST_INTERVAL - elapsed
+                if image_deadline is not None:
+                    await asyncio.wait_for(
+                        asyncio.sleep(delay),
+                        timeout=_remaining_timeout(image_deadline),
+                    )
+                else:
+                    await asyncio.sleep(delay)
 
             if self.chat_session is None:
                 self._create_new_chat_session()
@@ -1477,14 +1591,21 @@ class SingleChatManager:
                     prompt_with_header = self._ensure_header_in_prompt(
                         self._apply_pending_handoff(base_prompt)
                     )
-                    async with _asyncio_timeout(GEMINI_HARD_TIMEOUT):
-                        async for output in self.chat_session.send_message_stream(
+                    vision_deadline = min(
+                        image_deadline,
+                        asyncio.get_running_loop().time()
+                        + min(GEMINI_HARD_TIMEOUT, IMAGE_REQUEST_TIMEOUT / 2),
+                    )
+                    async for output in _iterate_stream_until(
+                        self.chat_session.send_message_stream(
                             prompt_with_header, files=image_files
-                        ):
-                            delta = output.text_delta or ""
-                            if delta:
-                                full_text += delta
-                                yield "delta", delta
+                        ),
+                        vision_deadline,
+                    ):
+                        delta = output.text_delta or ""
+                        if delta:
+                            full_text += delta
+                            yield "delta", delta
                     self.last_request_ts = time.time()
                     self.session_initialized = True
                     self.tool_header_sent = True
@@ -1496,7 +1617,11 @@ class SingleChatManager:
                     yield "done", full_text.strip()
                     return
                 except asyncio.TimeoutError:
-                    logger.error(f"[Vision] Quá thời gian {GEMINI_HARD_TIMEOUT}s!")
+                    if image_deadline <= asyncio.get_running_loop().time():
+                        raise
+                    logger.warning(
+                        "[Vision] Direct image attempt timed out; switching to OCR fallback."
+                    )
                     self.total_errors += 1
                     self.vision_disabled_until = time.time() + 300
                     full_text = ""
@@ -1521,8 +1646,9 @@ class SingleChatManager:
                     logger.info(
                         f"[Vision Layer 2] Quét chữ từ ảnh #{idx} bằng Local OCR..."
                     )
-                    ocr_text = await asyncio.to_thread(
-                        extract_text_from_image_local, img_p
+                    ocr_text = await asyncio.wait_for(
+                        asyncio.to_thread(extract_text_from_image_local, img_p),
+                        timeout=_remaining_timeout(image_deadline),
                     )
                     ocr_blocks.append(
                         f"=== [EXTRACTED TEXT FROM IMAGE #{idx}] ===\n"
@@ -1553,15 +1679,20 @@ class SingleChatManager:
                         f"Stream vào ChatSession (Turn={self.turn_count + 1} | "
                         f"Chars={len(prompt_to_send)})"
                     )
-                    async with _asyncio_timeout(GEMINI_HARD_TIMEOUT):
-                        async for output in self.chat_session.send_message_stream(
-                            prompt_to_send
-                        ):
-                            delta = output.text_delta or ""
-                            if delta:
-                                yielded_any = True
-                                full_text += delta
-                                yield "delta", delta
+                    stream_deadline = (
+                        image_deadline
+                        if image_deadline is not None
+                        else asyncio.get_running_loop().time() + GEMINI_HARD_TIMEOUT
+                    )
+                    async for output in _iterate_stream_until(
+                        self.chat_session.send_message_stream(prompt_to_send),
+                        stream_deadline,
+                    ):
+                        delta = output.text_delta or ""
+                        if delta:
+                            yielded_any = True
+                            full_text += delta
+                            yield "delta", delta
                     self.last_request_ts = time.time()
                     reply = full_text.strip()
                     self.session_initialized = True
@@ -1583,10 +1714,18 @@ class SingleChatManager:
                     return
 
                 except asyncio.TimeoutError:
-                    logger.error(f"Quá thời gian {GEMINI_HARD_TIMEOUT}s!")
+                    timeout = (
+                        IMAGE_REQUEST_TIMEOUT
+                        if (
+                            image_deadline is not None
+                            and image_deadline <= asyncio.get_running_loop().time()
+                        )
+                        else GEMINI_HARD_TIMEOUT
+                    )
+                    logger.error(f"Quá thời gian {timeout}s!")
                     self.total_errors += 1
                     yield "error", {
-                        "message": f"Gemini không phản hồi sau {GEMINI_HARD_TIMEOUT}s.",
+                        "message": f"Gemini không phản hồi sau {timeout}s.",
                         "type": BridgeTimeoutError.err_type,
                         "code": BridgeTimeoutError.code,
                     }
@@ -1601,11 +1740,18 @@ class SingleChatManager:
                         }
                         return
                     if quota_switches < len(self.chain):
-                        task = asyncio.create_task(self._handle_quota_exhausted(exc))
-                        while not task.done():
-                            yield "delta", ""
-                            await asyncio.sleep(2.5)
-                        switched = task.result()
+                        if image_deadline is not None:
+                            switched = await _await_with_deadline(
+                                self._handle_quota_exhausted(exc), image_deadline
+                            )
+                        else:
+                            task = asyncio.create_task(
+                                self._handle_quota_exhausted(exc)
+                            )
+                            while not task.done():
+                                yield "delta", ""
+                                await asyncio.sleep(2.5)
+                            switched = task.result()
                         if switched:
                             quota_switches += 1
                             continue
@@ -1630,19 +1776,34 @@ class SingleChatManager:
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
                             "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
                         )
-                        if len(self.chain) > 1 and await self._try_failover_to_backup():
+                        if len(self.chain) > 1 and await _await_with_deadline(
+                            self._try_failover_to_backup(), image_deadline
+                        ):
                             continue
                     if attempt == 0:
                         saved_meta = self._chat_metadata_snapshot()
                         try:
-                            await self.client.close()
+                            await _await_with_deadline(
+                                self.client.close(), image_deadline
+                            )
                         except Exception:
                             pass
                         try:
-                            await self.client.init(
-                                timeout=60, auto_close=False, close_delay=300, auto_refresh=True
+                            await _await_with_deadline(
+                                self.client.init(
+                                    timeout=60,
+                                    auto_close=False,
+                                    close_delay=300,
+                                    auto_refresh=True,
+                                ),
+                                image_deadline,
                             )
                         except Exception as init_exc:
+                            if (
+                                image_deadline is not None
+                                and image_deadline <= asyncio.get_running_loop().time()
+                            ):
+                                raise asyncio.TimeoutError from init_exc
                             logger.error(f"Init lại client thất bại: {init_exc}")
                             yield "error", {
                                 "message": f"Lỗi kết nối Gemini Web: {init_exc}",
@@ -1651,7 +1812,9 @@ class SingleChatManager:
                             }
                             return
                         if not self._evaluate_auth():
-                            if len(self.chain) > 1 and await self._try_failover_to_backup():
+                            if len(self.chain) > 1 and await _await_with_deadline(
+                                self._try_failover_to_backup(), image_deadline
+                            ):
                                 attempt += 1
                                 continue
                             if not (self.allow_guest and self.is_guest):
@@ -1676,6 +1839,15 @@ class SingleChatManager:
                 "message": "Không nhận được phản hồi từ Gemini.",
                 "type": BridgeUpstreamError.err_type,
                 "code": BridgeUpstreamError.code,
+            }
+        except asyncio.TimeoutError:
+            if image_deadline is None:
+                raise
+            self.total_errors += 1
+            yield "error", {
+                "message": f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
+                "type": BridgeTimeoutError.err_type,
+                "code": BridgeTimeoutError.code,
             }
         finally:
             self.lock.release()

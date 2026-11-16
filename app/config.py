@@ -1,5 +1,6 @@
 import logging
 import logging.handlers
+import math
 import os
 import re
 import sys
@@ -106,6 +107,11 @@ DISABLE_DRAIN_TIMEOUT = float(os.getenv("DISABLE_DRAIN_TIMEOUT", "120"))
 
 # Giới hạn cứng 90s (< 120s của gemini_webapi)
 GEMINI_HARD_TIMEOUT = int(os.getenv("GEMINI_HARD_TIMEOUT", "90"))
+
+# Total deadline for image upload, OCR fallback, and the Gemini response.
+IMAGE_REQUEST_TIMEOUT = float(os.getenv("IMAGE_REQUEST_TIMEOUT", "90"))
+if not math.isfinite(IMAGE_REQUEST_TIMEOUT) or not 0 < IMAGE_REQUEST_TIMEOUT <= 120:
+    raise ValueError("IMAGE_REQUEST_TIMEOUT must be greater than 0 and at most 120 seconds.")
 
 # Giãn cách tối thiểu giữa 2 request liên tiếp (giây)
 MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.5"))

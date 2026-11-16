@@ -112,8 +112,8 @@ icacls "D:\ABC" /grant "$($env:USERNAME):(OI)(CI)F" /T
 ```
 
 ### 4. Khởi động nhanh cả hai luồng (`run_all.bat`)
-Chủ dự án có thể khởi động cả hai luồng `acc1` (cổng 10000) và `acc2` (cổng 10001) chỉ với **MỘT thao tác**:
-- **(a) Bấm đúp `run_all.bat`:** Script sẽ kiểm tra cổng lắng nghe và tự động khởi động 2 cửa sổ cmd thu nhỏ (`minimized`) cho 2 luồng riêng biệt. Nếu luồng nào đã chạy từ trước, script tự động bỏ qua.
+`run_all.bat` khởi động Cổng Dashboard (`10000`), Luồng 1 `acc1` (`10001`) và Luồng 2 `acc2` (`10002`) chỉ với **MỘT thao tác**:
+- **(a) Bấm đúp `run_all.bat`:** Script sẽ kiểm tra cổng lắng nghe và tự động khởi động tối đa 3 cửa sổ cmd thu nhỏ (`minimized`): một gateway và hai worker. Nếu tiến trình ở cổng tương ứng đã chạy, script tự động bỏ qua.
 - **(b) Tạo shortcut ra Desktop:** Bấm chuột phải vào `run_all.bat` → *Send to* → *Desktop (create shortcut)* để mở 2 luồng nhanh chóng từ màn hình chính.
 - **(c) Tự chạy khi khởi động máy:** Nhấn tổ hợp phím `Win + R` → gõ `shell:startup` → Enter → kéo shortcut của `run_all.bat` vào thư mục Startup này. Trong thuộc tính của Shortcut (Properties), chọn *Run: Minimized* để chạy ngầm gọn gàng.
 - **Dừng tiến trình:** Khi cần tắt hoàn toàn cả 2 tiến trình ngay lập tức, chạy `stop_all.bat`. Lưu ý: trong vận hành thông thường, hãy sử dụng công tắc **BẬT/TẮT** trên Dashboard để chờ request đang xử lý hoàn tất (drain an toàn).
@@ -125,8 +125,8 @@ Tại thư mục `dsh_gemini_bridge/`, bạn vẫn có thể khởi chạy riên
 python main.py
 
 # Hoặc chạy riêng lẻ qua file .bat:
-run_acc1.bat    # Luồng acc1 cổng 10000
-run_acc2.bat    # Luồng acc2 cổng 10001
+run_acc1.bat    # Luồng 1 (acc1), cổng 10001
+run_acc2.bat    # Luồng 2 (acc2), cổng 10002
 ```
 
 Khi khởi động thành công, Terminal sẽ hiển thị:
@@ -229,7 +229,7 @@ Bridge hỗ trợ chạy tối đa 2 Agent DSH độc lập cùng lúc từ **c�
 
 Bridge tích hợp cơ chế kiểm soát kết nối chủ động:
 - **Khởi động ở trạng thái TẮT (mặc định):** Server web và dashboard vẫn hoạt động, nhưng **KHÔNG** kết nối Gemini Web và **KHÔNG** chạy vòng tự làm mới token ngầm (chống hao mòn / quét cookie khi không dùng).
-- **Mỗi Instance một công tắc riêng:** `acc1` trên `:10000/dashboard` và `acc2` trên `:10001/dashboard` có công tắc hoàn toàn độc lập. Trạng thái không lưu ra đĩa (mỗi lần khởi động luôn theo biến `API_START_STATE`).
+- **Mỗi Instance một công tắc riêng:** `acc1` trên `:10001/dashboard` và `acc2` trên `:10002/dashboard` có công tắc hoàn toàn độc lập. Dashboard gateway tại `:10000/dashboard` có thể điều khiển cả hai worker. Trạng thái không lưu ra đĩa (mỗi lần khởi động luôn theo biến `API_START_STATE`).
 
 ### Bảng Hành Vi Trạng Thái
 
@@ -248,6 +248,10 @@ API_START_STATE=off
 
 # Số giây tối đa chờ request đang chạy dở hoàn thành khi bấm TẮT (mặc định: 120 giây)
 DISABLE_DRAIN_TIMEOUT=120
+
+# Deadline tổng cho mỗi yêu cầu có ảnh, gồm upload, OCR dự phòng và phản hồi (mặc định 90, tối đa 120 giây).
+# Xử lý ảnh trực tiếp dùng tối đa một nửa thời gian để dành phần còn lại cho OCR và phản hồi.
+IMAGE_REQUEST_TIMEOUT=90
 ```
 
 ### Cơ Chế Draining Khi Bấm TẮT
@@ -265,9 +269,9 @@ Khi cần truy cập Bridge hoặc Dashboard từ một máy tính khác trong c
      ```
    - *Cơ chế phòng thủ:* Nếu đặt `HOST=0.0.0.0` mà `API_KEY` để trống, Bridge sẽ **TỪ CHỐI KHỞI ĐỘNG** (thoát mã lỗi 1) để bảo vệ tài khoản Google của bạn khỏi truy cập trái phép từ các thiết bị khác trong mạng (trừ khi cố ý đặt `ALLOW_INSECURE_LAN=true`).
 2. **Tạo luật Windows Firewall giới hạn địa chỉ IP:**
-   Khuyến nghị chỉ cho phép IP cụ thể của máy thứ hai truy cập vào các cổng 10000/10001 (chạy trong PowerShell với quyền Administrator):
+   Khuyến nghị chỉ cho phép IP cụ thể của máy thứ hai truy cập vào các cổng 10000/10001/10002 (chạy trong PowerShell với quyền Administrator):
    ```powershell
-   New-NetFirewallRule -DisplayName "DSH Bridge" -Direction Inbound -LocalPort 10000,10001 -Protocol TCP -RemoteAddress <IP_MÁY_2> -Action Allow
+   New-NetFirewallRule -DisplayName "DSH Bridge" -Direction Inbound -LocalPort 10000,10001,10002 -Protocol TCP -RemoteAddress <IP_MÁY_2> -Action Allow
    ```
 3. **Lưu ý bảo mật đường truyền:**
    - Kết nối trên mạng LAN sử dụng giao thức HTTP thông thường (chưa mã hóa TLS/HTTPS), do đó API Key có thể bị nghe lén nếu kết nối qua mạng Wi-Fi không tin cậy. Chỉ nên sử dụng tính năng này trên mạng gia đình hoặc văn phòng tin cậy.
@@ -278,7 +282,7 @@ Khi cần truy cập Bridge hoặc Dashboard từ một máy tính khác trong c
 
 0. **Agent nhận mã lỗi HTTP 503 `bridge_disabled`:**
    * **Triệu chứng:** Agent thông báo `Bridge đang TẮT. Hãy bật ở dashboard rồi thử lại.`
-   * **Cách xử lý:** Mở Dashboard của instance tương ứng (`http://127.0.0.1:10000/dashboard` cho con 1 hoặc `:10001/dashboard` cho con 2) và bấm nút **BẬT**. Sau khi trạng thái chuyển sang màu xanh **BẬT**, gửi lại prompt trên Agent.
+   * **Cách xử lý:** Mở Dashboard của instance tương ứng (`http://127.0.0.1:10001/dashboard` cho `acc1` hoặc `http://127.0.0.1:10002/dashboard` cho `acc2`), hoặc Dashboard gateway `http://127.0.0.1:10000/dashboard` để điều khiển cả hai; bấm nút **BẬT**. Sau khi trạng thái chuyển sang màu xanh **BẬT**, gửi lại prompt trên Agent.
 
 1. **Xử lý khi bridge rơi vào Guest mode (Chưa đăng nhập):**
    * **Triệu chứng:** Dashboard hiển thị huy hiệu `GUEST (CHƯA ĐĂNG NHẬP)` màu đỏ, request API từ Agent trả về HTTP 503 với mã lỗi `{"error": {"code": "gemini_not_authenticated", "message": "Gemini chưa đăng nhập..."}}`.

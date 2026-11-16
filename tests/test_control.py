@@ -303,6 +303,27 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         )
         switch_model.assert_awaited_once_with("Gemini_4.1", keep_chat=True)
 
+    async def test_chat_accepts_alias_models(self):
+        from main import chat_completions, session_manager
+
+        for alias in ("1", "2", "default", "auto", "acc1", "acc2"):
+            request = Request({"type": "http", "headers": []})
+            request._json = {
+                "model": alias,
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+
+            with patch.object(session_manager, "require_on"), \
+                 patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+                 patch.object(session_manager, "send_prepared_turn", new_callable=AsyncMock, return_value="hello back"), \
+                 patch("main._local_switch_model", new_callable=AsyncMock) as switch_model, \
+                 patch("main.activity.write"):
+                response = await chat_completions(request)
+                self.assertIsInstance(response, dict, f"Alias '{alias}' did not return dict")
+                self.assertEqual(response.get("object"), "chat.completion")
+                # Không được gọi _local_switch_model vì đã normalize thẳng về default_model
+                switch_model.assert_not_awaited()
+
     async def test_stream_reports_unparseable_tool_call(self):
         from main import chat_completions, session_manager
 
@@ -327,6 +348,37 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
 
         body = "".join(chunks)
         self.assertIn("invalid_tool_call", body)
+        self.assertNotIn('"finish_reason":"stop"', body)
+
+    async def test_stream_exposes_producer_exception_as_sse_error(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "analyze screenshot"}],
+            "stream": True,
+        }
+
+        async def broken_stream(prompt, image_files):
+            raise RuntimeError("private upstream detail")
+            yield "done", ""
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "send_prepared_turn_stream", new=broken_stream), \
+             patch("main.build_incremental_prompt_and_files", return_value=("prompt", ["mock-image.png"])), \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+            chunks = [
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        body = "".join(chunks)
+        self.assertIn('"code": "stream_producer_error"', body)
+        self.assertIn('"type": "upstream_error"', body)
+        self.assertIn("[DONE]", body)
+        self.assertNotIn("private upstream detail", body)
         self.assertNotIn('"finish_reason":"stop"', body)
 
     async def test_control_and_chat_endpoints_when_off(self):
