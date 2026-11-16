@@ -360,7 +360,12 @@ def _local_lane_models() -> dict:
             label = "Mặc định (unspecified)"
         else:
             meta = details.get(m, {})
-            label = meta.get("display_name", m) or m
+            disp = meta.get("display_name") or m
+            raw_disp = meta.get("raw_display_name")
+            if raw_disp and raw_disp != disp and raw_disp.lower() not in disp.lower():
+                label = f"{disp} ({raw_disp})"
+            else:
+                label = disp
         available.append({"id": m, "label": label})
     return {
         "current": session_manager.default_model,

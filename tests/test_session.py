@@ -90,6 +90,17 @@ class TestSessionManager(unittest.TestCase):
         self.assertFalse(mgr.auth_ok)
         self.assertEqual(mgr.account_status_name, "UNAUTHENTICATED")
 
+    def test_guest_mode_enabled_and_ready(self):
+        mgr = make_manager(AccountStatus.UNAUTHENTICATED, "Guest")
+        self.assertTrue(mgr.is_guest)
+        self.assertFalse(mgr.auth_ok)
+        self.assertTrue(mgr.allow_guest)
+        loop = asyncio.new_event_loop()
+        try:
+            self.assertTrue(loop.run_until_complete(mgr.ensure_authenticated()))
+        finally:
+            loop.close()
+
     def test_session_state_bound_to_account(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             session_file = Path(tmp_dir) / ".bridge_session.json"

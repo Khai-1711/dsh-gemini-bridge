@@ -53,7 +53,7 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
 
         # Kiểm tra đầy đủ các trường theo đúng lược đồ JSON chuẩn
         expected_fields = {
-            "id", "label", "url", "is_self", "reachable", "control",
+            "id", "label", "url", "port", "is_self", "reachable", "control",
             "inflight", "auth_ok", "account_status", "active_account",
             "accounts", "model", "requests", "errors", "uptime_s",
             "chat_key", "last_activity_ts", "cache_enabled", "controllable"
@@ -62,6 +62,7 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st["id"], "acc1")
         self.assertEqual(st["label"], "Frontend")
         self.assertEqual(st["url"], "http://127.0.0.1:10000")
+        self.assertEqual(st["port"], 10000)
         self.assertTrue(st["is_self"])
         self.assertTrue(st["reachable"])
         self.assertEqual(st["control"], "on")
@@ -89,8 +90,10 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
             "acc2": "http://127.0.0.1:10001",
             "acc3": "http://127.0.0.1:10002",
         }
+        requests = []
 
         async def fake_http(method, url, headers=None, body=None, timeout=2.0):
+            requests.append(url)
             if "10001" in url:
                 return 200, {
                     "instance_id": "acc2",
@@ -118,6 +121,7 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         }
 
         lanes = await reg.list_lanes(local_st)
+        await reg.list_lanes(local_st)
         self.assertEqual(len(lanes), 3)
 
         # acc1 (self)
@@ -129,6 +133,7 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lanes[1]["id"], "acc2")
         self.assertFalse(lanes[1]["is_self"])
         self.assertTrue(lanes[1]["reachable"])
+        self.assertEqual(lanes[1]["port"], 10001)
         self.assertEqual(lanes[1]["control"], "on")
         self.assertEqual(lanes[1]["model"], "gemini-flash")
         self.assertTrue(lanes[1]["cache_enabled"])
@@ -138,8 +143,77 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lanes[2]["id"], "acc3")
         self.assertFalse(lanes[2]["is_self"])
         self.assertFalse(lanes[2]["reachable"])
+        self.assertEqual(lanes[2]["port"], 10002)
         self.assertEqual(lanes[2]["control"], "off")
         self.assertIn("error", lanes[2])
+        self.assertEqual(requests.count("http://127.0.0.1:10002/v1/lanes/acc3/status"), 1)
+
+    async def test_lane_registry_list_lanes_frontend_gateway(self):
+        peers = {
+            "acc1": "http://127.0.0.1:10001",
+            "acc2": "http://127.0.0.1:10002",
+        }
+
+        async def fake_http(method, url, headers=None, body=None, timeout=2.0):
+            if "10001" in url:
+                return 200, {
+                    "instance_id": "acc1",
+                    "instance_label": "Luong 1",
+                    "state": "on",
+                    "inflight": 0,
+                    "auth_ok": True,
+                }
+            return 0, {"error": "Connection refused"}
+
+        reg = LaneRegistry("frontend", peers, token=self.canary_token, http_call=fake_http, is_frontend_gateway=True)
+        local_st = {
+            "id": "frontend", "label": "Frontend Gateway", "url": "http://127.0.0.1:10000",
+            "is_self": True, "reachable": True, "control": "on", "controllable": True,
+        }
+
+        lanes = await reg.list_lanes(local_st)
+        # Port 10000 Frontend không nằm trong danh sách worker flows
+        self.assertEqual(len(lanes), 2)
+        self.assertEqual(lanes[0]["id"], "acc1")
+        self.assertEqual(lanes[0]["port"], 10001)
+        self.assertTrue(lanes[0]["reachable"])
+        self.assertEqual(lanes[1]["id"], "acc2")
+        self.assertEqual(lanes[1]["port"], 10002)
+        self.assertFalse(lanes[1]["reachable"])
+
+    async def test_off_peer_is_not_probed_until_forced_refresh_or_enable(self):
+        peer_state = "off"
+        calls = []
+
+        async def fake_http(method, url, headers=None, body=None, timeout=2.0):
+            nonlocal peer_state
+            calls.append(method)
+            if method == "POST":
+                peer_state = "on"
+                return 200, {"state": peer_state, "changed": True}
+            return 200, {"instance_label": "Backend", "state": peer_state}
+
+        reg = LaneRegistry(
+            "acc1",
+            {"acc2": "http://127.0.0.1:10001"},
+            token=self.canary_token,
+            http_call=fake_http,
+        )
+        local_st = {"id": "acc1", "reachable": True, "control": "on"}
+
+        first = await reg.list_lanes(local_st)
+        second = await reg.list_lanes(local_st)
+        self.assertEqual(calls, ["GET"])
+        self.assertEqual(first[1]["port"], 10001)
+        self.assertEqual(second[1]["control"], "off")
+
+        await reg.control("acc2", "enable", AsyncMock())
+        await reg.list_lanes(local_st)
+        self.assertEqual(calls, ["GET", "POST", "GET"])
+
+        peer_state = "off"
+        await reg.list_lanes(local_st, force_refresh=True)
+        self.assertEqual(calls, ["GET", "POST", "GET", "GET"])
 
     async def test_lane_registry_control_self(self):
         reg = LaneRegistry("acc1", {}, token=self.canary_token)
@@ -221,6 +295,9 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
             self.assertIn("self", res_lanes)
             self.assertEqual(res_lanes["lanes"], [{"id": "acc1", "reachable": True}])
 
+            await list_lanes(refresh=True)
+            mock_list.assert_awaited_with(unittest.mock.ANY, force_refresh=True)
+
             # 2. POST /v1/lanes/acc1/enable
             req = Request({"type": "http", "headers": []})
             resp_en = await lane_enable("acc1", req)
@@ -273,6 +350,27 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         # 3. Proxy tới chính mình -> 400
         code_self, _ = await reg.proxy_request("acc1", "GET", "logs")
         self.assertEqual(code_self, 400)
+
+    async def test_failed_peer_proxy_is_cached_without_followup_probe(self):
+        calls = []
+
+        async def fake_http(method, url, headers=None, body=None, timeout=5.0):
+            calls.append(url)
+            return 0, {"error": "Connection refused"}
+
+        reg = LaneRegistry(
+            "acc1",
+            {"acc2": "http://127.0.0.1:10001"},
+            token=self.canary_token,
+            http_call=fake_http,
+        )
+
+        status_code, _ = await reg.proxy_request("acc2", "GET", "logs")
+        lanes = await reg.list_lanes({"id": "acc1", "reachable": True, "control": "on"})
+
+        self.assertEqual(status_code, 502)
+        self.assertFalse(lanes[1]["reachable"])
+        self.assertEqual(len(calls), 1)
 
     async def test_local_switch_model_validation(self):
         from main import _local_switch_model, session_manager

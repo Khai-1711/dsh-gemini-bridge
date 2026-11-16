@@ -165,6 +165,67 @@ def clear_saved_session() -> None:
 # =====================================================================
 # SINGLE CHAT MANAGER (Stateful Session + Failover + Cache)
 # =====================================================================
+def canonicalize_gemini_model(raw_name: str, display_name: str = "", description: str = "") -> dict:
+    """Chuẩn hóa tên model kỹ thuật (vd: Gemini 2.0 Flash, Gemini 1.5 Pro)
+    từ các chuỗi mô tả tiếng Việt/tiếng Anh mà Google Gemini Web trả về."""
+    raw_str = (raw_name or "").strip()
+    disp_str = (display_name or "").strip()
+    comb = f"{raw_str.lower()} {disp_str.lower()}".strip()
+    clean_id = raw_str.removeprefix("models/").lower()
+
+    # 1. Flash Lite (Trả lời nhanh / Flash Lite)
+    if "lite" in comb or clean_id == "gemini-flash-lite" or ("trả lời nhanh" in comb and "hydrogen" not in comb):
+        return {
+            "name": "gemini-2.0-flash-lite",
+            "display_name": "Gemini 2.0 Flash Lite",
+            "raw_display_name": disp_str or raw_str,
+            "description": description or "Mô hình siêu nhẹ, phản hồi nhanh tức thì.",
+        }
+
+    # 2. Flash Standard / Hydrogen (Trợ giúp hằng ngày / Fast / Flash / Hydrogen)
+    if any(k in comb for k in ["trợ giúp hằng ngày", "tro giup hang ngay", "hydrogen", "fast", "everyday"]) or clean_id in ("gemini-flash", "gemini-2.0-flash", "gemini-4-hydrogen"):
+        return {
+            "name": "gemini-2.0-flash",
+            "display_name": "Gemini 2.0 Flash",
+            "raw_display_name": disp_str or raw_str,
+            "description": description or "Mô hình nhanh nhất, đa năng cho tác vụ hằng ngày.",
+        }
+
+    # 3. Deep Research / Thinking Tier / Pro (Nghiên cứu chi tiết / Deep research / Thinking / Pro)
+    if any(k in comb for k in ["nghiên cứu chi tiết", "nghien cuu chi tiet", "deep research", "deep-research", "thinking"]):
+        return {
+            "name": "gemini-2.0-flash-thinking",
+            "display_name": "Gemini 2.0 Flash Thinking",
+            "raw_display_name": disp_str or raw_str,
+            "description": description or "Mô hình suy luận chuyên sâu và nghiên cứu chi tiết.",
+        }
+
+    # 4. Complex / Advanced / Carbon / 2.5 Pro (Việc phức tạp nhất / Complex / Advanced / Carbon / Ultra)
+    if any(k in comb for k in ["việc phức tạp nhất", "viec phuc tap nhat", "phức tạp nhất", "complex", "advanced", "carbon", "ultra", "2.5-pro"]) or clean_id in ("gemini-carbon", "gemini-2.5-pro", "gemini-ultra"):
+        return {
+            "name": "gemini-2.5-pro",
+            "display_name": "Gemini 2.5 Pro",
+            "raw_display_name": disp_str or raw_str,
+            "description": description or "Mô hình mạnh mẽ nhất cho bài toán phức tạp và lập trình.",
+        }
+
+    # 5. Fallback Pro
+    if clean_id in ("gemini-pro", "gemini-1.5-pro"):
+        return {
+            "name": "gemini-1.5-pro",
+            "display_name": "Gemini 1.5 Pro",
+            "raw_display_name": disp_str or raw_str,
+            "description": description or "Mô hình cân bằng và suy luận chuẩn xác.",
+        }
+
+    return {
+        "name": clean_id,
+        "display_name": disp_str or clean_id,
+        "raw_display_name": disp_str or raw_str,
+        "description": description or "",
+    }
+
+
 class SingleChatManager:
     """
     Quản lý phiên hội thoại đơn nhất với Gemini Web:
@@ -559,28 +620,37 @@ class SingleChatManager:
         """
         details: List[Dict[str, Any]] = []
 
-        def _add(name: Any, display_name: Any = None, description: Any = None) -> None:
-            clean = str(name or "").strip()
-            if not clean or any(d["name"] == clean for d in details):
+        def _add(name: Any, display_name: Any = None, description: Any = None, model_obj: Any = None) -> None:
+            clean_raw = str(name or "").strip()
+            if not clean_raw:
                 return
-            details.append(
-                {
-                    "name": clean,
-                    "display_name": str(display_name or clean).strip() or clean,
-                    "description": str(description or "").strip(),
-                }
-            )
+            c = canonicalize_gemini_model(clean_raw, str(display_name or "").strip(), str(description or "").strip())
+            c_name = c["name"]
+            if any(d["name"] == c_name for d in details):
+                return
+            details.append(c)
+
+            # Đăng ký alias vào client model registry để resolve_model(c_name) luôn thành công
+            if hasattr(self.client, "_model_registry"):
+                reg = getattr(self.client, "_model_registry", {})
+                if model_obj and hasattr(model_obj, "aliases"):
+                    if c_name not in model_obj.aliases:
+                        model_obj.aliases.append(c_name)
+                    reg[c_name] = model_obj
+                elif clean_raw in reg:
+                    reg[c_name] = reg[clean_raw]
 
         # Đường chuẩn: gemini-webapi 2.x
         try:
             for model in self.client.list_models() or []:
-                _add(
+                raw_n = (
                     getattr(model, "model_name", None)
                     or getattr(model, "name", None)
-                    or model,
-                    getattr(model, "display_name", None),
-                    getattr(model, "description", None),
+                    or model
                 )
+                disp_n = getattr(model, "display_name", None)
+                desc = getattr(model, "description", None)
+                _add(raw_n, disp_n, desc, model_obj=model)
         except Exception as e:
             logger.warning(f"Không đọc được model registry: {e}")
 
@@ -688,7 +758,8 @@ class SingleChatManager:
             if target and target != "unspecified":
                 try:
                     resolved = self.client.resolve_model(target)
-                    target = str(getattr(resolved, "model_name", None) or target)
+                    if target not in self.available_models:
+                        target = str(getattr(resolved, "model_name", None) or target)
                 except Exception:
                     if self.available_models and target not in self.available_models:
                         raise ValueError(
