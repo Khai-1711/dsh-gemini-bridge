@@ -250,6 +250,12 @@ def cleanup_temp_images(image_paths: List[str]) -> None:
         if path in _TEMP_FILES:
             try:
                 os.remove(path)
-            except Exception:
-                pass
-            _TEMP_FILES.discard(path)
+            except FileNotFoundError:
+                _TEMP_FILES.discard(path)
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove temporary image file (%s).",
+                    type(exc).__name__,
+                )
+            else:
+                _TEMP_FILES.discard(path)

@@ -3,9 +3,12 @@ class BridgeError(Exception):
     err_type: str = "internal_error"
     code: str = "internal_error"
 
-    def __init__(self, message: str, status_code: int = None):
+    def __init__(
+        self, message: str, status_code: int = None, *, stage: str = None
+    ):
         super().__init__(message)
         self.message = message
+        self.stage = stage
         if status_code is not None:
             self.status_code = status_code
 

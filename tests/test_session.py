@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import json
 import logging
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -156,6 +158,77 @@ class TestSessionManager(unittest.TestCase):
         p3 = mgr._ensure_header_in_prompt("Hello Turn 3")
         self.assertIn("SYSTEM_TOOL_HEADER_XYZ", p3)
 
+    def test_greeting_defers_full_tool_header_to_next_task(self):
+        mgr = make_manager()
+        header = "SYSTEM_TOOL_HEADER_XYZ"
+        mgr.remember_tool_header(header)
+        mgr.session_initialized = False
+        mgr.tool_header_sent = False
+        prompts = []
+
+        async def send_stream(prompt, files=None):
+            prompts.append(prompt)
+            yield SimpleNamespace(text_delta="hello")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch.object(mgr, "_save_session"):
+            first = asyncio.run(
+                _collect_stream_items(
+                    mgr.send_prepared_turn_stream(
+                        "hi", [], include_tool_header=False
+                    )
+                )
+            )
+            self.assertTrue(mgr.needs_tool_header)
+
+            second = asyncio.run(
+                _collect_stream_items(
+                    mgr.send_prepared_turn_stream(
+                        "inspect a file", [], include_tool_header=True
+                    )
+                )
+            )
+
+        self.assertEqual(prompts[0], "hi")
+        self.assertIn("SYSTEM_TOOL_HEADER_XYZ", prompts[1])
+        self.assertTrue(mgr.tool_header_sent)
+        self.assertEqual(
+            mgr.chat_tool_header_hash,
+            hashlib.sha256(header.encode("utf-8")).hexdigest(),
+        )
+        self.assertIn(("done", "hello"), first)
+        self.assertIn(("done", "hello"), second)
+
+    def test_saved_session_restores_matching_tool_header_fingerprint(self):
+        manager = make_manager()
+        header = "stable tool schema"
+        manager.chat_session.metadata = ["saved_cid", "saved_rid"]
+        manager.last_tool_header = header
+        manager.tool_header_sent = True
+        manager.chat_tool_header_hash = hashlib.sha256(
+            header.encode("utf-8")
+        ).hexdigest()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            session_file = Path(tmp_dir) / ".bridge_session.json"
+            with patch("app.gemini_session.SESSION_STATE_FILE", session_file):
+                manager._save_session()
+                saved = load_saved_session()
+
+        self.assertEqual(saved["tool_header_hash"], manager.chat_tool_header_hash)
+
+        restored = make_manager()
+        restored.available_models = ["models/gemini-2.5-pro"]
+        self.assertTrue(restored._resume_saved_session(saved))
+        restored.remember_tool_header(header)
+        self.assertTrue(restored.tool_header_sent)
+        self.assertFalse(restored.needs_tool_header)
+
+        restored.remember_tool_header("changed tool schema")
+        self.assertFalse(restored.tool_header_sent)
+        self.assertTrue(restored.needs_tool_header)
+
     def test_metadata_preserved_on_retry(self):
         mgr = make_manager()
         mgr.chat_session = MockChatSession(
@@ -197,6 +270,125 @@ class TestSessionManager(unittest.TestCase):
                 asyncio.run(mgr.send_prepared_turn("analyze screenshot", ["image.png"]))
 
         self.assertEqual(cm.exception.code, BridgeTimeoutError.code)
+        self.assertEqual(cm.exception.stage, "text_generation")
+
+    def test_text_timeout_cancels_upstream_and_releases_lock(self):
+        mgr = make_manager()
+        upstream_cancelled = threading.Event()
+
+        async def slow_send(*args, **kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                upstream_cancelled.set()
+
+        mgr.chat_session.send_message = slow_send
+        with patch("app.gemini_session.GEMINI_HARD_TIMEOUT", 0.03), \
+             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch.object(mgr, "_save_session"):
+            with self.assertRaises(BridgeTimeoutError):
+                asyncio.run(mgr.send_prepared_turn("first request", []))
+
+            self.assertTrue(upstream_cancelled.is_set())
+            self.assertFalse(mgr.lock.locked())
+            self.assertEqual(mgr._inflight, 0)
+
+            mgr.chat_session.send_message = AsyncMock(
+                return_value=SimpleNamespace(text="second request completed")
+            )
+            reply = asyncio.run(mgr.send_prepared_turn("second request", []))
+
+        self.assertEqual(reply, "second request completed")
+        self.assertEqual(mgr._inflight, 0)
+
+    def test_temp_image_cleanup_on_success_and_ocr_error(self):
+        from app.vision import _TEMP_FILES
+
+        for fail_ocr in (False, True):
+            with self.subTest(fail_ocr=fail_ocr):
+                mgr = make_manager()
+                mgr.is_guest = True
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
+                    image_path = image.name
+                    image.write(b"test image")
+                _TEMP_FILES.add(image_path)
+
+                def fake_ocr(_path):
+                    if fail_ocr:
+                        raise RuntimeError("mock OCR failure")
+                    return "recognized text"
+
+                with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 1), \
+                     patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+                     patch(
+                         "app.gemini_session.extract_text_from_image_local",
+                         side_effect=fake_ocr,
+                     ), \
+                     patch.object(mgr, "_save_session"):
+                    if fail_ocr:
+                        with self.assertRaisesRegex(RuntimeError, "mock OCR failure"):
+                            asyncio.run(
+                                mgr.send_prepared_turn("analyze", [image_path])
+                            )
+                    else:
+                        mgr.chat_session.send_message = AsyncMock(
+                            return_value=SimpleNamespace(text="OCR answer")
+                        )
+                        reply = asyncio.run(
+                            mgr.send_prepared_turn("analyze", [image_path])
+                        )
+                        self.assertEqual(reply, "OCR answer")
+
+                self.assertFalse(Path(image_path).exists())
+                self.assertNotIn(image_path, _TEMP_FILES)
+
+    def test_image_timeout_defers_temp_cleanup_until_ocr_worker_finishes(self):
+        from app.vision import _TEMP_FILES
+
+        mgr = make_manager()
+        mgr.is_guest = True
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
+            image_path = image.name
+            image.write(b"test image")
+        _TEMP_FILES.add(image_path)
+
+        def slow_ocr(path):
+            with open(path, "rb"):
+                started.set()
+                release.wait(timeout=2)
+            finished.set()
+            return "recognized text"
+
+        async def run_timeout_and_wait_for_ocr():
+            with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.05), \
+                 patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+                 patch(
+                     "app.gemini_session.extract_text_from_image_local",
+                     side_effect=slow_ocr,
+                 ), \
+                 patch.object(mgr, "_save_session"):
+                with self.assertRaises(BridgeTimeoutError) as cm:
+                    await mgr.send_prepared_turn("analyze", [image_path])
+                self.assertEqual(cm.exception.stage, "ocr")
+
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                release.set()
+                self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+                await asyncio.sleep(0)
+                self.assertFalse(Path(image_path).exists())
+
+        try:
+            asyncio.run(run_timeout_and_wait_for_ocr())
+        finally:
+            release.set()
+            if Path(image_path).exists():
+                Path(image_path).unlink()
+            _TEMP_FILES.discard(image_path)
+
+        self.assertEqual(mgr._inflight, 0)
 
     def test_image_request_uses_local_ocr_fallback(self):
         mgr = make_manager()
@@ -268,6 +460,35 @@ class TestSessionManager(unittest.TestCase):
         errors = [payload for kind, payload in results if kind == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
+        self.assertEqual(errors[0]["stage"], "text_generation")
+
+    def test_stream_timeout_cancels_upstream_and_releases_lock(self):
+        mgr = make_manager()
+        upstream_cancelled = threading.Event()
+
+        async def slow_stream(prompt, files=None):
+            try:
+                await asyncio.Event().wait()
+                yield SimpleNamespace(text_delta="late response")
+            finally:
+                upstream_cancelled.set()
+
+        mgr.chat_session.send_message_stream = slow_stream
+        with patch("app.gemini_session.GEMINI_HARD_TIMEOUT", 0.03), \
+             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0):
+            results = asyncio.run(
+                _collect_stream_items(
+                    mgr.send_prepared_turn_stream("slow request", [])
+                )
+            )
+
+        errors = [payload for kind, payload in results if kind == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
+        self.assertEqual(errors[0]["stage"], "text_generation")
+        self.assertTrue(upstream_cancelled.is_set())
+        self.assertFalse(mgr.lock.locked())
+        self.assertEqual(mgr._inflight, 0)
 
     def test_stream_image_deadline_includes_ocr_fallback(self):
         mgr = make_manager()
@@ -354,6 +575,244 @@ class TestSessionManager(unittest.TestCase):
         self.assertIn(("delta", "OCR fallback answer"), results)
         self.assertIn(("done", "OCR fallback answer"), results)
 
+    def test_stream_discards_partial_vision_on_timeout_before_ocr_fallback(self):
+        mgr = make_manager()
+
+        async def send_stream(prompt, files=None):
+            if files:
+                yield SimpleNamespace(text_delta="partial vision answer")
+                await asyncio.sleep(0.18)
+                yield SimpleNamespace(text_delta="late vision answer")
+            else:
+                self.assertIn("recognized screenshot text", prompt)
+                yield SimpleNamespace(text_delta="OCR fallback answer")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.3), \
+             patch("app.gemini_session.GEMINI_HARD_TIMEOUT", 1), \
+             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch(
+                 "app.gemini_session.extract_text_from_image_local",
+                 return_value="recognized screenshot text",
+             ):
+            results = asyncio.run(_collect_stream_items(
+                mgr.send_prepared_turn_stream("analyze", ["image.png"])
+            ))
+
+        self.assertIn(("delta", "OCR fallback answer"), results)
+        self.assertIn(("done", "OCR fallback answer"), results)
+        self.assertFalse(any(
+            kind == "delta" and "vision answer" in payload
+            for kind, payload in results
+        ))
+
+    def test_stream_discards_partial_vision_on_exception_before_ocr_fallback(self):
+        mgr = make_manager()
+
+        async def send_stream(prompt, files=None):
+            if files:
+                yield SimpleNamespace(text_delta="partial vision answer")
+                raise RuntimeError("mock vision stream failure")
+            self.assertIn("recognized screenshot text", prompt)
+            yield SimpleNamespace(text_delta="OCR fallback answer")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
+             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch(
+                 "app.gemini_session.extract_text_from_image_local",
+                 return_value="recognized screenshot text",
+             ), \
+             patch.object(mgr, "_save_session"):
+            results = asyncio.run(_collect_stream_items(
+                mgr.send_prepared_turn_stream("analyze", ["image.png"])
+            ))
+
+        self.assertIn(("delta", "OCR fallback answer"), results)
+        self.assertIn(("done", "OCR fallback answer"), results)
+        self.assertFalse(any(
+            kind == "delta" and "partial vision answer" in payload
+            for kind, payload in results
+        ))
+
+    def test_stream_emits_buffered_vision_deltas_after_success(self):
+        mgr = make_manager()
+
+        async def send_stream(prompt, files=None):
+            yield SimpleNamespace(text_delta="vision ")
+            yield SimpleNamespace(text_delta="answer")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch(
+                 "app.gemini_session.VISION_STREAM_BUFFER_MAX_BYTES",
+                 len("vision answer".encode("utf-8")),
+             ), \
+             patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
+             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch.object(mgr, "_save_session"):
+            results = asyncio.run(_collect_stream_items(
+                mgr.send_prepared_turn_stream("analyze", ["image.png"])
+            ))
+
+        self.assertEqual(
+            results,
+            [
+                ("delta", "vision "),
+                ("delta", "answer"),
+                ("done", "vision answer"),
+            ],
+        )
+
+    def test_stream_stops_after_delta_for_network_auth_and_quota_errors(self):
+        from gemini_webapi.exceptions import UsageLimitExceededError
+
+        cases = [
+            (
+                "network",
+                RuntimeError("connection reset"),
+                "upstream_error",
+                "gemini_upstream_error",
+            ),
+            (
+                "auth",
+                RuntimeError("unauthenticated"),
+                "authentication_error",
+                "gemini_not_authenticated",
+            ),
+            (
+                "quota",
+                UsageLimitExceededError("quota exhausted"),
+                "quota_error",
+                "all_accounts_exhausted",
+            ),
+        ]
+        for label, failure, expected_type, expected_code in cases:
+            with self.subTest(error=label):
+                mgr = make_manager()
+                mgr.chain = [{"label": "acc1"}, {"label": "acc2"}]
+                if label == "auth":
+                    mgr._consecutive_auth_errors = 1
+                send_calls = 0
+
+                async def send_stream(prompt, files=None):
+                    nonlocal send_calls
+                    send_calls += 1
+                    yield SimpleNamespace(text_delta="first partial answer")
+                    raise failure
+
+                mgr.chat_session.send_message_stream = send_stream
+                with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+                     patch.object(
+                         mgr,
+                         "_try_failover_to_backup",
+                         new_callable=AsyncMock,
+                         return_value=True,
+                     ) as failover, \
+                     patch.object(
+                         mgr,
+                         "_handle_quota_exhausted",
+                         new_callable=AsyncMock,
+                         return_value=True,
+                     ) as handoff:
+                    results = asyncio.run(_collect_stream_items(
+                        mgr.send_prepared_turn_stream("stream prompt", [])
+                    ))
+
+                errors = [payload for kind, payload in results if kind == "error"]
+                self.assertEqual(send_calls, 1)
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["type"], expected_type)
+                self.assertEqual(errors[0]["code"], expected_code)
+                self.assertEqual(errors[0]["stage"], "text_generation")
+                self.assertEqual(
+                    [kind for kind, _payload in results], ["delta", "error"]
+                )
+                failover.assert_not_awaited()
+                handoff.assert_not_awaited()
+
+    def test_stream_retries_transient_error_before_first_delta(self):
+        mgr = make_manager()
+        send_calls = 0
+
+        async def send_stream(prompt, files=None):
+            nonlocal send_calls
+            send_calls += 1
+            if send_calls == 1:
+                raise RuntimeError("connection reset before response")
+            yield SimpleNamespace(text_delta="complete answer")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch.object(mgr, "_create_new_chat_session"):
+            results = asyncio.run(_collect_stream_items(
+                mgr.send_prepared_turn_stream("stream prompt", [])
+            ))
+
+        self.assertEqual(send_calls, 2)
+        self.assertIn(("delta", "complete answer"), results)
+        self.assertIn(("done", "complete answer"), results)
+        self.assertFalse(any(kind == "error" for kind, _payload in results))
+
+    def test_stream_can_handoff_quota_before_first_delta(self):
+        from gemini_webapi.exceptions import UsageLimitExceededError
+
+        mgr = make_manager()
+        mgr.chain = [{"label": "acc1"}, {"label": "acc2"}]
+        send_calls = 0
+
+        async def send_stream(prompt, files=None):
+            nonlocal send_calls
+            send_calls += 1
+            if send_calls == 1:
+                raise UsageLimitExceededError("quota exhausted")
+            yield SimpleNamespace(text_delta="response after handoff")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch.object(
+                 mgr, "_handle_quota_exhausted", new_callable=AsyncMock, return_value=True
+             ) as handoff:
+            results = asyncio.run(_collect_stream_items(
+                mgr.send_prepared_turn_stream("stream prompt", [])
+            ))
+
+        self.assertEqual(send_calls, 2)
+        handoff.assert_awaited_once()
+        self.assertIn(("delta", "response after handoff"), results)
+        self.assertIn(("done", "response after handoff"), results)
+        self.assertFalse(any(kind == "error" for kind, _payload in results))
+
+    def test_oversized_vision_buffer_falls_back_without_leaking_partial_text(self):
+        mgr = make_manager()
+
+        async def send_stream(prompt, files=None):
+            if files:
+                yield SimpleNamespace(text_delta="1234")
+                yield SimpleNamespace(text_delta="56")
+            else:
+                self.assertIn("recognized screenshot text", prompt)
+                yield SimpleNamespace(text_delta="OCR fallback answer")
+
+        mgr.chat_session.send_message_stream = send_stream
+        with patch("app.gemini_session.VISION_STREAM_BUFFER_MAX_BYTES", 5), \
+             patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
+             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             patch(
+                 "app.gemini_session.extract_text_from_image_local",
+                 return_value="recognized screenshot text",
+             ), \
+             patch.object(mgr, "_save_session"):
+            results = asyncio.run(_collect_stream_items(
+                mgr.send_prepared_turn_stream("analyze", ["image.png"])
+            ))
+
+        self.assertIn(("delta", "OCR fallback answer"), results)
+        self.assertIn(("done", "OCR fallback answer"), results)
+        self.assertFalse(any(
+            kind == "delta" and payload in ("1234", "56")
+            for kind, payload in results
+        ))
+
     def test_error_classes_and_status_codes(self):
         auth_err = BridgeAuthError("Auth error")
         self.assertEqual(auth_err.status_code, 503)
@@ -374,6 +833,26 @@ class TestSessionManager(unittest.TestCase):
         self.assertEqual(upstream_err.status_code, 502)
         self.assertEqual(upstream_err.err_type, "upstream_error")
         self.assertEqual(upstream_err.code, "gemini_upstream_error")
+
+    def test_tool_header_is_resent_when_schema_changes_or_disappears(self):
+        mgr = make_manager()
+        mgr.session_initialized = True
+        mgr.tool_header_sent = True
+
+        mgr.remember_tool_header("schema A")
+        self.assertTrue(mgr.needs_tool_header)
+
+        mgr._mark_tool_header_sent(True)
+        mgr.remember_tool_header("schema A")
+        self.assertFalse(mgr.needs_tool_header)
+
+        mgr.remember_tool_header("")
+        self.assertTrue(mgr.needs_tool_header)
+        self.assertEqual(mgr._ensure_header_in_prompt("user request"), "user request")
+
+        mgr._mark_tool_header_sent(True)
+        mgr.remember_tool_header("schema A")
+        self.assertTrue(mgr.needs_tool_header)
 
     def test_get_status_reflects_auth(self):
         mgr = make_manager(AccountStatus.AVAILABLE, "Base Cookies")

@@ -61,11 +61,21 @@ from app.lane_security import (
     lane_token_ok,
 )
 from app.lanes import LaneRegistry, build_local_lane_status, spawn_local_lane
-from app.prompt_builder import build_incremental_prompt_and_files, compile_tools_prompt
+from app.prompt_builder import (
+    build_incremental_prompt_and_files,
+    compile_tools_prompt,
+    is_plain_greeting_request,
+)
 from app.streaming import ToolCallAwareStreamer
-from app.tool_parser import parse_tool_calls_from_reply
+from app.tool_parser import has_tool_call_intent, parse_tool_calls_from_reply
+from app.tool_repair import (
+    schedule_tool_repair_shadow,
+    validate_tool_repair_settings,
+)
+from app.title_generation import extract_local_title_request
 
 FRONTEND_DIR = BASE_DIR / "frontend"
+validate_tool_repair_settings()
 
 
 @asynccontextmanager
@@ -295,7 +305,7 @@ async def update_cookies(request: Request):
     return await update_account_cookies(0, request)
 
 
-async def _local_switch_model(model_name: str, keep_chat: bool = True) -> Tuple[int, dict]:
+async def _local_switch_model(model_name: Any, keep_chat: bool = True) -> Tuple[int, dict]:
     is_ready = session_manager.state == "on" and (
         session_manager.auth_ok or (session_manager.allow_guest and session_manager.is_guest)
     )
@@ -307,7 +317,8 @@ async def _local_switch_model(model_name: str, keep_chat: bool = True) -> Tuple[
             }
         }
 
-    if not model_name:
+    raw_str = str(model_name or "").strip()
+    if not raw_str:
         return 400, {
             "error": {
                 "code": "invalid_request",
@@ -315,22 +326,39 @@ async def _local_switch_model(model_name: str, keep_chat: bool = True) -> Tuple[
             }
         }
 
-    target = model_name
+    target = raw_str
     is_valid = False
     if target.lower() in ("unspecified", "", "1", "2", "acc1", "acc2", "default", "auto", "none"):
         is_valid = True
         target = session_manager.default_model or "unspecified"
     elif session_manager.available_models and target in session_manager.available_models:
         is_valid = True
+    elif session_manager.available_models and any(m.lower() == target.lower() for m in session_manager.available_models):
+        target = next(m for m in session_manager.available_models if m.lower() == target.lower())
+        is_valid = True
     else:
-        try:
-            resolved = session_manager.client.resolve_model(target)
-            resolved_name = str(getattr(resolved, "model_name", None) or target)
-            if resolved_name in session_manager.available_models:
-                target = resolved_name
-                is_valid = True
-        except Exception:
-            is_valid = False
+        t_low = target.lower()
+        matched = None
+        for keyword in ("flash", "pro", "carbon", "hydrogen"):
+            if keyword in t_low:
+                for m in session_manager.available_models:
+                    if keyword in m.lower():
+                        matched = m
+                        break
+            if matched:
+                break
+        if matched:
+            target = matched
+            is_valid = True
+        else:
+            try:
+                resolved = session_manager.client.resolve_model(target)
+                resolved_name = str(getattr(resolved, "model_name", None) or target)
+                if resolved_name in session_manager.available_models:
+                    target = resolved_name
+                    is_valid = True
+            except Exception:
+                is_valid = False
 
     if not is_valid:
         return 400, {
@@ -983,12 +1011,6 @@ async def chat_completions(request: Request):
         and t.get("function", t).get("name").lower() not in FORBIDDEN_TOOLS
     }
 
-    last = messages[-1] if messages else {}
-    task_hint = ""
-    if last.get("role") == "user":
-        c = last.get("content")
-        task_hint = (c if isinstance(c, str) else str(c))[:100]
-
     requested_model = str(body.get("model") or session_manager.default_model).strip()
     model_id = requested_model or session_manager.default_model
     if model_id.lower() in ("1", "2", "acc1", "acc2", "default", "auto", "none", "unspecified"):
@@ -997,6 +1019,121 @@ async def chat_completions(request: Request):
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_ts = int(t0)
 
+    is_title_request, local_title, title_prompt_chars = (
+        extract_local_title_request(messages)
+    )
+    if is_title_request:
+        if local_title is None:
+            activity.write(
+                request_id=chat_id,
+                model=model_id,
+                stream=is_stream,
+                stage="session_title_local",
+                latency_ms=int((time.time() - t0) * 1000),
+                outcome="error:invalid_title_request",
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "DSH session title request is malformed.",
+                        "type": "invalid_request_error",
+                        "code": "invalid_title_request",
+                    }
+                },
+            )
+
+        prompt_tokens = max(1, title_prompt_chars // 4)
+        completion_tokens = max(1, len(local_title) // 4)
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        activity.write(
+            request_id=chat_id,
+            model=model_id,
+            stream=is_stream,
+            stage="session_title_local",
+            prompt_chars=title_prompt_chars,
+            reply_chars=len(local_title),
+            latency_ms=int((time.time() - t0) * 1000),
+            outcome="ok",
+        )
+
+        if is_stream:
+            async def local_title_stream():
+                chunks = [
+                    {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": ""},
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                    {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": local_title},
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                    {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": usage,
+                    },
+                ]
+                for chunk in chunks:
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                local_title_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        return {
+            "id": chat_id,
+            "object": "chat.completion",
+            "created": created_ts,
+            "model": model_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": local_title},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": usage,
+        }
+
     if not await session_manager.ensure_authenticated():
         activity.write(
             request_id=chat_id,
@@ -1004,7 +1141,7 @@ async def chat_completions(request: Request):
             stream=is_stream,
             chat_key=session_manager.current_chat_key(),
             auth_ok=False,
-            task_hint=task_hint,
+            stage="authentication",
             latency_ms=int((time.time() - t0) * 1000),
             outcome="error:gemini_not_authenticated",
         )
@@ -1031,7 +1168,7 @@ async def chat_completions(request: Request):
                 stream=is_stream,
                 chat_key=session_manager.current_chat_key(),
                 auth_ok=session_manager.auth_ok,
-                task_hint=task_hint,
+                stage="model_selection",
                 latency_ms=int((time.time() - t0) * 1000),
                 outcome=f"error:{model_data.get('error', {}).get('code', 'model_not_available')}",
             )
@@ -1053,10 +1190,15 @@ async def chat_completions(request: Request):
             )
 
     # Rút trích prompt gia tăng
-    prompt_to_send, image_files = build_incremental_prompt_and_files(
-        messages, tools, is_first_turn=session_manager.needs_tool_header
+    tool_header = compile_tools_prompt(tools)
+    session_manager.remember_tool_header(tool_header)
+    needs_tool_header = session_manager.needs_tool_header
+    defer_tool_header = (
+        needs_tool_header and is_plain_greeting_request(messages)
     )
-    session_manager.remember_tool_header(compile_tools_prompt(tools))
+    prompt_to_send, image_files = build_incremental_prompt_and_files(
+        messages, tools, is_first_turn=needs_tool_header and not defer_tool_header
+    )
     del body, messages, tools
 
     # Tính toán ước tính số token (OpenAI Usage Stats)
@@ -1098,9 +1240,17 @@ async def chat_completions(request: Request):
 
             async def producer():
                 try:
-                    async for item in session_manager.send_prepared_turn_stream(
-                        prompt_to_send, image_files
-                    ):
+                    if defer_tool_header:
+                        turn_stream = session_manager.send_prepared_turn_stream(
+                            prompt_to_send,
+                            image_files,
+                            include_tool_header=False,
+                        )
+                    else:
+                        turn_stream = session_manager.send_prepared_turn_stream(
+                            prompt_to_send, image_files
+                        )
+                    async for item in turn_stream:
                         await queue.put(item)
                 except Exception as exc:  # defensive
                     logger.error(f"[SSE] producer error: {exc}")
@@ -1145,13 +1295,18 @@ async def chat_completions(request: Request):
                             if isinstance(payload, dict)
                             else "error"
                         )
+                        stage = (
+                            payload.get("stage")
+                            if isinstance(payload, dict)
+                            else None
+                        )
                         activity.write(
                             request_id=chat_id,
                             model=model_id,
                             stream=True,
                             chat_key=session_manager.current_chat_key(),
                             auth_ok=session_manager.auth_ok,
-                            task_hint=task_hint,
+                            stage=stage,
                             latency_ms=int((time.time() - t0) * 1000),
                             outcome=f"error:{err_code}",
                         )
@@ -1171,7 +1326,8 @@ async def chat_completions(request: Request):
 
                 reply_text = done_text if done_text is not None else splitter.full_text
                 tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
-                if "<tool_call>" in reply_text and not tool_calls:
+                if has_tool_call_intent(reply_text) and not tool_calls:
+                    schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
                     error = {
                         "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
                         "type": "upstream_error",
@@ -1183,7 +1339,7 @@ async def chat_completions(request: Request):
                         stream=True,
                         chat_key=session_manager.current_chat_key(),
                         auth_ok=session_manager.auth_ok,
-                        task_hint=task_hint,
+                        stage="tool_parse",
                         latency_ms=int((time.time() - t0) * 1000),
                         outcome="error:invalid_tool_call",
                     )
@@ -1241,7 +1397,7 @@ async def chat_completions(request: Request):
                     stream=True,
                     chat_key=session_manager.current_chat_key(),
                     auth_ok=session_manager.auth_ok,
-                    task_hint=task_hint,
+                    stage="complete",
                     prompt_chars=len(prompt_to_send),
                     reply_chars=len(reply_text),
                     finish=finish_reason,
@@ -1252,13 +1408,13 @@ async def chat_completions(request: Request):
 
                 yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
-            except asyncio.CancelledError:
-                prod_task.cancel()
-                try:
-                    await prod_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-                raise
+            finally:
+                if not prod_task.done():
+                    prod_task.cancel()
+                    try:
+                        await prod_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
 
         return StreamingResponse(
             sse_generator(),
@@ -1274,7 +1430,16 @@ async def chat_completions(request: Request):
     # LUỒNG NON-STREAMING
     # ─────────────────────────────────────────────────────────────────
     try:
-        reply_text = await session_manager.send_prepared_turn(prompt_to_send, image_files)
+        if defer_tool_header:
+            reply_text = await session_manager.send_prepared_turn(
+                prompt_to_send,
+                image_files,
+                include_tool_header=False,
+            )
+        else:
+            reply_text = await session_manager.send_prepared_turn(
+                prompt_to_send, image_files
+            )
     except BridgeError as e:
         activity.write(
             request_id=chat_id,
@@ -1282,7 +1447,7 @@ async def chat_completions(request: Request):
             stream=False,
             chat_key=session_manager.current_chat_key(),
             auth_ok=session_manager.auth_ok,
-            task_hint=task_hint,
+            stage=e.stage,
             latency_ms=int((time.time() - t0) * 1000),
             outcome=f"error:{e.code}",
         )
@@ -1291,7 +1456,8 @@ async def chat_completions(request: Request):
             content={"error": {"message": e.message, "type": e.err_type, "code": e.code}},
         )
     tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
-    if "<tool_call>" in reply_text and not tool_calls:
+    if has_tool_call_intent(reply_text) and not tool_calls:
+        schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
         error = {
             "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
             "type": "upstream_error",
@@ -1303,7 +1469,7 @@ async def chat_completions(request: Request):
             stream=False,
             chat_key=session_manager.current_chat_key(),
             auth_ok=session_manager.auth_ok,
-            task_hint=task_hint,
+            stage="tool_parse",
             latency_ms=int((time.time() - t0) * 1000),
             outcome="error:invalid_tool_call",
         )
@@ -1327,7 +1493,7 @@ async def chat_completions(request: Request):
         stream=False,
         chat_key=session_manager.current_chat_key(),
         auth_ok=session_manager.auth_ok,
-        task_hint=task_hint,
+        stage="complete",
         prompt_chars=len(prompt_to_send),
         reply_chars=len(reply_text),
         finish=finish_reason,

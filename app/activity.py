@@ -7,6 +7,43 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+_SENSITIVE_FIELDS = {
+    "task_hint",
+    "prompt",
+    "message",
+    "content",
+    "arguments",
+    "argument",
+    "cookie",
+    "cookies",
+    "token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "image",
+    "image_data",
+    "hint",
+    "command",
+    "path",
+    "file_path",
+    "url",
+    "secret",
+    "password",
+}
+
+
+def _sanitize_activity_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_activity_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _SENSITIVE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_sanitize_activity_value(item) for item in value]
+    return value
+
+
 class ActivityJournal:
     def __init__(self, path, instance_id: str):
         self.path = Path(path)
@@ -30,7 +67,7 @@ class ActivityJournal:
             "instance": self.instance_id,
             "seq": self.counter,
         }
-        entry.update(fields)
+        entry.update(_sanitize_activity_value(fields))
         try:
             self._logger.info(json.dumps(entry, ensure_ascii=False))
             self._handler.flush()
@@ -49,7 +86,8 @@ class ActivityJournal:
         out: List[Dict[str, Any]] = []
         for line in raw.splitlines()[-limit:]:
             try:
-                out.append(json.loads(line))
+                entry = json.loads(line)
+                out.append(_sanitize_activity_value(entry))
             except Exception:
                 continue
         return out
@@ -60,19 +98,10 @@ class ActivityJournal:
 
 
 def summarize_tool_calls(tool_calls) -> List[Dict[str, str]]:
-    """Chỉ ghi TÊN tool + gợi ý ngắn (lệnh/đường dẫn). KHÔNG ghi nội dung file."""
+    """Chỉ ghi tên tool; không lưu arguments hoặc giá trị tham số."""
     out = []
     for tc in tool_calls or []:
         fn = tc.get("function", {}) if isinstance(tc, dict) else {}
         name = fn.get("name", "?")
-        try:
-            args = json.loads(fn.get("arguments") or "{}")
-        except Exception:
-            args = {}
-        hint = ""
-        for key in ("command", "file_path", "path", "pattern", "url"):
-            if isinstance(args, dict) and key in args:
-                hint = str(args[key])
-                break
-        out.append({"name": name, "hint": hint[:120]})
+        out.append({"name": str(name)[:80]})
     return out

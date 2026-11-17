@@ -36,6 +36,23 @@ def is_safe_path_no_c_drive(path_str: str) -> bool:
     return True
 
 
+def is_path_within_project(path_str: str, project_dir: str = None) -> bool:
+    """Return whether a path resolves inside the configured project directory."""
+    if not path_str:
+        return False
+    try:
+        root = os.path.realpath(os.path.abspath(project_dir or DEFAULT_PROJECT_DIR))
+        candidate = path_str.strip()
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(root, candidate)
+        resolved = os.path.realpath(os.path.abspath(candidate))
+        return os.path.commonpath(
+            [os.path.normcase(root), os.path.normcase(resolved)]
+        ) == os.path.normcase(root)
+    except (OSError, ValueError):
+        return False
+
+
 def sanitize_shell_command_no_c_drive(cmd: str) -> str:
     """
     Kiểm duyệt lệnh PowerShell/Bash: Chặn mọi truy cập ổ C:\\, Registry, System.
@@ -48,6 +65,7 @@ def sanitize_shell_command_no_c_drive(cmd: str) -> str:
         # === Truy cập trực tiếp ổ C ===
         r"\bC:\\",
         r"\bc:/",
+        r"(?:^|[\s\"'])/c/",
         # === Biến môi trường trỏ tới ổ hệ thống ===
         r"\$env:SystemDrive",
         r"\$env:SystemRoot",
@@ -90,11 +108,15 @@ def sanitize_shell_command_no_c_drive(cmd: str) -> str:
         r"Invoke-WebRequest.*\|\s*Invoke-Expression",
         r"IWR.*\|\s*IEX",
         r"DownloadString.*\|\s*IEX",
+        # === PowerShell encoded execution ===
+        r"\b(?:powershell|pwsh)(?:\.exe)?\s+.*-(?:e|enc|encodedcommand)\b",
+        # === Certutil abuse ===
+        r"\bcertutil(?:\.exe)?\s+.*-(?:urlcache|decode)\b",
     ]
 
     for pat in forbidden_patterns:
         if re.search(pat, cmd, flags=re.IGNORECASE):
-            logger.warning(f"[SECURITY] Chặn lệnh nguy hiểm: {cmd[:200]}")
+            logger.warning("[SECURITY] Blocked potentially unsafe command.")
             return (
                 "Write-Output 'SECURITY BLOCK: Access to C: drive or system "
                 "configuration is strictly prohibited. Operate ONLY inside D: drive.'"

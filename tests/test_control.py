@@ -120,6 +120,26 @@ class TestSingleChatManagerControl(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(m.state, "on")
         self.assertEqual(m.client.init_calls, 1)
 
+    async def test_switching_to_active_model_preserves_chat_and_tool_header(self):
+        m = self._make_manager()
+        m.default_model = "gemini-carbon"
+        m.available_models = ["gemini-carbon"]
+        m.chat_session = MagicMock()
+        m.chat_session.metadata = ["active_cid", "active_rid"]
+        m.session_initialized = True
+        m.tool_header_sent = True
+        m.turn_count = 3
+        active_chat = m.chat_session
+
+        with patch.object(m.client, "start_chat", wraps=m.client.start_chat) as start_chat:
+            result = await m.switch_model("gemini-carbon", keep_chat=True)
+
+        self.assertEqual(result, "gemini-carbon")
+        self.assertIs(m.chat_session, active_chat)
+        self.assertTrue(m.tool_header_sent)
+        self.assertEqual(m.turn_count, 3)
+        start_chat.assert_not_called()
+
     async def test_enable_failure_returns_to_off(self):
         m = self._make_manager(fail_init=True)
         with self.assertRaises(BridgeUpstreamError):
@@ -277,6 +297,180 @@ class TestSingleChatManagerControl(unittest.IsolatedAsyncioTestCase):
 
 
 class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
+    async def test_plain_greeting_defers_tool_header(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Read",
+                        "description": "Read a workspace file",
+                    },
+                }
+            ],
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "session_initialized", False), \
+             patch.object(session_manager, "tool_header_sent", False), \
+             patch.object(session_manager, "last_tool_header", ""), \
+             patch.object(session_manager, "send_prepared_turn", new_callable=AsyncMock, return_value="Hello") as send_turn, \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "Hello")
+        prompt = send_turn.await_args.args[0]
+        self.assertEqual(prompt, "hi")
+        self.assertFalse(send_turn.await_args.kwargs["include_tool_header"])
+
+    async def test_plain_greeting_defers_tool_header_in_streaming_route(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "Read", "description": "Read a file"},
+                }
+            ],
+        }
+        calls = []
+
+        async def send_stream(prompt, image_files, include_tool_header=True):
+            calls.append((prompt, include_tool_header))
+            yield "delta", "Hello"
+            yield "done", "Hello"
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "session_initialized", False), \
+             patch.object(session_manager, "tool_header_sent", False), \
+             patch.object(session_manager, "last_tool_header", ""), \
+             patch.object(session_manager, "send_prepared_turn_stream", new=send_stream), \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+            chunks = [
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        self.assertEqual(calls, [("hi", False)])
+        self.assertIn("Hello", "".join(chunks))
+
+    async def test_session_title_request_is_answered_locally(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "model": "gemini-carbon",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate the session title from this JSON array of human "
+                        'messages:\n[{"seq":12,"text":"chào"}]'
+                    ),
+                }
+            ],
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock) as authenticate, \
+             patch.object(session_manager, "remember_transcript") as remember, \
+             patch.object(session_manager, "send_prepared_turn", new_callable=AsyncMock) as send_turn, \
+             patch("main.build_incremental_prompt_and_files") as build_prompt, \
+             patch("main.activity.write") as activity_write:
+            response = await chat_completions(request)
+
+        self.assertEqual(
+            response["choices"][0]["message"]["content"],
+            "chào",
+        )
+        authenticate.assert_not_awaited()
+        remember.assert_not_called()
+        send_turn.assert_not_awaited()
+        build_prompt.assert_not_called()
+        self.assertEqual(
+            activity_write.call_args.kwargs["stage"],
+            "session_title_local",
+        )
+        self.assertNotIn(
+            "Generate the session title",
+            json.dumps(activity_write.call_args.kwargs),
+        )
+
+    async def test_streaming_session_title_request_is_answered_locally(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate the session title from this JSON array of human "
+                        'messages:\n[{"seq":12,"text":"chào"}]'
+                    ),
+                }
+            ],
+            "stream": True,
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock) as authenticate, \
+             patch.object(session_manager, "send_prepared_turn_stream") as send_stream, \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+            chunks = [
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        body = "".join(chunks)
+        self.assertIn('"content": "chào"', body)
+        self.assertIn('"finish_reason": "stop"', body)
+        self.assertIn("[DONE]", body)
+        self.assertNotIn("Generate the session title", body)
+        authenticate.assert_not_awaited()
+        send_stream.assert_not_called()
+
+    async def test_malformed_session_title_request_is_not_forwarded(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate the session title from this JSON array of human "
+                        "messages:\n[{broken json]"
+                    ),
+                }
+            ],
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock) as authenticate, \
+             patch.object(session_manager, "send_prepared_turn", new_callable=AsyncMock) as send_turn:
+            response = await chat_completions(request)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["error"]["code"],
+            "invalid_title_request",
+        )
+        authenticate.assert_not_awaited()
+        send_turn.assert_not_awaited()
+
     async def test_chat_rejects_unavailable_requested_model(self):
         from main import chat_completions, session_manager
 
@@ -324,21 +518,64 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
                 # Không được gọi _local_switch_model vì đã normalize thẳng về default_model
                 switch_model.assert_not_awaited()
 
+    async def test_chat_without_tools_does_not_reuse_stale_tool_header(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        with patch.object(session_manager, "session_initialized", True), \
+             patch.object(session_manager, "tool_header_sent", True), \
+             patch.object(session_manager, "last_tool_header", "stale tool schema"), \
+             patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "send_prepared_turn", new_callable=AsyncMock, return_value="hello back") as send_turn, \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "hello back")
+        prompt = send_turn.await_args.args[0]
+        self.assertNotIn("stale tool schema", prompt)
+        self.assertNotIn("OPERATOR INSTRUCTIONS", prompt)
+
     async def test_stream_reports_unparseable_tool_call(self):
         from main import chat_completions, session_manager
 
         request = Request({"type": "http", "headers": []})
         request._json = {
             "messages": [{"role": "user", "content": "run the task"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Inspect",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "format": {"type": "string"},
+                                "max_items": {"type": "integer"},
+                            },
+                            "required": ["format", "max_items"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
             "stream": True,
         }
 
         async def malformed_stream(prompt, image_files):
-            yield "done", '<tool_call>{"name":"pwsh","arguments": }</tool_call>'
+            yield "done", (
+                '<tool_call>{"name":"Inspect","arguments":'
+                '{"format":"summary" "max_items":3}}</tool_call>'
+            )
 
         with patch.object(session_manager, "require_on"), \
              patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
              patch.object(session_manager, "send_prepared_turn_stream", new=malformed_stream), \
+             patch("main.schedule_tool_repair_shadow") as shadow_repair, \
              patch("main.activity.write"):
             response = await chat_completions(request)
             chunks = [
@@ -349,6 +586,153 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         body = "".join(chunks)
         self.assertIn("invalid_tool_call", body)
         self.assertNotIn('"finish_reason":"stop"', body)
+        shadow_repair.assert_called_once()
+
+    async def test_nonstream_rejects_labeled_malformed_tool_call(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "run the task"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "Inspect",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "format": {"type": "string"},
+                                "max_items": {"type": "integer"},
+                            },
+                            "required": ["format", "max_items"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(
+                 session_manager,
+                 "send_prepared_turn",
+                 new_callable=AsyncMock,
+                 return_value=(
+                     '<tool_call>{"name":"Inspect","arguments":'
+                     '{"format":"summary" "max_items":3}}</tool_call>'
+                 ),
+             ), \
+             patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
+             patch("main.schedule_tool_repair_shadow", return_value=True) as shadow_repair, \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+
+        self.assertEqual(response.status_code, 502)
+        shadow_repair.assert_called_once()
+        self.assertEqual(
+            json.loads(response.body)["error"]["code"], "invalid_tool_call"
+        )
+
+    async def test_stream_timeout_emits_sse_error_and_done(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "short timeout test"}],
+            "stream": True,
+        }
+
+        async def timed_out_stream(prompt, image_files):
+            yield "error", {
+                "message": "Gemini did not respond before the deadline.",
+                "type": "timeout_error",
+                "code": "gemini_timeout",
+                "stage": "text_generation",
+            }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "send_prepared_turn_stream", new=timed_out_stream), \
+             patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
+             patch("main.schedule_tool_repair_shadow") as shadow_repair, \
+             patch("main.activity.write") as activity_write:
+            response = await chat_completions(request)
+            chunks = [
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        body = "".join(chunks)
+        self.assertIn('"code": "gemini_timeout"', body)
+        self.assertIn("[DONE]", body)
+        self.assertNotIn('"finish_reason":"stop"', body)
+        self.assertEqual(activity_write.call_args.kwargs["stage"], "text_generation")
+        self.assertNotIn("short timeout test", json.dumps(activity_write.call_args.kwargs))
+        shadow_repair.assert_not_called()
+
+    async def test_stream_sends_heartbeat_while_vision_result_is_buffered(self):
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "analyze screenshot"}],
+            "stream": True,
+        }
+
+        async def delayed_stream(prompt, image_files):
+            await asyncio.sleep(0.03)
+            yield "delta", "complete vision answer"
+            yield "done", "complete vision answer"
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "send_prepared_turn_stream", new=delayed_stream), \
+             patch("main.SSE_HEARTBEAT_INTERVAL", 0.005), \
+             patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
+             patch("main.activity.write"):
+            response = await chat_completions(request)
+            chunks = [
+                chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                async for chunk in response.body_iterator
+            ]
+
+        body = "".join(chunks)
+        self.assertIn(": keep-alive", body)
+        self.assertIn("complete vision answer", body)
+
+    async def test_nonstream_timeout_records_stage_without_prompt(self):
+        from app.errors import BridgeTimeoutError
+        from main import chat_completions, session_manager
+
+        request = Request({"type": "http", "headers": []})
+        request._json = {
+            "messages": [{"role": "user", "content": "PRIVATE_REQUEST_TEXT"}],
+        }
+
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(
+                 session_manager,
+                 "send_prepared_turn",
+                 new_callable=AsyncMock,
+                 side_effect=BridgeTimeoutError(
+                     "Gemini timeout", stage="ocr"
+                 ),
+             ), \
+             patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
+             patch("main.activity.write") as activity_write:
+            response = await chat_completions(request)
+
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(activity_write.call_args.kwargs["stage"], "ocr")
+        self.assertEqual(
+            activity_write.call_args.kwargs["outcome"], "error:gemini_timeout"
+        )
+        self.assertNotIn(
+            "PRIVATE_REQUEST_TEXT", json.dumps(activity_write.call_args.kwargs)
+        )
 
     async def test_stream_exposes_producer_exception_as_sse_error(self):
         from main import chat_completions, session_manager

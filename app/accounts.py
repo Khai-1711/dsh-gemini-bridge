@@ -64,15 +64,30 @@ def load_state(path) -> Dict[str, dict]:
 
 def save_state(path, state: Dict[str, dict]) -> None:
     """Ghi atomic (ghi file tạm rồi thay thế). Lỗi ghi bị nuốt."""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
     try:
-        p = Path(path)
-        tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(
             json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        os.replace(tmp, p)
+        for attempt in range(3):
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                if attempt < 2:
+                    import time
+                    time.sleep(0.02)
+                else:
+                    raise
     except Exception:
         pass
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
 
 
 def mark_exhausted(

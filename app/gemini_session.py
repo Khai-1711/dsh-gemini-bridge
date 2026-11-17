@@ -73,6 +73,7 @@ from app.vision import cleanup_temp_images, extract_text_from_image_local
 _response_cache: Dict[str, Tuple[float, str]] = {}
 CACHE_TTL = 300  # 5 phút
 MAX_CACHE_SIZE = 50
+VISION_STREAM_BUFFER_MAX_BYTES = 1024 * 1024
 
 
 def _cache_key(prompt: str, model: str = "") -> str:
@@ -108,6 +109,36 @@ async def _iterate_stream_until(stream, deadline: float):
         except StopAsyncIteration:
             return
         yield item
+
+
+def _cleanup_after_ocr_worker(task: asyncio.Task, image_files: List[str]) -> None:
+    cleanup_temp_images(image_files)
+    if not task.cancelled():
+        error = task.exception()
+        if error is not None:
+            logger.warning(
+                "Local OCR worker failed after request ended (%s).",
+                type(error).__name__,
+            )
+
+
+async def _extract_text_with_deadline(
+    image_path: str, image_files: List[str], deadline: Optional[float]
+) -> str:
+    task = asyncio.create_task(
+        asyncio.to_thread(extract_text_from_image_local, image_path)
+    )
+    try:
+        if deadline is None:
+            return await asyncio.shield(task)
+        return await asyncio.wait_for(
+            asyncio.shield(task), timeout=_remaining_timeout(deadline)
+        )
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        task.add_done_callback(
+            lambda completed: _cleanup_after_ocr_worker(completed, image_files)
+        )
+        raise
 
 
 def get_cached_response(prompt: str, model: str = "") -> Optional[str]:
@@ -155,7 +186,12 @@ def load_saved_session() -> Optional[dict]:
     return None
 
 
-def save_session_state(metadata: list, model: str, account_key: str = "") -> None:
+def save_session_state(
+    metadata: list,
+    model: str,
+    account_key: str = "",
+    tool_header_hash: str = "",
+) -> None:
     """Lưu metadata phiên chat để resume sau khi restart."""
     try:
         SESSION_STATE_FILE.write_text(
@@ -164,6 +200,7 @@ def save_session_state(metadata: list, model: str, account_key: str = "") -> Non
                     "metadata": [m for m in metadata],
                     "model": model,
                     "account_key": account_key,
+                    "tool_header_hash": tool_header_hash,
                     "saved_at": time.time(),
                 },
                 ensure_ascii=False,
@@ -181,6 +218,12 @@ def clear_saved_session() -> None:
             SESSION_STATE_FILE.unlink()
     except Exception:
         pass
+
+
+def _tool_header_fingerprint(header: str) -> str:
+    if not header:
+        return ""
+    return hashlib.sha256(header.encode("utf-8")).hexdigest()
 
 
 # =====================================================================
@@ -230,6 +273,7 @@ class SingleChatManager:
         self.model_details: List[Dict[str, Any]] = []
         self.default_model: str = "unspecified"
         self.tool_header_sent = False
+        self.chat_tool_header_hash = ""
         self.chat_session = None
         self.session_initialized = False
         self.last_request_ts = 0.0
@@ -433,13 +477,28 @@ class SingleChatManager:
         self.transcript = lines[-60:]
 
     def remember_tool_header(self, header: str) -> None:
-        if header:
-            self.last_tool_header = header
+        header = header or ""
+        header_hash = _tool_header_fingerprint(header)
+        if header_hash != self.chat_tool_header_hash:
+            self.tool_header_sent = False
+        elif header_hash:
+            self.tool_header_sent = True
+        self.last_tool_header = header
 
-    def _ensure_header_in_prompt(self, prompt: str) -> str:
+    def _mark_tool_header_sent(self, include_tool_header: bool) -> None:
+        if include_tool_header:
+            self.tool_header_sent = True
+            self.chat_tool_header_hash = _tool_header_fingerprint(
+                self.last_tool_header
+            )
+
+    def _ensure_header_in_prompt(
+        self, prompt: str, include_tool_header: bool = True
+    ) -> str:
         """Chat hiện tại chưa nhận tool header mà prompt chưa có -> nối vào cuối."""
         if (
-            self.needs_tool_header
+            include_tool_header
+            and self.needs_tool_header
             and self.last_tool_header
             and self.HEADER_MARKER not in prompt
         ):
@@ -666,6 +725,7 @@ class SingleChatManager:
             self.session_initialized = False
             self.turn_count = 0
             self.tool_header_sent = False
+            self.chat_tool_header_hash = ""
 
     def _resume_saved_session(self, saved: dict) -> bool:
         """Khôi phục phiên chat cũ từ metadata đã lưu."""
@@ -679,11 +739,12 @@ class SingleChatManager:
             # Tài khoản có thể đã đổi danh sách model -> xác thực lại
             self._ensure_default_model()
             self._create_new_chat_session(preserve_metadata=list(meta))
-            # Phiên cũ đã có context hội thoại, nhưng KHÔNG chắc còn danh sách tool
-            # trong ngữ cảnh -> phải gửi lại header ở lượt kế tiếp, nếu không model
-            # Gemini sẽ không gọi được Read/Glob/Grep/Pwsh.
+            saved_header_hash = saved.get("tool_header_hash")
+            self.chat_tool_header_hash = (
+                saved_header_hash if isinstance(saved_header_hash, str) else ""
+            )
             self.session_initialized = True
-            self.tool_header_sent = False
+            self.tool_header_sent = bool(self.chat_tool_header_hash)
             self.turn_count = 0
             logger.info(f"Đã khôi phục phiên chat cũ (cid={meta[0]}).")
             return True
@@ -700,7 +761,14 @@ class SingleChatManager:
         except Exception:
             return
         if meta and meta[0]:
-            save_session_state(meta, self.default_model, self.account_key)
+            save_session_state(
+                meta,
+                self.default_model,
+                self.account_key,
+                tool_header_hash=(
+                    self.chat_tool_header_hash if self.tool_header_sent else ""
+                ),
+            )
 
     async def switch_model(self, new_model: str, keep_chat: bool = True) -> str:
         """Đổi model Gemini đang sử dụng."""
@@ -718,6 +786,15 @@ class SingleChatManager:
                             f"Model '{target}' không có trong tài khoản. "
                             f"Model khả dụng: {', '.join(self.available_models)}"
                         )
+            if (
+                target == str(self.default_model or "").strip()
+                and keep_chat
+                and self.chat_session is not None
+            ):
+                logger.info(
+                    f"[MODEL] [{target}] đã hoạt động; giữ nguyên ChatSession."
+                )
+                return self.default_model
             self.default_model = target
             saved_meta = (
                 list(self.chat_session.metadata)
@@ -726,6 +803,7 @@ class SingleChatManager:
             )
             self._create_new_chat_session(preserve_metadata=saved_meta)
             self.tool_header_sent = False
+            self.chat_tool_header_hash = ""
             self._save_session()
             logger.info(f"==> CHUYỂN MODEL: [{old_model}] --> [{self.default_model}]")
             return self.default_model
@@ -1223,14 +1301,19 @@ class SingleChatManager:
         }
 
     async def send_prepared_turn(
-        self, prompt_to_send: str, image_files: List[str]
+        self,
+        prompt_to_send: str,
+        image_files: List[str],
+        include_tool_header: bool = True,
     ) -> str:
         """Gửi 1 lượt hội thoại vào Gemini Web với đầy đủ cơ chế bảo vệ."""
         self.require_on()
         self._inflight += 1
         self._idle_event.clear()
         try:
-            return await self._send_prepared_turn_inner(prompt_to_send, image_files)
+            return await self._send_prepared_turn_inner(
+                prompt_to_send, image_files, include_tool_header
+            )
         finally:
             self._inflight -= 1
             if self._inflight <= 0:
@@ -1238,9 +1321,13 @@ class SingleChatManager:
                 self._idle_event.set()
 
     async def _send_prepared_turn_inner(
-        self, prompt_to_send: str, image_files: List[str]
+        self,
+        prompt_to_send: str,
+        image_files: List[str],
+        include_tool_header: bool = True,
     ) -> str:
         self.total_requests += 1
+        stage = "lock"
         image_deadline = (
             _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
         )
@@ -1264,11 +1351,15 @@ class SingleChatManager:
             self.total_errors += 1
             if image_deadline is not None and image_deadline <= asyncio.get_running_loop().time():
                 raise BridgeTimeoutError(
-                    f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline."
+                    f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
+                    stage=stage,
                 )
-            raise BridgeBusyError("Bridge đang bận, thử lại sau vài giây.")
+            raise BridgeBusyError(
+                "Bridge đang bận, thử lại sau vài giây.", stage=stage
+            )
 
         try:
+            stage = "throttle"
             # Giãn cách an toàn
             elapsed = time.time() - self.last_request_ts
             if elapsed < MIN_REQUEST_INTERVAL:
@@ -1291,11 +1382,13 @@ class SingleChatManager:
             # ─────────────────────────────────────────────────────
             if image_files and self.vision_upload_available and not self.is_guest:
                 try:
+                    stage = "vision_upload"
                     logger.info(
                         f"[Vision Layer 1] Upload {len(image_files)} ảnh lên Gemini..."
                     )
                     prompt_with_header = self._ensure_header_in_prompt(
-                        self._apply_pending_handoff(base_prompt)
+                        self._apply_pending_handoff(base_prompt),
+                        include_tool_header,
                     )
                     coro = self.chat_session.send_message(
                         prompt_with_header, files=image_files
@@ -1315,7 +1408,7 @@ class SingleChatManager:
                     reply = (response.text or "").strip()
                     del response
                     self.session_initialized = True
-                    self.tool_header_sent = True
+                    self._mark_tool_header_sent(include_tool_header)
                     self.turn_count += 1
                     self._consecutive_auth_errors = 0
                     self._consecutive_transient_errors = 0
@@ -1329,7 +1422,10 @@ class SingleChatManager:
                     ):
                         raise asyncio.TimeoutError from img_exc
                     if (self._is_auth_error(img_exc) or not self._evaluate_auth()) and not (self.allow_guest and self.is_guest):
-                        raise BridgeAuthError("Gemini chưa đăng nhập (guest/cookie hết hạn).")
+                        raise BridgeAuthError(
+                            "Gemini chưa đăng nhập (guest/cookie hết hạn).",
+                            stage=stage,
+                        )
                     logger.warning(
                         f"Upload ảnh thất bại ({img_exc}). --> Chuyển sang Local OCR!"
                     )
@@ -1339,18 +1435,15 @@ class SingleChatManager:
             # TẦNG 2: Local OCR fallback (cross-platform)
             # ─────────────────────────────────────────────────────
             if image_files:
+                stage = "ocr"
                 ocr_blocks = []
                 for idx, img_p in enumerate(image_files, 1):
                     logger.info(
                         f"[Vision Layer 2] Quét chữ từ ảnh #{idx} bằng Local OCR..."
                     )
-                    ocr_task = asyncio.to_thread(extract_text_from_image_local, img_p)
-                    if image_deadline is not None:
-                        ocr_text = await asyncio.wait_for(
-                            ocr_task, timeout=_remaining_timeout(image_deadline)
-                        )
-                    else:
-                        ocr_text = await ocr_task
+                    ocr_text = await _extract_text_with_deadline(
+                        img_p, image_files, image_deadline
+                    )
                     ocr_blocks.append(
                         f"=== [EXTRACTED TEXT FROM IMAGE #{idx}] ===\n"
                         f"{ocr_text}\n"
@@ -1369,8 +1462,10 @@ class SingleChatManager:
             attempt = 0
             quota_switches = 0
             while attempt < 2:
+                stage = "text_generation"
                 prompt_to_send = self._ensure_header_in_prompt(
-                    self._apply_pending_handoff(base_prompt)
+                    self._apply_pending_handoff(base_prompt),
+                    include_tool_header,
                 )
                 try:
                     if BRIDGE_DEBUG_FAKE_QUOTA and not self._fake_quota_done:
@@ -1395,7 +1490,7 @@ class SingleChatManager:
                     del response
 
                     self.session_initialized = True
-                    self.tool_header_sent = True
+                    self._mark_tool_header_sent(include_tool_header)
                     self.turn_count += 1
                     self._consecutive_auth_errors = 0
                     self._consecutive_transient_errors = 0
@@ -1428,7 +1523,7 @@ class SingleChatManager:
                     logger.error(f"Quá thời gian {timeout}s!")
                     self.total_errors += 1
                     raise BridgeTimeoutError(
-                        f"Gemini không phản hồi sau {timeout}s."
+                        f"Gemini không phản hồi sau {timeout}s.", stage=stage
                     )
 
                 except UsageLimitExceededError as exc:
@@ -1438,7 +1533,10 @@ class SingleChatManager:
                     ):
                         quota_switches += 1
                         continue
-                    raise BridgeQuotaError("Tất cả tài khoản đều hết quota. Hãy thử lại sau hoặc nạp thêm tài khoản.")
+                    raise BridgeQuotaError(
+                        "Tất cả tài khoản đều hết quota. Hãy thử lại sau hoặc nạp thêm tài khoản.",
+                        stage=stage,
+                    )
 
                 except Exception as exc:
                     self.total_errors += 1
@@ -1484,7 +1582,9 @@ class SingleChatManager:
                             ):
                                 raise asyncio.TimeoutError from init_exc
                             logger.error(f"Init lại client thất bại: {init_exc}")
-                            raise BridgeUpstreamError(f"Lỗi kết nối Gemini Web: {init_exc}")
+                            raise BridgeUpstreamError(
+                                f"Lỗi kết nối Gemini Web: {init_exc}", stage=stage
+                            )
                         if not self._evaluate_auth():
                             if len(self.chain) > 1 and await _await_with_deadline(
                                 self._try_failover_to_backup(), image_deadline
@@ -1492,27 +1592,37 @@ class SingleChatManager:
                                 attempt += 1
                                 continue
                             if not (self.allow_guest and self.is_guest):
-                                raise BridgeAuthError("Gemini chưa đăng nhập (guest/cookie hết hạn).")
+                                raise BridgeAuthError(
+                                    "Gemini chưa đăng nhập (guest/cookie hết hạn).",
+                                    stage=stage,
+                                )
                         self._create_new_chat_session(preserve_metadata=saved_meta)
                         attempt += 1
                     else:
-                        raise BridgeUpstreamError(f"Lỗi kết nối Gemini Web: {exc}")
+                        raise BridgeUpstreamError(
+                            f"Lỗi kết nối Gemini Web: {exc}", stage=stage
+                        )
 
-            raise BridgeUpstreamError("Không nhận được phản hồi.")
+            raise BridgeUpstreamError("Không nhận được phản hồi.", stage=stage)
         except asyncio.TimeoutError as exc:
             if image_deadline is None:
                 raise
             self.total_errors += 1
             logger.error(f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT}s deadline.")
             raise BridgeTimeoutError(
-                f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline."
+                f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
+                stage=stage,
             ) from exc
         finally:
-            self.lock.release()
+            if self.lock.locked():
+                self.lock.release()
             cleanup_temp_images(image_files)
 
     async def send_prepared_turn_stream(
-        self, prompt_to_send: str, image_files: List[str]
+        self,
+        prompt_to_send: str,
+        image_files: List[str],
+        include_tool_header: bool = True,
     ):
         """Streaming variant of send_prepared_turn.
 
@@ -1524,7 +1634,9 @@ class SingleChatManager:
         self._inflight += 1
         self._idle_event.clear()
         try:
-            async for item in self._send_prepared_turn_stream_inner(prompt_to_send, image_files):
+            async for item in self._send_prepared_turn_stream_inner(
+                prompt_to_send, image_files, include_tool_header
+            ):
                 yield item
         finally:
             self._inflight -= 1
@@ -1533,9 +1645,13 @@ class SingleChatManager:
                 self._idle_event.set()
 
     async def _send_prepared_turn_stream_inner(
-        self, prompt_to_send: str, image_files: List[str]
+        self,
+        prompt_to_send: str,
+        image_files: List[str],
+        include_tool_header: bool = True,
     ):
         self.total_requests += 1
+        stage = "lock"
         image_deadline = (
             _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
         )
@@ -1555,17 +1671,20 @@ class SingleChatManager:
                     "message": f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
                     "type": BridgeTimeoutError.err_type,
                     "code": BridgeTimeoutError.code,
+                    "stage": stage,
                 }
                 return
             yield "error", {
                 "message": "Bridge đang bận, thử lại sau vài giây.",
                 "type": BridgeBusyError.err_type,
                 "code": BridgeBusyError.code,
+                "stage": stage,
             }
             return
 
         full_text = ""
         try:
+            stage = "throttle"
             elapsed = time.time() - self.last_request_ts
             if elapsed < MIN_REQUEST_INTERVAL:
                 delay = MIN_REQUEST_INTERVAL - elapsed
@@ -1585,11 +1704,15 @@ class SingleChatManager:
             # Tầng 1: stream kèm ảnh trực tiếp (nếu có)
             if image_files and self.vision_upload_available and not self.is_guest:
                 try:
+                    stage = "vision_upload"
+                    vision_chunks: List[str] = []
+                    vision_buffer_bytes = 0
                     logger.info(
                         f"[Vision Layer 1] Stream {len(image_files)} ảnh lên Gemini..."
                     )
                     prompt_with_header = self._ensure_header_in_prompt(
-                        self._apply_pending_handoff(base_prompt)
+                        self._apply_pending_handoff(base_prompt),
+                        include_tool_header,
                     )
                     vision_deadline = min(
                         image_deadline,
@@ -1604,16 +1727,27 @@ class SingleChatManager:
                     ):
                         delta = output.text_delta or ""
                         if delta:
-                            full_text += delta
-                            yield "delta", delta
+                            delta_bytes = len(delta.encode("utf-8"))
+                            if (
+                                vision_buffer_bytes + delta_bytes
+                                > VISION_STREAM_BUFFER_MAX_BYTES
+                            ):
+                                raise ValueError(
+                                    "Vision stream response exceeded the buffer limit."
+                                )
+                            vision_chunks.append(delta)
+                            vision_buffer_bytes += delta_bytes
+                    full_text = "".join(vision_chunks)
                     self.last_request_ts = time.time()
                     self.session_initialized = True
-                    self.tool_header_sent = True
+                    self._mark_tool_header_sent(include_tool_header)
                     self.turn_count += 1
                     self._consecutive_auth_errors = 0
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
                     self._save_session()
+                    for delta in vision_chunks:
+                        yield "delta", delta
                     yield "done", full_text.strip()
                     return
                 except asyncio.TimeoutError:
@@ -1631,6 +1765,7 @@ class SingleChatManager:
                             "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
                             "type": BridgeAuthError.err_type,
                             "code": BridgeAuthError.code,
+                            "stage": stage,
                         }
                         return
                     logger.warning(
@@ -1641,14 +1776,14 @@ class SingleChatManager:
 
             # Tầng 2: OCR fallback
             if image_files:
+                stage = "ocr"
                 ocr_blocks = []
                 for idx, img_p in enumerate(image_files, 1):
                     logger.info(
                         f"[Vision Layer 2] Quét chữ từ ảnh #{idx} bằng Local OCR..."
                     )
-                    ocr_text = await asyncio.wait_for(
-                        asyncio.to_thread(extract_text_from_image_local, img_p),
-                        timeout=_remaining_timeout(image_deadline),
+                    ocr_text = await _extract_text_with_deadline(
+                        img_p, image_files, image_deadline
                     )
                     ocr_blocks.append(
                         f"=== [EXTRACTED TEXT FROM IMAGE #{idx}] ===\n"
@@ -1667,8 +1802,10 @@ class SingleChatManager:
             quota_switches = 0
             yielded_any = False
             while attempt < 2:
+                stage = "text_generation"
                 prompt_to_send = self._ensure_header_in_prompt(
-                    self._apply_pending_handoff(base_prompt)
+                    self._apply_pending_handoff(base_prompt),
+                    include_tool_header,
                 )
                 try:
                     if BRIDGE_DEBUG_FAKE_QUOTA and not self._fake_quota_done:
@@ -1696,7 +1833,7 @@ class SingleChatManager:
                     self.last_request_ts = time.time()
                     reply = full_text.strip()
                     self.session_initialized = True
-                    self.tool_header_sent = True
+                    self._mark_tool_header_sent(include_tool_header)
                     self.turn_count += 1
                     self._consecutive_auth_errors = 0
                     self._consecutive_transient_errors = 0
@@ -1728,6 +1865,7 @@ class SingleChatManager:
                         "message": f"Gemini không phản hồi sau {timeout}s.",
                         "type": BridgeTimeoutError.err_type,
                         "code": BridgeTimeoutError.code,
+                        "stage": stage,
                     }
                     return
 
@@ -1737,6 +1875,7 @@ class SingleChatManager:
                             "message": f"Hết quota khi đang stream: {exc}",
                             "type": BridgeQuotaError.err_type,
                             "code": BridgeQuotaError.code,
+                            "stage": stage,
                         }
                         return
                     if quota_switches < len(self.chain):
@@ -1759,6 +1898,7 @@ class SingleChatManager:
                         "message": "Tất cả tài khoản đều hết quota. Hãy thử lại sau hoặc nạp thêm tài khoản.",
                         "type": BridgeQuotaError.err_type,
                         "code": BridgeQuotaError.code,
+                        "stage": stage,
                     }
                     return
 
@@ -1768,6 +1908,26 @@ class SingleChatManager:
                         self._consecutive_auth_errors += 1
                     else:
                         self._consecutive_transient_errors += 1
+                    if yielded_any:
+                        logger.warning(
+                            "Stream failed after response began (%s).",
+                            type(exc).__name__,
+                        )
+                        if self._is_auth_error(exc):
+                            yield "error", {
+                                "message": "Gemini authentication failed after streaming began.",
+                                "type": BridgeAuthError.err_type,
+                                "code": BridgeAuthError.code,
+                                "stage": stage,
+                            }
+                        else:
+                            yield "error", {
+                                "message": "Gemini stream failed after response began.",
+                                "type": BridgeUpstreamError.err_type,
+                                "code": BridgeUpstreamError.code,
+                                "stage": stage,
+                            }
+                        return
                     logger.warning(
                         f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {exc}"
                     )
@@ -1809,6 +1969,7 @@ class SingleChatManager:
                                 "message": f"Lỗi kết nối Gemini Web: {init_exc}",
                                 "type": BridgeUpstreamError.err_type,
                                 "code": BridgeUpstreamError.code,
+                                "stage": stage,
                             }
                             return
                         if not self._evaluate_auth():
@@ -1822,6 +1983,7 @@ class SingleChatManager:
                                     "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
                                     "type": BridgeAuthError.err_type,
                                     "code": BridgeAuthError.code,
+                                    "stage": stage,
                                 }
                                 return
                         self._create_new_chat_session(preserve_metadata=saved_meta)
@@ -1832,6 +1994,7 @@ class SingleChatManager:
                             "message": f"Lỗi kết nối Gemini Web: {exc}",
                             "type": BridgeUpstreamError.err_type,
                             "code": BridgeUpstreamError.code,
+                            "stage": stage,
                         }
                         return
 
@@ -1839,6 +2002,7 @@ class SingleChatManager:
                 "message": "Không nhận được phản hồi từ Gemini.",
                 "type": BridgeUpstreamError.err_type,
                 "code": BridgeUpstreamError.code,
+                "stage": stage,
             }
         except asyncio.TimeoutError:
             if image_deadline is None:
@@ -1848,9 +2012,11 @@ class SingleChatManager:
                 "message": f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
                 "type": BridgeTimeoutError.err_type,
                 "code": BridgeTimeoutError.code,
+                "stage": stage,
             }
         finally:
-            self.lock.release()
+            if self.lock.locked():
+                self.lock.release()
             cleanup_temp_images(image_files)
 
 

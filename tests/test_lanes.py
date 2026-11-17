@@ -418,6 +418,22 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(code, 200)
             self.assertEqual(res["active_model"], "gemini-flash")
 
+            # Case 5: Model alias 1, 2 (int/str), acc1/acc2 và keyword matching
+            mock_sw.return_value = "gemini-pro"
+            code, res = await _local_switch_model(1)
+            self.assertEqual(code, 200)
+
+            code, res = await _local_switch_model("2")
+            self.assertEqual(code, 200)
+
+            code, res = await _local_switch_model("acc1")
+            self.assertEqual(code, 200)
+
+            mock_sw.return_value = "gemini-flash"
+            code, res = await _local_switch_model("gemini-2.0-flash")
+            self.assertEqual(code, 200)
+            self.assertEqual(res["active_model"], "gemini-flash")
+
     async def test_lane_models_format(self):
         from main import _local_lane_models, session_manager
 

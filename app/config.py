@@ -128,6 +128,29 @@ MAX_IMAGES_PER_TURN = int(os.getenv("MAX_IMAGES_PER_TURN", "4"))
 # Timeout chờ Lock (giây) — trả lỗi nếu chờ quá lâu
 LOCK_ACQUIRE_TIMEOUT = float(os.getenv("LOCK_ACQUIRE_TIMEOUT", "30"))
 
+# Local tool-call repair chỉ đánh giá shadow; kết quả không được gửi cho DSH.
+TOOL_REPAIR_ENABLED = os.getenv("TOOL_REPAIR_ENABLED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+TOOL_REPAIR_ENDPOINT = os.getenv(
+    "TOOL_REPAIR_ENDPOINT",
+    "http://127.0.0.1:8000/v1/chat/completions",
+).strip()
+TOOL_REPAIR_TRUSTED_IPS = tuple(
+    ip.strip()
+    for ip in os.getenv("TOOL_REPAIR_TRUSTED_IPS", "").split(",")
+    if ip.strip()
+)
+TOOL_REPAIR_MODEL = os.getenv("TOOL_REPAIR_MODEL", "").strip()
+TOOL_REPAIR_TIMEOUT_SECONDS = float(os.getenv("TOOL_REPAIR_TIMEOUT_SECONDS", "2"))
+if (
+    not math.isfinite(TOOL_REPAIR_TIMEOUT_SECONDS)
+    or not 0 < TOOL_REPAIR_TIMEOUT_SECONDS <= 10
+):
+    raise ValueError("TOOL_REPAIR_TIMEOUT_SECONDS must be greater than 0 and at most 10.")
+
 # Bật bộ nhớ đệm câu trả lời (mặc định tắt; chỉ bật khi hỏi đáp tĩnh, không dùng cho code agent)
 ENABLE_RESPONSE_CACHE = os.getenv("ENABLE_RESPONSE_CACHE", "false").strip().lower() in (
     "1",

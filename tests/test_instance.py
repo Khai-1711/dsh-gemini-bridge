@@ -95,6 +95,52 @@ class TestInstanceIsolation(unittest.TestCase):
         finally:
             logging.disable(prev_disable)
 
+    def test_activity_journal_filters_sensitive_fields_on_write_and_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "activity.jsonl"
+            journal = ActivityJournal(path, "acc1")
+            try:
+                entry = journal.write(
+                    model="gemini-test",
+                    stage="ocr",
+                    outcome="error:gemini_timeout",
+                    prompt="PRIVATE_PROMPT",
+                    task_hint="PRIVATE_HINT",
+                    token="PRIVATE_TOKEN",
+                    tools=[{"name": "Read", "hint": "PRIVATE_PATH"}],
+                )
+                self.assertEqual(entry["stage"], "ocr")
+                self.assertEqual(entry["outcome"], "error:gemini_timeout")
+                self.assertNotIn("prompt", entry)
+                self.assertNotIn("task_hint", entry)
+                journal._handler.flush()
+                logged = path.read_text(encoding="utf-8")
+                for secret in (
+                    "PRIVATE_PROMPT",
+                    "PRIVATE_HINT",
+                    "PRIVATE_TOKEN",
+                    "PRIVATE_PATH",
+                ):
+                    self.assertNotIn(secret, logged)
+
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "ts": "old",
+                                "instance": "acc1",
+                                "task_hint": "LEGACY_PRIVATE_HINT",
+                                "tools": [{"name": "Read", "hint": "LEGACY_PATH"}],
+                            }
+                        )
+                        + "\n"
+                    )
+                tail = journal.tail()
+                self.assertNotIn("task_hint", tail[-1])
+                self.assertNotIn("hint", tail[-1]["tools"][0])
+            finally:
+                journal.close()
+
     def test_summarize_tool_calls_no_content(self):
         calls = [
             {
@@ -120,10 +166,11 @@ class TestInstanceIsolation(unittest.TestCase):
         summary = summarize_tool_calls(calls)
         self.assertEqual(len(summary), 2)
         self.assertEqual(summary[0]["name"], "Write")
-        self.assertEqual(summary[0]["hint"], "D:\\project\\main.py")
+        self.assertNotIn("hint", summary[0])
         self.assertNotIn("SECRET_SUPER_LONG_CONTENT_", json.dumps(summary))
+        self.assertNotIn("D:\\project\\main.py", json.dumps(summary))
         self.assertEqual(summary[1]["name"], "Pwsh")
-        self.assertEqual(summary[1]["hint"], "dir /b D:\\project")
+        self.assertNotIn("dir /b D:\\project", json.dumps(summary))
 
     def test_current_chat_key(self):
         m = gs.SingleChatManager()

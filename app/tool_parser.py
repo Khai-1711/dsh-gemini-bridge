@@ -1,66 +1,95 @@
 import json
-import os
 import uuid
-from typing import Any, Dict, List, Tuple
-from app.config import DEFAULT_PROJECT_DIR, FORBIDDEN_TOOLS, logger
-from app.security import is_safe_path_no_c_drive, sanitize_shell_command_no_c_drive
+from typing import Any, Dict, List, Optional, Tuple
+from app.config import FORBIDDEN_TOOLS, logger
+from app.security import (
+    is_path_within_project,
+    is_safe_path_no_c_drive,
+    sanitize_shell_command_no_c_drive,
+)
+
+
+class InvalidToolArguments(ValueError):
+    """Raised when a tool request violates its declared schema or path policy."""
+
+
+def _is_schema_type(value: Any, schema_type: str) -> bool:
+    if schema_type == "string":
+        return isinstance(value, str)
+    if schema_type == "boolean":
+        return isinstance(value, bool)
+    if schema_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if schema_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if schema_type == "array":
+        return isinstance(value, list)
+    if schema_type == "object":
+        return isinstance(value, dict)
+    return True
 
 
 def normalize_tool_arguments(
     fn_name: str, args: Dict[str, Any], tool_schema: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Auto-Mapper: Tự động ánh xạ tên biến bị lệch của Gemini về chuẩn schema,
-    đồng thời áp dụng bộ lọc bảo mật chặn ổ C:\\.
-    """
+    """Normalize declared aliases and reject arguments outside the tool schema."""
     if not isinstance(args, dict):
-        args = {}
+        raise InvalidToolArguments("Tool arguments must be a JSON object.")
+
     name_lower = fn_name.lower()
     props = (tool_schema.get("parameters") or {}).get("properties") or {}
+    normalized = dict(args)
 
-    # 1. Chuẩn hóa file_path cho Read / Write / Edit (chỉ chạy khi "path" KHÔNG nằm trong props)
-    if "path" not in props and "file_path" not in args:
-        for alias in ("path", "file", "filepath", "filename", "target_file"):
-            if alias in args:
-                args["file_path"] = args.pop(alias)
+    aliases = {
+        "file_path": ("path", "file", "filepath", "filename", "target_file"),
+        "command": ("cmd", "script", "shell", "code", "input"),
+        "pattern": ("query", "path", "glob", "search", "file_pattern"),
+    }
+    for destination, sources in aliases.items():
+        if destination not in props or destination in normalized:
+            continue
+        for source in sources:
+            if source in normalized and source not in props:
+                normalized[destination] = normalized.pop(source)
                 break
 
-    if "file_path" in args and not is_safe_path_no_c_drive(str(args["file_path"])):
-        logger.warning(f"[SECURITY] Chặn truy cập ổ C: {args['file_path']}")
-        args["file_path"] = os.path.join(DEFAULT_PROJECT_DIR, "BLOCKED_C_DRIVE_ACCESS.txt")
+    params = tool_schema.get("parameters") or {}
+    if params.get("additionalProperties") is False:
+        extras = set(normalized) - set(props)
+        if extras:
+            raise InvalidToolArguments("Tool arguments contain undeclared keys.")
 
-    # 2. Chuẩn hóa pattern cho Glob / Grep
-    if "glob" in name_lower and "pattern" not in args:
-        for alias in ("query", "path", "glob", "search", "file_pattern"):
-            if alias in args:
-                args["pattern"] = args.pop(alias)
-                break
-        if "pattern" not in args:
-            args["pattern"] = "*"
+    for key in params.get("required", []):
+        if key not in normalized or normalized[key] is None:
+            raise InvalidToolArguments("Tool arguments are missing required keys.")
 
-    # 3. Chuẩn hóa command & description cho Pwsh / Shell
+    for key, value in normalized.items():
+        property_schema = props.get(key)
+        if not isinstance(property_schema, dict):
+            continue
+        schema_type = property_schema.get("type")
+        if isinstance(schema_type, str) and not _is_schema_type(value, schema_type):
+            raise InvalidToolArguments("Tool argument type does not match its schema.")
+        if "enum" in property_schema and value not in property_schema["enum"]:
+            raise InvalidToolArguments("Tool argument is not an allowed enum value.")
+
+        if key in ("file_path", "path"):
+            if not isinstance(value, str):
+                raise InvalidToolArguments("File path must be a string.")
+            if not is_safe_path_no_c_drive(value) or not is_path_within_project(value):
+                raise InvalidToolArguments("File path is outside the project directory.")
+
     if name_lower in ("pwsh", "bash", "shell", "execute_command", "run_command"):
-        if "command" not in args:
-            for alias in ("cmd", "script", "shell", "code", "input"):
-                if alias in args:
-                    args["command"] = args.pop(alias)
-                    break
-        if "command" in args:
-            raw_cmd = str(args["command"])
-            args["command"] = sanitize_shell_command_no_c_drive(raw_cmd)
-            if "description" not in args or not args["description"]:
-                args["description"] = f"Run in project: {args['command'][:50]}"
+        command = normalized.get("command")
+        if command is not None:
+            if not isinstance(command, str) or not command.strip():
+                raise InvalidToolArguments("Command must be a non-empty string.")
+            sanitized = sanitize_shell_command_no_c_drive(command)
+            if sanitized != command:
+                raise InvalidToolArguments("Command was rejected by the safety policy.")
+            normalized["command"] = sanitized
 
-    # 4. Đảm bảo điền đủ các trường required còn thiếu (bỏ tự bịa command="dir")
-    params = tool_schema.get("parameters", {})
-    for req_key in params.get("required", []):
-        if req_key not in args or args[req_key] is None:
-            if req_key == "description":
-                args[req_key] = f"Execute {fn_name}"
-            elif req_key == "pattern":
-                args[req_key] = "*"
-
-    return args
+    return normalized
 
 
 def _extract_tag_contents(text: str, open_tag: str, close_tag: str) -> List[str]:
@@ -85,6 +114,9 @@ def _loads_tool_json(raw_json: str) -> Any:
         return json.loads(raw_json, strict=False)
     except json.JSONDecodeError as exc:
         if "Invalid \\escape" not in exc.msg:
+            repaired = _remove_trailing_commas(raw_json)
+            if repaired != raw_json:
+                return json.loads(repaired, strict=False)
             raise
 
     repaired = []
@@ -125,7 +157,110 @@ def _loads_tool_json(raw_json: str) -> Any:
         repaired.append(char)
         i += 1
 
-    return json.loads("".join(repaired), strict=False)
+    repaired_json = "".join(repaired)
+    try:
+        return json.loads(repaired_json, strict=False)
+    except json.JSONDecodeError:
+        repaired_json = _remove_trailing_commas(repaired_json)
+        return json.loads(repaired_json, strict=False)
+
+
+def _remove_trailing_commas(raw_json: str) -> str:
+    """Remove commas immediately before a closing JSON delimiter, outside strings."""
+    out: List[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(raw_json):
+        char = raw_json[index]
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+            out.append(char)
+        elif char == ",":
+            lookahead = index + 1
+            while lookahead < len(raw_json) and raw_json[lookahead].isspace():
+                lookahead += 1
+            if lookahead >= len(raw_json) or raw_json[lookahead] not in "}]":
+                out.append(char)
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def has_tool_call_intent(reply_text: str) -> bool:
+    """Identify explicit tool-call markup, including a labeled tool_call fence."""
+    if not reply_text:
+        return False
+    if "<tool_call>" in reply_text:
+        return True
+    for block in _extract_tag_contents(reply_text, "```", "```"):
+        lines = block.lstrip().splitlines()
+        if lines and lines[0].strip().lower() == "tool_call":
+            return True
+        if (
+            lines
+            and lines[0].strip().lower() == "json"
+            and '"name"' in block
+            and ('"arguments"' in block or '"parameters"' in block)
+        ):
+            return True
+    return False
+
+
+def extract_malformed_tool_call_candidate(
+    reply_text: str, max_chars: int = 4000
+) -> Optional[str]:
+    """Return one explicitly marked, syntactically invalid tool-call candidate."""
+    if not reply_text or len(reply_text) > 100_000:
+        return None
+
+    tagged = _extract_tag_contents(reply_text, "<tool_call>", "</tool_call>")
+    if tagged:
+        if len(tagged) != 1:
+            return None
+        candidate = tagged[0]
+    else:
+        if len(reply_text) >= 4000:
+            return None
+        candidates = []
+        for block in _extract_tag_contents(reply_text, "```", "```"):
+            clean_block = block.strip()
+            first_line, separator, remainder = clean_block.partition("\n")
+            label = first_line.strip().lower()
+            candidate_text = remainder.strip() if separator else ""
+            if label == "tool_call" or (
+                label == "json"
+                and '"name"' in candidate_text
+                and (
+                    '"arguments"' in candidate_text
+                    or '"parameters"' in candidate_text
+                )
+            ):
+                candidates.append(candidate_text)
+        if len(candidates) != 1:
+            return None
+        candidate = candidates[0]
+
+    candidate = candidate.strip()
+    if not candidate or len(candidate) > max_chars or '"name"' not in candidate:
+        return None
+    try:
+        _loads_tool_json(candidate)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return candidate
+    return None
 
 
 def parse_tool_calls_from_reply(
@@ -140,6 +275,7 @@ def parse_tool_calls_from_reply(
 
     extracted_calls: List[Dict[str, Any]] = []
     candidates: List[Tuple[str, bool]] = []
+    rejected_candidate = False
 
     # 1. Quét thẻ <tool_call>...</tool_call> bằng find() O(N) -> is_tagged=True
     for tag_content in _extract_tag_contents(reply_text, "<tool_call>", "</tool_call>"):
@@ -149,9 +285,9 @@ def parse_tool_calls_from_reply(
     if not candidates and len(reply_text) < 4000:
         for block in _extract_tag_contents(reply_text, "```", "```"):
             clean_block = block.strip()
-            for prefix in ("json", "tool_call"):
-                if clean_block.lower().startswith(prefix):
-                    clean_block = clean_block[len(prefix):].strip()
+            first_line, separator, remainder = clean_block.partition("\n")
+            if first_line.strip().lower() in ("json", "tool_call"):
+                clean_block = remainder.strip() if separator else ""
             if clean_block.startswith("{") and clean_block.endswith("}"):
                 candidates.append((clean_block, False))
 
@@ -163,62 +299,49 @@ def parse_tool_calls_from_reply(
     for raw_json, is_tagged in candidates:
         try:
             data = _loads_tool_json(raw_json)
-            if isinstance(data, dict) and "name" in data:
-                fn_name = str(data["name"]).strip()
-                for prefix in ("functions.", "tools."):
-                    if fn_name.startswith(prefix):
-                        fn_name = fn_name[len(prefix):]
-                if fn_name.lower() in FORBIDDEN_TOOLS:
-                    continue
+            if not isinstance(data, dict) or "name" not in data:
+                rejected_candidate = rejected_candidate or is_tagged
+                continue
+            fn_name = str(data["name"]).strip()
+            for prefix in ("functions.", "tools."):
+                if fn_name.startswith(prefix):
+                    fn_name = fn_name[len(prefix):]
 
-                # Quy tắc chấp nhận:
-                # - tagged: nhận nếu tools_map rỗng HOẶC fn_name trong tools_map
-                # - fallback: CHỈ nhận khi tools_map KHÔNG rỗng VÀ fn_name trong tools_map
-                if is_tagged:
-                    accept = (not tools_map) or (fn_name in tools_map)
-                else:
-                    accept = bool(tools_map) and (fn_name in tools_map)
+            if (
+                fn_name.lower() in FORBIDDEN_TOOLS
+                or not tools_map
+                or fn_name not in tools_map
+            ):
+                rejected_candidate = True
+                continue
 
-                if accept:
-                    if "arguments" in data:
-                        raw_args = data["arguments"]
-                    elif "parameters" in data:
-                        raw_args = data["parameters"]
-                    else:
-                        raw_args = {
-                            key: value
-                            for key, value in data.items()
-                            if key not in {"name", "type", "id"}
-                        }
-                    if isinstance(raw_args, str):
-                        try:
-                            raw_args = _loads_tool_json(raw_args)
-                        except Exception as arg_exc:
-                            logger.warning(
-                                f"[PARSER] Không parse được raw_args JSON: {arg_exc} | đầu: {raw_args[:200]!r}"
-                            )
-                            raw_args = {"command": raw_args}
+            if "arguments" in data:
+                raw_args = data["arguments"]
+            elif "parameters" in data:
+                raw_args = data["parameters"]
+            else:
+                raw_args = {
+                    key: value
+                    for key, value in data.items()
+                    if key not in {"name", "type", "id"}
+                }
+            if isinstance(raw_args, str):
+                raw_args = _loads_tool_json(raw_args)
 
-                    schema = tools_map.get(fn_name, {}) if tools_map else {}
-                    clean_args = normalize_tool_arguments(fn_name, raw_args, schema)
+            schema = tools_map[fn_name]
+            clean_args = normalize_tool_arguments(fn_name, raw_args, schema)
+            extracted_calls.append(
+                {
+                    "id": f"call_{uuid.uuid4().hex[:16]}",
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": json.dumps(clean_args, ensure_ascii=False),
+                    },
+                }
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            rejected_candidate = True
+            logger.warning("[PARSER] Rejected malformed or schema-invalid tool call.")
 
-                    # Bỏ tool call nếu thiếu tham số bắt buộc 'command' (không tự bịa 'dir')
-                    req_params = (schema.get("parameters") or {}).get("required", [])
-                    if "command" in req_params and not str(clean_args.get("command", "")).strip():
-                        logger.warning(f"[PARSER] Bỏ tool call '{fn_name}': thiếu tham số bắt buộc 'command'.")
-                        continue
-
-                    extracted_calls.append(
-                        {
-                            "id": f"call_{uuid.uuid4().hex[:16]}",
-                            "type": "function",
-                            "function": {
-                                "name": fn_name,
-                                "arguments": json.dumps(clean_args, ensure_ascii=False),
-                            },
-                        }
-                    )
-        except Exception as exc:
-            logger.warning(f"[PARSER] Không parse được tool_call JSON: {exc} | đầu: {raw_json[:200]!r}")
-
-    return extracted_calls
+    return [] if rejected_candidate else extracted_calls
