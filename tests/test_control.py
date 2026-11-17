@@ -575,6 +575,7 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         with patch.object(session_manager, "require_on"), \
              patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
              patch.object(session_manager, "send_prepared_turn_stream", new=malformed_stream), \
+             patch("main.repair_tool_call_active", new_callable=AsyncMock, return_value=None), \
              patch("main.schedule_tool_repair_shadow") as shadow_repair, \
              patch("main.activity.write"):
             response = await chat_completions(request)
@@ -625,6 +626,7 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
                  ),
              ), \
              patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
+             patch("main.repair_tool_call_active", new_callable=AsyncMock, return_value=None), \
              patch("main.schedule_tool_repair_shadow", return_value=True) as shadow_repair, \
              patch("main.activity.write"):
             response = await chat_completions(request)

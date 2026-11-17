@@ -1,7 +1,21 @@
+import re
 from typing import Any, Dict, List, Tuple
 from app.config import FORBIDDEN_TOOLS, MAX_TOOL_RESULT_CHARS
 from app.security import sanitize_no_media_triggers
 from app.vision import extract_text_and_images
+
+_IDE_BOILERPLATE_RE = re.compile(
+    r"<(environment_details|context|workspace_info|system_info)\b[^>]*>.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def extract_actual_user_text(content: str) -> str:
+    """Loại bỏ các khối XML bọc context tự động của IDE (Roo Code/Cline/DSH) để lấy nội dung người dùng thực tế."""
+    if not isinstance(content, str):
+        return ""
+    stripped = _IDE_BOILERPLATE_RE.sub("", content).strip()
+    return stripped if stripped else content.strip()
 
 
 def smart_truncate(text: str, max_chars: int = None) -> str:
@@ -149,8 +163,12 @@ def is_plain_greeting_request(messages: List[Dict[str, Any]]) -> bool:
     if not isinstance(content, str):
         return False
 
-    greeting = content.strip().casefold().strip(" \t\r\n.,!?¡¿。！？…")
-    return greeting in {"hi", "hello", "hey", "chào", "xin chào"}
+    actual = extract_actual_user_text(content)
+    greeting = actual.strip().casefold().strip(" \t\r\n.,!?¡¿。！？…")
+    return greeting in {
+        "hi", "hello", "hey", "chào", "xin chào", "chào bạn",
+        "hello there", "good morning", "good afternoon", "alo", "ping", "test"
+    }
 
 
 def build_incremental_prompt_and_files(
@@ -179,7 +197,15 @@ def build_incremental_prompt_and_files(
                 "ask the user in the SAME LANGUAGE. Otherwise output <tool_call>{...}</tool_call>.)"
             )
         else:
-            clean_user_text = sanitize_no_media_triggers(content_str).strip()
+            actual_text = extract_actual_user_text(content_str)
+            if is_plain_greeting_request(latest_turn_msgs):
+                clean_user_text = actual_text
+            elif actual_text and len(actual_text) < len(content_str) // 2:
+                # Nếu phần context bọc quá lớn (như environment_details), giữ actual_text
+                clean_user_text = sanitize_no_media_triggers(actual_text).strip()
+            else:
+                clean_user_text = sanitize_no_media_triggers(content_str).strip()
+
             # Câu ngắn → gửi nguyên bản
             if len(clean_user_text) < 15 and not img_paths:
                 blocks.append(clean_user_text)

@@ -61,6 +61,16 @@ class TestPromptBuilder(unittest.TestCase):
                 ]
             )
         )
+        self.assertTrue(
+            is_plain_greeting_request(
+                [
+                    {
+                        "role": "user",
+                        "content": "<environment_details>\nVSCode Open Tabs: /src/app.js\nCWD: D:\\project\n</environment_details>\n\nhi",
+                    }
+                ]
+            )
+        )
         self.assertFalse(
             is_plain_greeting_request(
                 [{"role": "user", "content": "Hi, inspect this file"}]

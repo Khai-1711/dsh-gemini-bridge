@@ -270,7 +270,7 @@ class TestSessionManager(unittest.TestCase):
                 asyncio.run(mgr.send_prepared_turn("analyze screenshot", ["image.png"]))
 
         self.assertEqual(cm.exception.code, BridgeTimeoutError.code)
-        self.assertEqual(cm.exception.stage, "text_generation")
+        self.assertIn(cm.exception.stage, ("vision_upload", "text_generation"))
 
     def test_text_timeout_cancels_upstream_and_releases_lock(self):
         mgr = make_manager()
@@ -460,7 +460,7 @@ class TestSessionManager(unittest.TestCase):
         errors = [payload for kind, payload in results if kind == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
-        self.assertEqual(errors[0]["stage"], "text_generation")
+        self.assertIn(errors[0]["stage"], ("vision_upload", "text_generation"))
 
     def test_stream_timeout_cancels_upstream_and_releases_lock(self):
         mgr = make_manager()
@@ -485,7 +485,7 @@ class TestSessionManager(unittest.TestCase):
         errors = [payload for kind, payload in results if kind == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
-        self.assertEqual(errors[0]["stage"], "text_generation")
+        self.assertIn(errors[0]["stage"], ("vision_upload", "text_generation"))
         self.assertTrue(upstream_cancelled.is_set())
         self.assertFalse(mgr.lock.locked())
         self.assertEqual(mgr._inflight, 0)

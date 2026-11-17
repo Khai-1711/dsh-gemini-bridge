@@ -44,6 +44,7 @@ from app.config import (
     PEER_LANES,
     PORT,
     SSE_HEARTBEAT_INTERVAL,
+    TOOL_REPAIR_ENABLED,
     logger,
 )
 from app.control import is_origin_allowed
@@ -69,6 +70,7 @@ from app.prompt_builder import (
 from app.streaming import ToolCallAwareStreamer
 from app.tool_parser import has_tool_call_intent, parse_tool_calls_from_reply
 from app.tool_repair import (
+    repair_tool_call_active,
     schedule_tool_repair_shadow,
     validate_tool_repair_settings,
 )
@@ -328,7 +330,12 @@ async def _local_switch_model(model_name: Any, keep_chat: bool = True) -> Tuple[
 
     target = raw_str
     is_valid = False
-    if target.lower() in ("unspecified", "", "1", "2", "acc1", "acc2", "default", "auto", "none"):
+    if target.lower() in (
+        "unspecified", "", "1", "2", "gemini-1", "gemini-2", "lane-1", "lane-2",
+        "lane1", "lane2", "worker-1", "worker-2", "worker1", "worker2",
+        "acc1", "acc2", "acc-1", "acc-2", "model-1", "model-2", "default", "auto",
+        "none", "gemini"
+    ):
         is_valid = True
         target = session_manager.default_model or "unspecified"
     elif session_manager.available_models and target in session_manager.available_models:
@@ -1013,7 +1020,12 @@ async def chat_completions(request: Request):
 
     requested_model = str(body.get("model") or session_manager.default_model).strip()
     model_id = requested_model or session_manager.default_model
-    if model_id.lower() in ("1", "2", "acc1", "acc2", "default", "auto", "none", "unspecified"):
+    if model_id.lower() in (
+        "1", "2", "gemini-1", "gemini-2", "lane-1", "lane-2",
+        "lane1", "lane2", "worker-1", "worker-2", "worker1", "worker2",
+        "acc1", "acc2", "acc-1", "acc-2", "model-1", "model-2", "default", "auto",
+        "none", "unspecified", "gemini"
+    ):
         model_id = session_manager.default_model
     is_stream = body.get("stream", False)
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1327,6 +1339,11 @@ async def chat_completions(request: Request):
                 reply_text = done_text if done_text is not None else splitter.full_text
                 tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
                 if has_tool_call_intent(reply_text) and not tool_calls:
+                    if TOOL_REPAIR_ENABLED:
+                        repaired = await repair_tool_call_active(reply_text, tools_map, chat_id)
+                        if repaired:
+                            tool_calls = repaired
+                if has_tool_call_intent(reply_text) and not tool_calls:
                     schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
                     error = {
                         "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
@@ -1456,6 +1473,11 @@ async def chat_completions(request: Request):
             content={"error": {"message": e.message, "type": e.err_type, "code": e.code}},
         )
     tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
+    if has_tool_call_intent(reply_text) and not tool_calls:
+        if TOOL_REPAIR_ENABLED:
+            repaired = await repair_tool_call_active(reply_text, tools_map, chat_id)
+            if repaired:
+                tool_calls = repaired
     if has_tool_call_intent(reply_text) and not tool_calls:
         schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
         error = {

@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CyberSnake 2077 - Rắn Săn Mồi Cyberpunk</title>
+  <style>
+    :root {
+      --bg-color: #0b0f19;
+      --card-bg: rgba(18, 26, 47, 0.85);
+      --neon-cyan: #00f3ff;
+      --neon-pink: #ff007f;
+      --neon-green: #39ff14;
+      --neon-yellow: #ffe600;
+      --text-main: #e2e8f0;
+      --text-muted: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    body {
+      background-color: var(--bg-color);
+      color: var(--text-main);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      overflow-x: hidden;
+      background-image: 
+        radial-gradient(circle at 50% 20%, rgba(0, 243, 255, 0.08) 0%, transparent 60%),
+        radial-gradient(circle at 80% 80%, rgba(255, 0, 127, 0.08) 0%, transparent 60%);
+    }
+
+    .container {
+      width: 100%;
+      max-width: 520px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+    }
+
+    header {
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 18px;
+      background: var(--card-bg);
+      border: 1px solid rgba(0, 243, 255, 0.2);
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4), 0 0 15px rgba(0, 243, 255, 0.1);
+      backdrop-filter: blur(10px);
+    }
+
+    .title-box h1 {
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: 1px;
+      background: linear-gradient(135deg, var(--neon-cyan), var(--neon-pink));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+    }
+
+    .title-box p {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    .header-controls {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn-icon {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: var(--text-main);
+      padding: 8px 12px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .btn-icon:hover {
+      background: rgba(0, 243, 255, 0.15);
+      border-color: var(--neon-cyan);
+      box-shadow: 0 0 10px rgba(0, 243, 255, 0.3);
+    }
+
+    .stats-bar {
+      width: 100%;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      padding: 10px 14px;
+      text-align: center;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+    }
+
+    .stat-card.score-card {
+      border-color: rgba(57, 255, 20, 0.3);
+      box-shadow: 0 0 12px rgba(57, 255, 20, 0.15);
+    }
+
+    .stat-card.high-card {
+      border-color: rgba(255, 230, 0, 0.3);
+    }
+
+    .stat-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .stat-value {
+      font-size: 1.3rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .score-card .stat-value {
+      color: var(--neon-green);
+      text-shadow: 0 0 10px rgba(57, 255, 20, 0.4);
+    }
+
+    .high-card .stat-value {
+      color: var(--neon-yellow);
+      text-shadow: 0 0 10px rgba(255, 230, 0, 0.4);
+    }
+
+    .level-card .stat-value {
+      color: var(--neon-cyan);
+    }
+
+    .canvas-wrapper {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      background: #070a13;
+      border: 2px solid rgba(0, 243, 255, 0.4);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 0 25px rgba(0, 243, 255, 0.2), inset 0 0 20px rgba(0, 0, 0, 0.8);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(7, 10, 19, 0.85);
+      backdrop-filter: blur(4px);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 24px;
+      text-align: center;
+      transition: opacity 0.2s ease;
+    }
+
+    .overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .overlay h2 {
+      font-size: 1.8rem;
+      font-weight: 800;
+      letter-spacing: 1px;
+    }
+
+    .overlay.game-over h2 {
+      color: var(--neon-pink);
+      text-shadow: 0 0 15px rgba(255, 0, 127, 0.6);
+    }
+
+    .overlay.pause h2 {
+      color: var(--neon-yellow);
+      text-shadow: 0 0 15px rgba(255, 230, 0, 0.6);
+    }
+
+    .overlay p {
+      font-size: 0.9rem;
+      color: var(--text-muted);
+      max-width: 280px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--neon-cyan), #0077ff);
+      color: #050b14;
+      border: none;
+      padding: 12px 28px;
+      border-radius: 30px;
+      font-size: 1rem;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 0 15px rgba(0, 243, 255, 0.4);
+      transition: all 0.2s ease;
+    }
+
+    .btn-primary:hover {
+      transform: scale(1.05);
+      box-shadow: 0 0 25px rgba(0, 243, 255, 0.7);
+    }
+
+    /* Mobile D-Pad Controls */
+    .touch-controls {
+      display: none;
+      width: 100%;
+      max-width: 280px;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(3, 1fr);
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    @media (max-width: 768px) {
+      .touch-controls {
+        display: grid;
+      }
+    }
+
+    .dpad-btn {
+      background: var(--card-bg);
+      border: 1px solid rgba(0, 243, 255, 0.3);
+      color: var(--neon-cyan);
+      border-radius: 12px;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.2rem;
+      font-weight: bold;
+      touch-action: manipulation;
+    }
+
+    .dpad-btn:active {
+      background: rgba(0, 243, 255, 0.25);
+      border-color: var(--neon-cyan);
+    }
+
+    .dpad-up { grid-column: 2; grid-row: 1; }
+    .dpad-left { grid-column: 1; grid-row: 2; }
+    .dpad-pause { grid-column: 2; grid-row: 2; font-size: 0.8rem; }
+    .dpad-right { grid-column: 3; grid-row: 2; }
+    .dpad-down { grid-column: 2; grid-row: 3; }
+
+    .help-text {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      text-align: center;
+    }
+
+    .gold-progress-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 4px;
+      background: var(--neon-yellow);
+      box-shadow: 0 0 8px var(--neon-yellow);
+      width: 0%;
+      transition: width 0.1s linear;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <header>
+      <div class="title-box">
+        <h1>CYBERSNAKE 2077</h1>
+        <p>Rắn săn mồi Neon • Web Audio API</p>
+      </div>
+      <div class="header-controls">
+        <button id="muteBtn" class="btn-icon" title="Bật/Tắt âm thanh">
+          <span id="muteIcon">🔊</span> Âm
+        </button>
+        <button id="restartHeaderBtn" class="btn-icon" title="Chơi lại">
+          🔄 Lại
+        </button>
+      </div>
+    </header>
+
+    <div class="stats-bar">
+      <div class="stat-card score-card">
+        <div class="stat-label">Điểm số</div>
+        <div id="scoreVal" class="stat-value">0</div>
+      </div>
+      <div class="stat-card high-card">
+        <div class="stat-label">Kỷ lục</div>
+        <div id="highVal" class="stat-value">0</div>
+      </div>
+      <div class="stat-card level-card">
+        <div class="stat-label">Cấp độ</div>
+        <div id="levelVal" class="stat-value">1</div>
+      </div>
+    </div>
+
+    <div class="canvas-wrapper">
+      <div id="goldProgressBar" class="gold-progress-bar"></div>
+      <canvas id="gameCanvas" width="400" height="400"></canvas>
+
+      <!-- Overlay Start / Game Over / Pause -->
+      <div id="gameOverlay" class="overlay">
+        <h2 id="overlayTitle">SẴN SÀNG?</h2>
+        <p id="overlayDesc">Sử dụng phím mũi tên hoặc WASD để di chuyển. Nhấn Space để tạm dừng.</p>
+        <button id="startBtn" class="btn-primary">CHƠI NGAY</button>
+      </div>
+    </div>
+
+    <!-- Mobile Touch Controls -->
+    <div class="touch-controls">
+      <button class="dpad-btn dpad-up" id="btnUp">▲</button>
+      <button class="dpad-btn dpad-left" id="btnLeft">◀</button>
+      <button class="dpad-btn dpad-pause" id="btnPause">⏸</button>
+      <button class="dpad-btn dpad-right" id="btnRight">▶</button>
+      <button class="dpad-btn dpad-down" id="btnDown">▼</button>
+    </div>
+
+    <div class="help-text">
+      ⌨️ Phím: <b>W, A, S, D</b> hoặc <b>Phím Mũi Tên</b> | <b>Space</b>: Tạm dừng / Tiếp tục | <b>R</b>: Chơi lại
+    </div>
+  </div>
+
+  <script>
+    // --- Web Audio Synthesizer (Zero asset dependency) ---
+    class SoundEngine {
+      constructor() {
+        this.ctx = null;
+        this.muted = false;
+      }
+
+      init() {
+        if (!this.ctx) {
+          const AudioContext = window.AudioContext || window.webkitAudioContext;
+          if (AudioContext) {
+            this.ctx = new AudioContext();
+          }
+        }
+        if (this.ctx && this.ctx.state === 'suspended') {
+          this.ctx.resume();
+        }
+      }
+
+      playTone(freq, type = 'sine', duration = 0.1, gainVal = 0.15) {
+        if (this.muted || !this.ctx) return;
+        try {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = type;
+          osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+          
+          gain.gain.setValueAtTime(gainVal, this.ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + duration);
+
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+
+          osc.start();
+          osc.stop(this.ctx.currentTime + duration);
+        } catch (e) {
+          console.warn("Audio play error", e);
+        }
+      }
+
+      playEat() {
+        this.init();
+        this.playTone(600, 'sine', 0.08, 0.2);
+        setTimeout(() => this.playTone(850, 'triangle', 0.1, 0.2), 60);
+      }
+
+      playGoldenEat() {
+        this.init();
+        const notes = [523.25, 659.25, 783.99, 1046.50]; // C - E - G - C
+        notes.forEach((freq, idx) => {
+          setTimeout(() => this.playTone(freq, 'triangle', 0.15, 0.25), idx * 50);
+        });
+      }
+
+      playGameOver() {
+        this.init();
+        if (this.muted || !this.ctx) return;
+        try {
+          const osc = this.ctx.createOscillator();
+          const gain = this.ctx.createGain();
+          osc.type = 'sawtooth';
+          osc.frequency.setValueAtTime(320, this.ctx.currentTime);
+          osc.frequency.linearRampToValueAtTime(60, this.ctx.currentTime + 0.4);
+
+          gain.gain.setValueAtTime(0.3, this.ctx.currentTime);
+          gain.gain.linearRampToValueAtTime(0.001, this.ctx.currentTime + 0.4);
+
+          osc.connect(gain);
+          gain.connect(this.ctx.destination);
+
+          osc.start();
+          osc.stop(this.ctx.currentTime + 0.4);
+        } catch (e) {}
+      }
+
+      playPause() {
+        this.init();
+        this.playTone(400, 'sine', 0.05, 0.1);
+      }
+    }
+
+    // --- Particle System for Visual Polish ---
+    class Particle {
+      constructor(x, y, color) {
+        this.x = x;
+        this.y = y;
+        this.color = color;
+        const angle = Math.random() * Math.PI * 2;
+        const speed = Math.random() * 4 + 1;
+        this.vx = Math.cos(angle) * speed;
+        this.vy = Math.sin(angle) * speed;
+        this.life = 1.0;
+        this.decay = Math.random() * 0.04 + 0.03;
+        this.size = Math.random() * 3 + 2;
+      }
+
+      update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.life -= this.decay;
+        this.size = Math.max(0, this.size - 0.05);
+      }
+
+      draw(ctx) {
+        if (this.life <= 0) return;
+        ctx.save();
+        ctx.globalAlpha = this.life;
+        ctx.fillStyle = this.color;
+        ctx.shadowBlur = 6;
+        ctx.shadowColor = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // --- Main Game Logic ---
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const scoreVal = document.getElementById('scoreVal');
+    const highVal = document.getElementById('highVal');
+    const levelVal = document.getElementById('levelVal');
+    const gameOverlay = document.getElementById('gameOverlay');
+    const overlayTitle = document.getElementById('overlayTitle');
+    const overlayDesc = document.getElementById('overlayDesc');
+    const startBtn = document.getElementById('startBtn');
+    const muteBtn = document.getElementById('muteBtn');
+    const muteIcon = document.getElementById('muteIcon');
+    const restartHeaderBtn = document.getElementById('restartHeaderBtn');
+    const goldProgressBar = document.getElementById('goldProgressBar');
+
+    const sounds = new SoundEngine();
+
+    const GRID_SIZE = 20; // 20x20 grid
+    const CELL_SIZE = canvas.width / GRID_SIZE; // 20px per cell
+
+    let snake = [];
+    let direction = { x: 1, y: 0 };
+    let nextDirection = { x: 1, y: 0 };
+    let food = null;
+    let goldenFood = null;
+    let goldenTimer = 0;
+    const GOLDEN_DURATION = 80; // ticks
+    let score = 0;
+    let highScore = parseInt(localStorage.getItem('cybersnake_high') || '0', 10);
+    let level = 1;
+    let state = 'start'; // 'start', 'playing', 'paused', 'gameover'
+    let particles = [];
+    let lastRenderTime = 0;
+    let gameSpeed = 120; // ms per tick
+
+    highVal.textContent = highScore;
+
+    function resetGame() {
+      const startX = 5;
+      const startY = 10;
+      snake = [
+        { x: startX, y: startY },
+        { x: startX - 1, y: startY },
+        { x: startX - 2, y: startY },
+      ];
+      direction = { x: 1, y: 0 };
+      nextDirection = { x: 1, y: 0 };
+      score = 0;
+      level = 1;
+      gameSpeed = 120;
+      particles = [];
+      goldenFood = null;
+      goldenTimer = 0;
+      updateStats();
+      spawnFood();
+      goldProgressBar.style.width = '0%';
+    }
+
+    function updateStats() {
+      scoreVal.textContent = score;
+      if (score > highScore) {
+        highScore = score;
+        localStorage.setItem('cybersnake_high', highScore);
+        highVal.textContent = highScore;
+      }
+      level = Math.floor(score / 50) + 1;
+      levelVal.textContent = level;
+      // Tăng tốc độ theo cấp độ
+      gameSpeed = Math.max(50, 120 - (level - 1) * 8);
+    }
+
+    function getEmptyCell() {
+      const occupied = new Set(snake.map(s => `${s.x},${s.y}`));
+      if (food) occupied.add(`${food.x},${food.y}`);
+      if (goldenFood) occupied.add(`${goldenFood.x},${goldenFood.y}`);
+
+      const available = [];
+      for (let x = 0; x < GRID_SIZE; x++) {
+        for (let y = 0; y < GRID_SIZE; y++) {
+          if (!occupied.has(`${x},${y}`)) {
+            available.push({ x, y });
+          }
+        }
+      }
+      if (available.length === 0) return null;
+      return available[Math.floor(Math.random() * available.length)];
+    }
+
+    function spawnFood() {
+      food = getEmptyCell();
+      // 25% cơ hội sinh mồi vàng nếu chưa có
+      if (!goldenFood && Math.random() < 0.25 && score >= 20) {
+        goldenFood = getEmptyCell();
+        goldenTimer = GOLDEN_DURATION;
+      }
+    }
+
+    function createExplosion(x, y, color, count = 15) {
+      const px = (x + 0.5) * CELL_SIZE;
+      const py = (y + 0.5) * CELL_SIZE;
+      for (let i = 0; i < count; i++) {
+        particles.push(new Particle(px, py, color));
+      }
+    }
+
+    function setDirection(newDir) {
+      if (state !== 'playing') return;
+      // Không cho phép quay ngoắt 180 độ
+      if (newDir.x !== 0 && direction.x !== 0) return;
+      if (newDir.y !== 0 && direction.y !== 0) return;
+      nextDirection = newDir;
+    }
+
+    function tick() {
+      if (state !== 'playing') return;
+
+      direction = nextDirection;
+      const head = { x: snake[0].x + direction.x, y: snake[0].y + direction.y };
+
+      // Kiểm tra đâm tường
+      if (head.x < 0 || head.x >= GRID_SIZE || head.y < 0 || head.y >= GRID_SIZE) {
+        gameOver();
+        return;
+      }
+
+      // Kiểm tra tự cắn mình
+      for (let i = 0; i < snake.length; i++) {
+        if (head.x === snake[i].x && head.y === snake[i].y) {
+          gameOver();
+          return;
+        }
+      }
+
+      snake.unshift(head);
+
+      // Kiểm tra ăn mồi thường
+      let ate = false;
+      if (food && head.x === food.x && head.y === food.y) {
+        score += 10;
+        ate = true;
+        sounds.playEat();
+        createExplosion(food.x, food.y, '#39ff14', 16);
+        spawnFood();
+        updateStats();
+      }
+
+      // Kiểm tra ăn mồi vàng
+      if (goldenFood && head.x === goldenFood.x && head.y === goldenFood.y) {
+        score += 50;
+        ate = true;
+        sounds.playGoldenEat();
+        createExplosion(goldenFood.x, goldenFood.y, '#ffe600', 25);
+        goldenFood = null;
+        goldenTimer = 0;
+        goldProgressBar.style.width = '0%';
+        updateStats();
+      }
+
+      // Đếm ngược mồi vàng
+      if (goldenFood) {
+        goldenTimer--;
+        const pct = (goldenTimer / GOLDEN_DURATION) * 100;
+        goldProgressBar.style.width = `${pct}%`;
+        if (goldenTimer <= 0) {
+          goldenFood = null;
+          goldProgressBar.style.width = '0%';
+        }
+      }
+
+      if (!ate) {
+        snake.pop();
+      }
+    }
+
+    function gameOver() {
+      state = 'gameover';
+      sounds.playGameOver();
+      createExplosion(snake[0].x, snake[0].y, '#ff007f', 30);
+      overlayTitle.textContent = "GAME OVER";
+      overlayDesc.textContent = `Bạn đạt được ${score} điểm! Kỷ lục: ${highScore}`;
+      startBtn.textContent = "CHƠI LẠI (R)";
+      gameOverlay.className = "overlay game-over";
+    }
+
+    function togglePause() {
+      if (state === 'playing') {
+        state = 'paused';
+        sounds.playPause();
+        overlayTitle.textContent = "TẠM DỪNG";
+        overlayDesc.textContent = "Nhấn Space hoặc nút bên dưới để tiếp tục";
+        startBtn.textContent = "TIẾP TỤC";
+        gameOverlay.className = "overlay pause";
+      } else if (state === 'paused') {
+        state = 'playing';
+        sounds.playPause();
+        gameOverlay.className = "overlay hidden";
+      }
+    }
+
+    function startGame() {
+      sounds.init();
+      if (state === 'start' || state === 'gameover') {
+        resetGame();
+        state = 'playing';
+        gameOverlay.className = "overlay hidden";
+      } else if (state === 'paused') {
+        state = 'playing';
+        gameOverlay.className = "overlay hidden";
+      }
+    }
+
+    // --- Rendering Functions ---
+    function drawGrid() {
+      ctx.strokeStyle = 'rgba(0, 243, 255, 0.05)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x <= canvas.width; x += CELL_SIZE) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y <= canvas.height; y += CELL_SIZE) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+    }
+
+    function drawSnake() {
+      snake.forEach((seg, index) => {
+        const x = seg.x * CELL_SIZE;
+        const y = seg.y * CELL_SIZE;
+        const radius = index === 0 ? 6 : 4;
+
+        if (index === 0) {
+          // Đầu rắn phát sáng
+          ctx.save();
+          ctx.fillStyle = '#00f3ff';
+          ctx.shadowBlur = 12;
+          ctx.shadowColor = '#00f3ff';
+          ctx.beginPath();
+          ctx.roundRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2, radius);
+          ctx.fill();
+
+          // Mắt rắn
+          ctx.fillStyle = '#0b0f19';
+          const eyeSize = 3;
+          let eye1 = { x: x + 5, y: y + 5 };
+          let eye2 = { x: x + 12, y: y + 5 };
+          if (direction.y === 1) {
+            eye1 = { x: x + 5, y: y + 12 };
+            eye2 = { x: x + 12, y: y + 12 };
+          } else if (direction.x === -1) {
+            eye1 = { x: x + 4, y: y + 5 };
+            eye2 = { x: x + 4, y: y + 12 };
+          } else if (direction.x === 1) {
+            eye1 = { x: x + 13, y: y + 5 };
+            eye2 = { x: x + 13, y: y + 12 };
+          }
+          ctx.beginPath();
+          ctx.arc(eye1.x, eye1.y, eyeSize, 0, Math.PI * 2);
+          ctx.arc(eye2.x, eye2.y, eyeSize, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        } else {
+          // Thân rắn gradient mượt mà
+          ctx.save();
+          const ratio = index / snake.length;
+          ctx.fillStyle = `rgba(0, ${Math.floor(243 - ratio * 100)}, 255, ${Math.max(0.4, 1 - ratio * 0.5)})`;
+          ctx.shadowBlur = 4;
+          ctx.shadowColor = '#00f3ff';
+          ctx.beginPath();
+          ctx.roundRect(x + 2, y + 2, CELL_SIZE - 4, CELL_SIZE - 4, radius);
+          ctx.fill();
+          ctx.restore();
+        }
+      });
+    }
+
+    function drawFood() {
+      if (food) {
+        const x = food.x * CELL_SIZE;
+        const y = food.y * CELL_SIZE;
+        ctx.save();
+        ctx.fillStyle = '#39ff14';
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = '#39ff14';
+        ctx.beginPath();
+        ctx.arc(x + CELL_SIZE / 2, y + CELL_SIZE / 2, CELL_SIZE / 2 - 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      if (goldenFood) {
+        const x = goldenFood.x * CELL_SIZE;
+        const y = goldenFood.y * CELL_SIZE;
+        const pulse = Math.sin(Date.now() / 150) * 2;
+        ctx.save();
+        ctx.fillStyle = '#ffe600';
+        ctx.shadowBlur = 15 + pulse;
+        ctx.shadowColor = '#ffe600';
+        ctx.beginPath();
+        ctx.arc(x + CELL_SIZE / 2, y + CELL_SIZE / 2, CELL_SIZE / 2 - 2 + pulse * 0.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function drawParticles() {
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const p = particles[i];
+        p.update();
+        p.draw(ctx);
+        if (p.life <= 0) {
+          particles.splice(i, 1);
+        }
+      }
+    }
+
+    let lastTickTime = 0;
+    function gameLoop(timestamp) {
+      if (timestamp - lastTickTime >= gameSpeed) {
+        tick();
+        lastTickTime = timestamp;
+      }
+
+      // Render
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawGrid();
+      drawFood();
+      drawSnake();
+      drawParticles();
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // --- Input Handlers ---
+    window.addEventListener('keydown', (e) => {
+      switch (e.key) {
+        case 'ArrowUp':
+        case 'w':
+        case 'W':
+          e.preventDefault();
+          setDirection({ x: 0, y: -1 });
+          break;
+        case 'ArrowDown':
+        case 's':
+        case 'S':
+          e.preventDefault();
+          setDirection({ x: 0, y: 1 });
+          break;
+        case 'ArrowLeft':
+        case 'a':
+        case 'A':
+          e.preventDefault();
+          setDirection({ x: -1, y: 0 });
+          break;
+        case 'ArrowRight':
+        case 'd':
+        case 'D':
+          e.preventDefault();
+          setDirection({ x: 1, y: 0 });
+          break;
+        case ' ':
+          e.preventDefault();
+          if (state === 'start' || state === 'gameover') {
+            startGame();
+          } else {
+            togglePause();
+          }
+          break;
+        case 'r':
+        case 'R':
+          resetGame();
+          state = 'playing';
+          gameOverlay.className = "overlay hidden";
+          break;
+      }
+    });
+
+    // Touch D-Pad Events
+    document.getElementById('btnUp').addEventListener('click', () => setDirection({ x: 0, y: -1 }));
+    document.getElementById('btnDown').addEventListener('click', () => setDirection({ x: 0, y: 1 }));
+    document.getElementById('btnLeft').addEventListener('click', () => setDirection({ x: -1, y: 0 }));
+    document.getElementById('btnRight').addEventListener('click', () => setDirection({ x: 1, y: 0 }));
+    document.getElementById('btnPause').addEventListener('click', togglePause);
+
+    startBtn.addEventListener('click', startGame);
+    restartHeaderBtn.addEventListener('click', () => {
+      resetGame();
+      state = 'playing';
+      gameOverlay.className = "overlay hidden";
+    });
+
+    muteBtn.addEventListener('click', () => {
+      sounds.muted = !sounds.muted;
+      muteIcon.textContent = sounds.muted ? '🔇' : '🔊';
+      muteBtn.style.color = sounds.muted ? 'var(--text-muted)' : 'var(--neon-cyan)';
+    });
+
+    // Swipe Gestures for Mobile
+    let touchStartX = 0;
+    let touchStartY = 0;
+    canvas.addEventListener('touchstart', (e) => {
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+
+    canvas.addEventListener('touchend', (e) => {
+      if (state !== 'playing') return;
+      const dx = e.changedTouches[0].clientX - touchStartX;
+      const dy = e.changedTouches[0].clientY - touchStartY;
+      const absDx = Math.abs(dx);
+      const absDy = Math.abs(dy);
+
+      if (Math.max(absDx, absDy) > 20) {
+        if (absDx > absDy) {
+          setDirection(dx > 0 ? { x: 1, y: 0 } : { x: -1, y: 0 });
+        } else {
+          setDirection(dy > 0 ? { x: 0, y: 1 } : { x: 0, y: -1 });
+        }
+      }
+    }, { passive: true });
+
+    // Initial Setup
+    resetGame();
+    requestAnimationFrame(gameLoop);
+  </script>
+</body>
+</html>

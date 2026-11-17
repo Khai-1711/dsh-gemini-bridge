@@ -309,6 +309,30 @@ class TestToolRepairShadow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outcome, "disabled")
         self.assertEqual(requests, [])
 
+    async def test_repair_tool_call_active_success(self):
+        transport, _ = self._transport(
+            '{"name":"Inspect","arguments":{"format":"summary","max_items":3}}'
+        )
+        with patch.object(tool_repair, "TOOL_REPAIR_ENABLED", True), \
+             patch.object(tool_repair, "TOOL_REPAIR_MODEL", "test-model"):
+            repaired = await tool_repair.repair_tool_call_active(
+                self.candidate, self.tools, transport=transport
+            )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(len(repaired), 1)
+        self.assertEqual(repaired[0]["function"]["name"], "Inspect")
+        args = json.loads(repaired[0]["function"]["arguments"])
+        self.assertEqual(args["format"], "summary")
+        self.assertEqual(args["max_items"], 3)
+
+    async def test_repair_tool_call_active_disabled(self):
+        with patch.object(tool_repair, "TOOL_REPAIR_ENABLED", False):
+            repaired = await tool_repair.repair_tool_call_active(
+                self.candidate, self.tools
+            )
+        self.assertIsNone(repaired)
+
 
 if __name__ == "__main__":
     unittest.main()
