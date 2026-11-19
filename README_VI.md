@@ -301,4 +301,19 @@ Khi cần truy cập Bridge hoặc Dashboard từ một máy tính khác trong c
      curl -X POST http://127.0.0.1:10000/v1/update-cookies -H "Content-Type: application/json" -d "{\"SECURE_1PSID\":\"...\",\"SECURE_1PSIDTS\":\"...\"}"
      ```
 4. **Agent báo lỗi `missing required property` khi gọi Tool:**
-   * Cơ chế `Auto-Mapper` trong `app/tool_parser.py` sẽ tự động bổ sung và chuẩn hóa tên tham số (`path` → `file_path`, `cmd` → `command`). Nếu có custom tool mới, bạn có thể bổ sung quy tắc ánh xạ vào hàm `normalize_tool_arguments()`.
+   * Cơ chế `Auto-Mapper` trong `app/tool_parser.py` sẽ tự động bổ sung và chuẩn hóa tên tham số (`path` → `file_path`, `cmd` → `command`, `filePath` ↔ `file_path`). Nếu có custom tool mới, bạn có thể bổ sung quy tắc ánh xạ vào hàm `normalize_tool_arguments()`.
+
+---
+
+## Cập Nhật Gần Đây
+
+- **Fallback Thông Minh & Chống Treo 90s (`app/gemini_session.py`, `main.py`):**
+  - Ưu tiên `gemini-4-hydrogen` và chặn vòng lặp `MODEL_FALLBACK` tự fallback lại chính model vừa lỗi.
+  - Khi gặp lỗi `1097` hoặc chờ quá `35s` chưa có byte đầu tiên, tự động chuyển sang `unspecified` (`model=None`) và gọi `_evaluate_auth()` để báo lỗi xác thực rõ ràng thay vì âm thầm tụt xuống Guest Mode.
+  - Dọn/rollback metadata dở dang `[cid, rid, None]` khi timeout hoặc hủy giữa chừng, và tự động `reset_session()` khi DSH mở phiên hội thoại mới.
+- **Giao Thức Tool Text & Sửa JSON Chủ Động Bằng Local AI (`app/prompt_builder.py`, `app/tool_repair.py`, `app/tool_parser.py`):**
+  - Nén gọn schema tool và làm rõ `<tool_call>` là giao thức plain-text XML cho client ngoài (không phải tool nội bộ của Gemini), giúp agent chạy thông suốt qua các lượt `[TOOL_RESULT]` nối tiếp.
+  - Bật cơ chế chủ động sửa lỗi JSON tool call bằng Local AI (`Nemotron`, `TOOL_REPAIR_ENABLED=true`, hỗ trợ payload tới `16,000` ký tự / `4,096` token đầu ra) và giữ lại các tool call hợp lệ khi gọi song song.
+- **Đa Luồng Trên Windows & Kiểm Thử (`app/lanes.py`, `run_all.bat`, `tests/`):**
+  - Dùng `CREATE_NO_WINDOW` khi spawn worker trên Windows / Python 3.14 và sửa lỗi khoảng trắng biến môi trường trong `run_all.bat`.
+  - Đã kiểm thử tự động với **198 unit test**: `python -m unittest discover -s tests -q`.

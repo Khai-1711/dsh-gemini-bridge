@@ -252,4 +252,19 @@ When hosting the bridge on one computer and accessing the dashboard from another
      curl -X POST http://127.0.0.1:10000/v1/update-cookies -H "Content-Type: application/json" -d "{\"SECURE_1PSID\":\"...\",\"SECURE_1PSIDTS\":\"...\"}"
      ```
 4. **Agent tool fails with missing properties:**
-   * The Auto-Mapper in `app/tool_parser.py` automatically normalizes common parameter variations (e.g. `path` → `file_path`, `cmd` → `command`). Extend `normalize_tool_arguments()` if adding custom tools.
+   * The Auto-Mapper in `app/tool_parser.py` automatically normalizes common parameter variations (e.g. `path` → `file_path`, `cmd` → `command`, `filePath` ↔ `file_path`). Extend `normalize_tool_arguments()` if adding custom tools.
+
+---
+
+## Recent Updates
+
+- **Smart Fallback & Anti-Hang Recovery (`app/gemini_session.py`, `main.py`):**
+  - Prioritizes `gemini-4-hydrogen` and prevents `MODEL_FALLBACK` from looping back onto the same failing model.
+  - On Error `1097` or if a stream produces no first byte within `35s`, automatically falls back to `unspecified` (`model=None`) and validates `_evaluate_auth()` so expired cookies fail loudly instead of silently dropping into Guest Mode.
+  - Sanitizes and rolls back incomplete `[cid, rid, None]` metadata on timeouts/cancellations and auto-resets `ChatSession` when DSH starts a new conversation.
+- **External Text Tool Protocol & Active Local AI Repair (`app/prompt_builder.py`, `app/tool_repair.py`, `app/tool_parser.py`):**
+  - Compacted tool schema instructions and explicitly framed `<tool_call>` as an external client plain-text XML protocol so Gemini Web continues emitting tools across multi-turn `[TOOL_RESULT]` loops.
+  - Enabled active JSON syntax repair via Local AI (`Nemotron`, `TOOL_REPAIR_ENABLED=true`, up to `16,000` chars / `4,096` output tokens) while preserving valid sibling calls in parallel tool-call responses.
+- **Windows Multi-Lane & Testing (`app/lanes.py`, `run_all.bat`, `tests/`):**
+  - Switched local lane spawning to `CREATE_NO_WINDOW` for Python 3.14 compatibility and fixed `run_all.bat` environment variable spacing.
+  - Verified with **198 unit tests**: `python -m unittest discover -s tests -q`.
