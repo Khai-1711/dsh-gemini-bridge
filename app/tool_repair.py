@@ -101,12 +101,16 @@ def validate_tool_repair_settings() -> None:
 
 
 def _prepare_candidate(
-    reply_text: str, tools_map: Dict[str, Dict[str, object]]
+    reply_text: str,
+    tools_map: Dict[str, Dict[str, object]],
+    *,
+    allow_protected_keys: bool = False,
+    max_chars: int = 4000,
 ) -> Tuple[Optional[Tuple[str, str, Dict[str, object]]], str]:
-    candidate = extract_malformed_tool_call_candidate(reply_text)
+    candidate = extract_malformed_tool_call_candidate(reply_text, max_chars=max_chars)
     if candidate is None:
         return None, "skipped_no_malformed_candidate"
-    if _PROTECTED_ARGUMENT_KEY.search(candidate):
+    if not allow_protected_keys and _PROTECTED_ARGUMENT_KEY.search(candidate):
         return None, "skipped_protected_argument"
     match = _TOOL_NAME.search(candidate)
     if not match:
@@ -449,7 +453,9 @@ async def repair_tool_call_active(
     actual_model = model if model is not None else TOOL_REPAIR_MODEL
     actual_timeout = timeout if timeout is not None else TOOL_REPAIR_TIMEOUT_SECONDS
 
-    prepared, reason = _prepare_candidate(reply_text, tools_map)
+    prepared, reason = _prepare_candidate(
+        reply_text, tools_map, allow_protected_keys=True, max_chars=16000
+    )
     if prepared is None:
         return None
 
@@ -461,7 +467,7 @@ async def repair_tool_call_active(
     request_body = {
         "model": actual_model,
         "temperature": 0.1,
-        "max_tokens": 512,
+        "max_tokens": 4096,
         "stream": False,
         "messages": [
             {
@@ -496,8 +502,9 @@ async def repair_tool_call_active(
             if slots_res.status_code == 200:
                 slots_data = slots_res.json()
                 slots = slots_data.get("slots") if isinstance(slots_data, dict) else slots_data
-                if isinstance(slots, list) and any(s.get("is_processing") for s in slots if isinstance(s, dict)):
-                    logger.warning("[TOOL_REPAIR_ACTIVE] Nemotron is busy processing another request")
+                dict_slots = [s for s in slots if isinstance(s, dict)] if isinstance(slots, list) else []
+                if dict_slots and all(s.get("is_processing") for s in dict_slots):
+                    logger.warning("[TOOL_REPAIR_ACTIVE] Nemotron is busy processing on all slots")
                     return None
 
             response = await client.post(actual_endpoint, json=request_body)
@@ -514,7 +521,12 @@ async def repair_tool_call_active(
                 if len(lines) >= 3 and lines[-1].strip() == "```":
                     repaired_text = "\n".join(lines[1:-1]).strip()
 
-            repaired_calls = parse_tool_calls_from_reply(repaired_text, {tool_name: schema})
+            parse_input = (
+                repaired_text
+                if "<tool_call>" in repaired_text
+                else f"<tool_call>{repaired_text}</tool_call>"
+            )
+            repaired_calls = parse_tool_calls_from_reply(parse_input, {tool_name: schema})
             if repaired_calls:
                 logger.info(
                     "[TOOL_REPAIR_ACTIVE] request=%s Đã sửa thành công tool call '%s' bằng Nemotron 4B!",

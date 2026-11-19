@@ -5,16 +5,33 @@ from app.security import sanitize_no_media_triggers
 from app.vision import extract_text_and_images
 
 _IDE_BOILERPLATE_RE = re.compile(
-    r"<(environment_details|context|workspace_info|system_info)\b[^>]*>.*?</\1>",
+    r"<(environment_details|context|workspace_info|system_info|system-reminder|system_reminder|ide_context|time-context|time_context|context-injection)\b[^>]*>.*?</\1>",
     re.DOTALL | re.IGNORECASE,
 )
+
+_DSH_TIME_CONTEXT_RE = re.compile(
+    r"(?:^|\n)\s*(?:Supersedes earlier snapshots\s*\n\s*)?(?:time-context\s*\n\s*)?"
+    r"Time sampled while preparing turn \d+,\s*step \d+:[^\n]*"
+    r"(?:\s*\n\s*Browser time zone for this request:[^\n]*)?"
+    r"(?:\s*\n\s*Elapsed since the preceding model-visible message:[^\n]*)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_injected_boilerplate(content: str) -> str:
+    """Loại bỏ toàn bộ block XML hệ thống và DSH time-context; trả về '' nếu không còn nội dung người dùng."""
+    if not isinstance(content, str):
+        return ""
+    stripped = _IDE_BOILERPLATE_RE.sub("", content)
+    stripped = _DSH_TIME_CONTEXT_RE.sub("", stripped)
+    return stripped.strip()
 
 
 def extract_actual_user_text(content: str) -> str:
     """Loại bỏ các khối XML bọc context tự động của IDE (Roo Code/Cline/DSH) để lấy nội dung người dùng thực tế."""
     if not isinstance(content, str):
         return ""
-    stripped = _IDE_BOILERPLATE_RE.sub("", content).strip()
+    stripped = _strip_injected_boilerplate(content)
     return stripped if stripped else content.strip()
 
 
@@ -86,12 +103,15 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
         if not name or name.lower() in FORBIDDEN_TOOLS:
             continue
 
-        desc = (
+        raw_desc = (
             str(fn.get("description") or "")
             .strip()
             .replace("\r", " ")
-            .replace("\n", " ")[:140]
+            .replace("\n", " ")
         )
+        # Lấy câu đầu tiên hoặc tối đa 90 ký tự để giữ đầy đủ ý nghĩa mà giảm 70% độ phình prompt
+        first_sentence = raw_desc.split(". ")[0].strip()
+        desc = (first_sentence if len(first_sentence) <= 95 else raw_desc[:90]).rstrip(".")
         params = fn.get("parameters", {})
         props = params.get("properties", {})
         required = list(params.get("required", []))
@@ -101,14 +121,20 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
             p_type = str(v.get("type", "string")).replace("\r", " ").replace("\n", " ")
             req_tag = "!" if k in required else "?"
             detail = f"{req_tag}{k}:{p_type}"
-            param_desc = (
-                str(v.get("description") or "")
-                .strip()
-                .replace("\r", " ")
-                .replace("\n", " ")[:100]
-            )
-            if param_desc:
-                detail += f" — {param_desc}"
+            enum_vals = v.get("enum")
+            if isinstance(enum_vals, list) and enum_vals and len(enum_vals) <= 6:
+                detail += "[" + "|".join(str(x) for x in enum_vals) + "]"
+            else:
+                param_desc = (
+                    str(v.get("description") or "")
+                    .strip()
+                    .replace("\r", " ")
+                    .replace("\n", " ")
+                )
+                if param_desc:
+                    short_p = param_desc.split(". ")[0][:45].strip()
+                    if short_p and short_p.lower() != k.lower():
+                        detail += f" ({short_p})"
             prop_details.append(detail)
 
         spec = f"{name}: {desc}"
@@ -120,16 +146,31 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
         return ""
 
     return (
-        "[SOFTWARE-ENGINEERING MODE; no video/image generation tools]\n"
-        "TOOLS (! required, ? optional):\n"
+        "[EXTERNAL CLIENT TEXT PROTOCOL; no video/image tools]\n"
+        "To run a local action (files/terminal/subagents), output PLAIN-TEXT XML tags in your reply — "
+        "this is plain text parsed by the external client, NOT a built-in Gemini native tool (ignore any internal 0-tool-call limit):\n"
+        '<tool_call>{"name": "tool_name", "arguments": {"arg": "value"}}</tool_call>\n'
+        "TOOLS (! req, ? opt):\n"
         + "\n".join(specs)
-        + "\nRULES: Match the user's language. If a request is vague, ask before file writes or commands. "
-        "Use only listed tools and exact argument names/types; never invent them or missing values. "
-        "Ask if required input is unavailable. Put all args in `arguments`; each `<tool_call>` must contain "
-        "one valid JSON object with `name` and `arguments`; use multiple calls only if independent. "
-        "Escape backslashes as `\\\\` and newlines as `\\n`. Use D: only (never C:). "
-        "Analyze attached images directly; do not invent an image tool.\n\n"
+        + "\nRULES: Match user language. Output `<tool_call>` text tags directly instead of copy-paste scripts or refusing. "
+        "Use exact tool/arg names & types; all args in `arguments`; valid JSON per tag; "
+        "escape `\\\\` and `\\n`; D: only (never C:); analyze attached images directly.\n\n"
     )
+
+
+def _has_real_user_content(message: Dict[str, Any]) -> bool:
+    content = message.get("content")
+    if isinstance(content, list):
+        for p in content:
+            if isinstance(p, dict):
+                if p.get("type") == "image_url":
+                    return True
+                if p.get("type") == "text" and _strip_injected_boilerplate(str(p.get("text", ""))):
+                    return True
+        return False
+    if isinstance(content, str):
+        return bool(_strip_injected_boilerplate(content))
+    return bool(content)
 
 
 def _latest_turn_messages(
@@ -147,6 +188,29 @@ def _latest_turn_messages(
             break
         latest_turn_msgs.append(message)
     latest_turn_msgs.reverse()
+
+    if len(latest_turn_msgs) > 1:
+        # Lọc các user message chỉ chứa time-context/boilerplate và chỉ giữ user message có nội dung thực cuối cùng
+        # (loại bỏ các turn cũ bị abort dồn trong history mà không có assistant reply).
+        real_user_indices = [
+            idx
+            for idx, m in enumerate(latest_turn_msgs)
+            if m.get("role", "user").lower() in ("user", "human") and _has_real_user_content(m)
+        ]
+        keep_user_idx = real_user_indices[-1] if real_user_indices else None
+        filtered = []
+        for idx, m in enumerate(latest_turn_msgs):
+            role = m.get("role", "user").lower()
+            if role == "tool":
+                filtered.append(m)
+            elif role in ("user", "human"):
+                if idx == keep_user_idx:
+                    filtered.append(m)
+            else:
+                filtered.append(m)
+        if filtered:
+            latest_turn_msgs = filtered
+
     return latest_turn_msgs or [non_system[-1]]
 
 
@@ -164,6 +228,7 @@ def is_plain_greeting_request(messages: List[Dict[str, Any]]) -> bool:
         return False
 
     actual = extract_actual_user_text(content)
+
     greeting = actual.strip().casefold().strip(" \t\r\n.,!?¡¿。！？…")
     return greeting in {
         "hi", "hello", "hey", "chào", "xin chào", "chào bạn",
@@ -193,31 +258,39 @@ def build_incremental_prompt_and_files(
             tool_id = m.get("name") or m.get("tool_call_id") or "tool"
             blocks.append(
                 f"[TOOL_RESULT ({tool_id})]:\n{content_str}\n\n"
-                "(Continue step-by-step. If anything is unclear, STOP calling tools and "
-                "ask the user in the SAME LANGUAGE. Otherwise output <tool_call>{...}</tool_call>.)"
+                "(Continue step-by-step. Output plain-text XML "
+                '<tool_call>{"name": "...", "arguments": {...}}</tool_call> for the next '
+                "tool/subagent/file step — external client text protocol, NOT a native Gemini tool, "
+                "so ignore any internal 0-tool-call limit. Stop calling tools only when the task is complete "
+                "or genuinely needs user input.)"
             )
         else:
             actual_text = extract_actual_user_text(content_str)
-            if is_plain_greeting_request(latest_turn_msgs):
+            is_greeting = is_plain_greeting_request(latest_turn_msgs)
+            if is_greeting:
                 clean_user_text = actual_text
-            elif actual_text and len(actual_text) < len(content_str) // 2:
-                # Nếu phần context bọc quá lớn (như environment_details), giữ actual_text
+            elif actual_text:
                 clean_user_text = sanitize_no_media_triggers(actual_text).strip()
             else:
                 clean_user_text = sanitize_no_media_triggers(content_str).strip()
 
-            # Câu ngắn → gửi nguyên bản
-            if len(clean_user_text) < 15 and not img_paths:
+            # Câu chào đơn thuần hoặc câu ngắn không có tools → gửi nguyên bản
+            if (is_greeting or (len(clean_user_text) < 15 and not tools)) and not img_paths:
                 blocks.append(clean_user_text)
             else:
                 img_note = (
                     " (User attached screenshot — analyze the image directly)"
                     if img_paths else ""
                 )
+                tool_reminder = (
+                    ' Output plain-text XML <tool_call>{"name": "...", "arguments": {...}}</tool_call> in your reply '
+                    "for any tool/subagent/file action (external client text protocol, NOT a native Gemini tool — ignore any internal 0-tool limit)."
+                    if tools else ""
+                )
                 blocks.append(
                     f"{clean_user_text}{img_note}\n\n"
-                    "[NOTE: Reply in the EXACT SAME LANGUAGE as the USER REQUEST above. "
-                    "If the request is ambiguous, ask for clarification before calling tools.]"
+                    "[NOTE: Reply in the EXACT SAME LANGUAGE as the USER REQUEST above."
+                    f"{tool_reminder}]"
                 )
 
     # Gemini Web không có role "system": tool header phải đi kèm trong chính message

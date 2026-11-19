@@ -330,7 +330,13 @@ async def _local_switch_model(model_name: Any, keep_chat: bool = True) -> Tuple[
 
     target = raw_str
     is_valid = False
-    if target.lower() in (
+    if (
+        target.lower() in ("gemini-carbon", "gemini-pro", "gemini-flash-lite")
+        and "gemini-4-hydrogen" in (session_manager.available_models or [])
+    ):
+        is_valid = True
+        target = "gemini-4-hydrogen"
+    elif target.lower() in (
         "unspecified", "", "1", "2", "gemini-1", "gemini-2", "lane-1", "lane-2",
         "lane1", "lane2", "worker-1", "worker-2", "worker1", "worker2",
         "acc1", "acc2", "acc-1", "acc-2", "model-1", "model-2", "default", "auto",
@@ -1027,6 +1033,8 @@ async def chat_completions(request: Request):
         "none", "unspecified", "gemini"
     ):
         model_id = session_manager.default_model
+    elif model_id.lower() in ("gemini-carbon", "gemini-pro", "gemini-flash-lite") and "gemini-4-hydrogen" in (session_manager.available_models or []):
+        model_id = "gemini-4-hydrogen"
     is_stream = body.get("stream", False)
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_ts = int(t0)
@@ -1188,6 +1196,18 @@ async def chat_completions(request: Request):
         model_id = model_data["active_model"]
     else:
         model_id = session_manager.default_model
+
+    # Tự động nhận diện khi DSH mở New Session (chưa có tin nhắn assistant hoặc tool nào trong lịch sử)
+    has_prior_turns = any(
+        m.get("role") in ("assistant", "tool") for m in messages if isinstance(m, dict)
+    )
+    has_dirty_chat_id = bool(
+        getattr(session_manager, "chat_session", None)
+        and getattr(session_manager.chat_session, "cid", None)
+    )
+    if not has_prior_turns and (session_manager.turn_count > 0 or has_dirty_chat_id):
+        logger.info("[SESSION] Phát hiện phiên hội thoại mới từ DSH -> Tự động làm mới ChatSession để tránh lỗi 1097 và nạp lại Tool Header.")
+        await session_manager.reset_session()
 
     # Ghi nhận hội thoại và sổ sự thật (Ledger)
     session_manager.remember_transcript(messages)

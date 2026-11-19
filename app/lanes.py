@@ -93,9 +93,9 @@ def spawn_local_lane(lane_id: str) -> bool:
         spawn_log = open(log_dir / f"spawn_{lane_id}.log", "a", encoding="utf-8")
 
         if sys.platform == "win32":
-            DETACHED_PROCESS = 0x00000008
+            CREATE_NO_WINDOW = 0x08000000
             CREATE_NEW_PROCESS_GROUP = 0x00000200
-            flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
             subprocess.Popen(
                 [sys.executable, str(base_dir / "main.py")],
                 cwd=str(base_dir),

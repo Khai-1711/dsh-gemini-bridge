@@ -41,7 +41,9 @@ def normalize_tool_arguments(
     normalized = dict(args)
 
     aliases = {
-        "file_path": ("path", "file", "filepath", "filename", "target_file"),
+        "file_path": ("path", "file", "filepath", "filename", "target_file", "filePath"),
+        "filePath": ("path", "file", "file_path", "filepath", "filename", "target_file"),
+        "path": ("file_path", "filePath", "file", "filepath", "filename", "target_file"),
         "command": ("cmd", "script", "shell", "code", "input"),
         "pattern": ("query", "path", "glob", "search", "file_pattern"),
     }
@@ -73,7 +75,7 @@ def normalize_tool_arguments(
         if "enum" in property_schema and value not in property_schema["enum"]:
             raise InvalidToolArguments("Tool argument is not an allowed enum value.")
 
-        if key in ("file_path", "path"):
+        if key in ("file_path", "path", "filePath", "filepath"):
             if not isinstance(value, str):
                 raise InvalidToolArguments("File path must be a string.")
             if not is_safe_path_no_c_drive(value) or not is_path_within_project(value):
@@ -344,4 +346,4 @@ def parse_tool_calls_from_reply(
             rejected_candidate = True
             logger.warning("[PARSER] Rejected malformed or schema-invalid tool call.")
 
-    return [] if rejected_candidate else extracted_calls
+    return extracted_calls if extracted_calls else ([] if rejected_candidate else [])

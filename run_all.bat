@@ -32,5 +32,5 @@ if errorlevel 1 (
   echo [%LANE%] cong %LPORT% da co tien trinh chay - bo qua.
   exit /b 0
 )
-start "DSH-Bridge [%LANE% - Port %LPORT%]" /min cmd /c "set BRIDGE_INSTANCE=%LANE%&& python main.py || pause"
+start "DSH-Bridge [%LANE% - Port %LPORT%]" /min cmd /c "set "BRIDGE_INSTANCE=%LANE%" && python main.py || pause"
 exit /b 0

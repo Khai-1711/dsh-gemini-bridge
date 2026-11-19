@@ -74,6 +74,7 @@ _response_cache: Dict[str, Tuple[float, str]] = {}
 CACHE_TTL = 300  # 5 phút
 MAX_CACHE_SIZE = 50
 VISION_STREAM_BUFFER_MAX_BYTES = 1024 * 1024
+MODEL_FIRST_BYTE_FALLBACK_TIMEOUT = 35.0
 
 
 def _cache_key(prompt: str, model: str = "") -> str:
@@ -98,16 +99,26 @@ async def _await_with_deadline(awaitable, deadline: Optional[float]):
     return await asyncio.wait_for(awaitable, timeout=_remaining_timeout(deadline))
 
 
-async def _iterate_stream_until(stream, deadline: float):
+async def _iterate_stream_until(
+    stream, deadline: float, first_chunk_deadline: Optional[float] = None
+):
     """Iterate an async response stream against an absolute deadline."""
     iterator = stream.__aiter__()
+    got_text = False
     while True:
+        active_deadline = (
+            min(deadline, first_chunk_deadline)
+            if (first_chunk_deadline is not None and not got_text)
+            else deadline
+        )
         try:
             item = await asyncio.wait_for(
-                iterator.__anext__(), timeout=_remaining_timeout(deadline)
+                iterator.__anext__(), timeout=_remaining_timeout(active_deadline)
             )
         except StopAsyncIteration:
             return
+        if getattr(item, "text_delta", None):
+            got_text = True
         yield item
 
 
@@ -691,14 +702,31 @@ class SingleChatManager:
         if not details:
             _add("unspecified")
 
+        # Khóa toàn bộ về gemini-4-hydrogen (Argon) khi tài khoản hỗ trợ để tránh lỗi 1097/300s của Carbon
+        if any(d["name"] == "gemini-4-hydrogen" for d in details):
+            details = [d for d in details if d["name"] == "gemini-4-hydrogen"]
+        else:
+            has_gen4 = any(d["name"] in ("gemini-4-hydrogen", "gemini-carbon") for d in details)
+            if has_gen4:
+                details = [
+                    d for d in details
+                    if d["name"] not in ("gemini-flash-lite", "gemini-pro")
+                ]
+
         self.model_details = details
         self.available_models = [d["name"] for d in details]
         return self.available_models
 
     def _ensure_default_model(self) -> None:
-        """Giữ model đang chọn nếu tài khoản còn model đó, ngược lại chọn model đầu."""
+        """Giữ model đang chọn nếu tài khoản còn model đó, ngược lại ưu tiên gemini-4-hydrogen / gemini-carbon."""
         selectable = [m for m in self.available_models if m != "unspecified"]
         current = str(self.default_model or "").strip()
+        if current and current not in ("unspecified", "gemini-flash-lite", "gemini-pro") and current in selectable:
+            return
+        for preferred in ("gemini-4-hydrogen", "gemini-carbon"):
+            if preferred in selectable:
+                self.default_model = preferred
+                return
         if current and current != "unspecified" and current in selectable:
             return
         self.default_model = selectable[0] if selectable else "unspecified"
@@ -726,6 +754,46 @@ class SingleChatManager:
             self.turn_count = 0
             self.tool_header_sent = False
             self.chat_tool_header_hash = ""
+
+    def _select_fallback_model(self) -> str:
+        """Chọn model fallback khác với model hiện tại để tránh vòng lặp tự đâm vào model vừa lỗi."""
+        current = str(self.default_model or "").strip()
+        if current != "gemini-4-hydrogen" and "gemini-4-hydrogen" in (self.available_models or []):
+            return "gemini-4-hydrogen"
+        if current != "unspecified":
+            return "unspecified"
+        for candidate in self.available_models or []:
+            if candidate and candidate != current:
+                return candidate
+        return "unspecified"
+
+    def _sanitize_chat_metadata_before_send(self) -> Optional[list]:
+        """Kiểm tra metadata trước khi gửi; xóa sạch nếu đang ở trạng thái dở dang [cid, rid, None]."""
+        saved_meta = self._chat_metadata_snapshot()
+        if not saved_meta:
+            return None
+        has_cid = bool(saved_meta[0]) if len(saved_meta) >= 1 else False
+        has_rcid = bool(saved_meta[2]) if len(saved_meta) >= 3 else False
+        if has_cid and (not has_rcid or (self.turn_count == 0 and not self.session_initialized)):
+            logger.warning(
+                "[SESSION] Phát hiện metadata dở dang (cid có nhưng chưa hoàn tất lượt) -> Làm mới ChatSession để tránh lỗi 1097."
+            )
+            self._create_new_chat_session(preserve_metadata=None)
+            return None
+        return saved_meta
+
+    def _restore_chat_metadata_after_abort(self, saved_meta: Optional[list]) -> None:
+        """Khôi phục metadata sạch sau khi lượt gửi bị timeout hoặc hủy giữa chừng."""
+        has_valid_saved = bool(
+            saved_meta
+            and len(saved_meta) >= 3
+            and saved_meta[0]
+            and saved_meta[2]
+        )
+        if has_valid_saved:
+            self._create_new_chat_session(preserve_metadata=list(saved_meta))
+        else:
+            self._create_new_chat_session(preserve_metadata=None)
 
     def _resume_saved_session(self, saved: dict) -> bool:
         """Khôi phục phiên chat cũ từ metadata đã lưu."""
@@ -1463,6 +1531,7 @@ class SingleChatManager:
             quota_switches = 0
             while attempt < 2:
                 stage = "text_generation"
+                saved_meta_before_send = self._sanitize_chat_metadata_before_send()
                 prompt_to_send = self._ensure_header_in_prompt(
                     self._apply_pending_handoff(base_prompt),
                     include_tool_header,
@@ -1511,7 +1580,12 @@ class SingleChatManager:
 
                     return reply
 
+                except asyncio.CancelledError:
+                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                    raise
+
                 except asyncio.TimeoutError:
+                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
                     timeout = (
                         IMAGE_REQUEST_TIMEOUT
                         if (
@@ -1547,6 +1621,48 @@ class SingleChatManager:
                     logger.warning(
                         f"Lỗi ChatSession (Lần {attempt + 1}/2): {exc}"
                     )
+
+                    if "1097" in str(exc) or ("carbon" in str(self.default_model).lower() and not self._is_auth_error(exc)):
+                        fallback_target = self._select_fallback_model()
+                        logger.warning(
+                            f"[MODEL_FALLBACK] Model '{self.default_model}' bị lỗi ({exc}). "
+                            f"Tự động fallback sang '{fallback_target}' và mở lại kết nối mới!"
+                        )
+                        try:
+                            # LƯU Ý: gemini_webapi đã tự gọi client.close() trước khi ném lỗi 1097 -> cần init lại client!
+                            try:
+                                await _await_with_deadline(self.client.close(), image_deadline)
+                            except Exception:
+                                pass
+                            await _await_with_deadline(
+                                self.client.init(
+                                    timeout=60,
+                                    auto_close=False,
+                                    close_delay=300,
+                                    auto_refresh=True,
+                                ),
+                                image_deadline,
+                            )
+                            if not self._evaluate_auth():
+                                if len(self.chain) > 1 and await _await_with_deadline(
+                                    self._try_failover_to_backup(), image_deadline
+                                ):
+                                    attempt += 1
+                                    continue
+                                if not (self.allow_guest and self.is_guest):
+                                    raise BridgeAuthError(
+                                        "Gemini chưa đăng nhập (guest/cookie hết hạn).",
+                                        stage=stage,
+                                    )
+                            self.default_model = fallback_target
+                            self._create_new_chat_session(preserve_metadata=None)
+                            self._save_session()
+                            attempt += 1
+                            continue
+                        except BridgeAuthError:
+                            raise
+                        except Exception as fb_exc:
+                            logger.error(f"[MODEL_FALLBACK] Lỗi khi fallback: {fb_exc}")
 
                     # Cảnh báo cookie hết hạn
                     if self._consecutive_auth_errors >= 2 and not self.is_guest:
@@ -1801,11 +1917,29 @@ class SingleChatManager:
             attempt = 0
             quota_switches = 0
             yielded_any = False
+            overall_stream_deadline = (
+                image_deadline
+                if image_deadline is not None
+                else asyncio.get_running_loop().time() + GEMINI_HARD_TIMEOUT
+            )
             while attempt < 2:
                 stage = "text_generation"
+                saved_meta_before_send = self._sanitize_chat_metadata_before_send()
                 prompt_to_send = self._ensure_header_in_prompt(
                     self._apply_pending_handoff(base_prompt),
                     include_tool_header,
+                )
+                now_ts = asyncio.get_running_loop().time()
+                stream_deadline = overall_stream_deadline
+                soft_fallback_eligible = (
+                    attempt == 0
+                    and str(self.default_model or "").strip() not in ("", "unspecified")
+                    and (stream_deadline - now_ts) > (MODEL_FIRST_BYTE_FALLBACK_TIMEOUT + 10.0)
+                )
+                first_chunk_deadline = (
+                    now_ts + MODEL_FIRST_BYTE_FALLBACK_TIMEOUT
+                    if soft_fallback_eligible
+                    else None
                 )
                 try:
                     if BRIDGE_DEBUG_FAKE_QUOTA and not self._fake_quota_done:
@@ -1816,14 +1950,10 @@ class SingleChatManager:
                         f"Stream vào ChatSession (Turn={self.turn_count + 1} | "
                         f"Chars={len(prompt_to_send)})"
                     )
-                    stream_deadline = (
-                        image_deadline
-                        if image_deadline is not None
-                        else asyncio.get_running_loop().time() + GEMINI_HARD_TIMEOUT
-                    )
                     async for output in _iterate_stream_until(
                         self.chat_session.send_message_stream(prompt_to_send),
                         stream_deadline,
+                        first_chunk_deadline=first_chunk_deadline,
                     ):
                         delta = output.text_delta or ""
                         if delta:
@@ -1850,7 +1980,28 @@ class SingleChatManager:
                     yield "done", reply
                     return
 
+                except asyncio.CancelledError:
+                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                    raise
+
                 except asyncio.TimeoutError:
+                    if (
+                        soft_fallback_eligible
+                        and not yielded_any
+                        and asyncio.get_running_loop().time() < stream_deadline - 5.0
+                    ):
+                        old_model = self.default_model
+                        fallback_target = self._select_fallback_model()
+                        logger.warning(
+                            f"[MODEL_FALLBACK] Model '{old_model}' không phản hồi sau "
+                            f"{MODEL_FIRST_BYTE_FALLBACK_TIMEOUT:g}s -> Tự động chuyển sang '{fallback_target}' và gửi lại!"
+                        )
+                        self.default_model = fallback_target
+                        self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                        self._save_session()
+                        attempt += 1
+                        continue
+                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
                     timeout = (
                         IMAGE_REQUEST_TIMEOUT
                         if (
@@ -1931,6 +2082,48 @@ class SingleChatManager:
                     logger.warning(
                         f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {exc}"
                     )
+                    if "1097" in str(exc) or ("carbon" in str(self.default_model).lower() and not self._is_auth_error(exc)):
+                        fallback_target = self._select_fallback_model()
+                        logger.warning(
+                            f"[MODEL_FALLBACK] Model '{self.default_model}' bị lỗi ({exc}). "
+                            f"Tự động fallback sang '{fallback_target}' và mở lại kết nối mới!"
+                        )
+                        try:
+                            # LƯU Ý: gemini_webapi đã tự gọi client.close() trước khi ném lỗi 1097 -> cần init lại client!
+                            try:
+                                await _await_with_deadline(self.client.close(), image_deadline)
+                            except Exception:
+                                pass
+                            await _await_with_deadline(
+                                self.client.init(
+                                    timeout=60,
+                                    auto_close=False,
+                                    close_delay=300,
+                                    auto_refresh=True,
+                                ),
+                                image_deadline,
+                            )
+                            if not self._evaluate_auth():
+                                if len(self.chain) > 1 and await _await_with_deadline(
+                                    self._try_failover_to_backup(), image_deadline
+                                ):
+                                    attempt += 1
+                                    continue
+                                if not (self.allow_guest and self.is_guest):
+                                    yield "error", {
+                                        "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
+                                        "type": BridgeAuthError.err_type,
+                                        "code": BridgeAuthError.code,
+                                        "stage": stage,
+                                    }
+                                    return
+                            self.default_model = fallback_target
+                            self._create_new_chat_session(preserve_metadata=None)
+                            self._save_session()
+                            attempt += 1
+                            continue
+                        except Exception as fb_exc:
+                            logger.error(f"[MODEL_FALLBACK] Lỗi khi fallback: {fb_exc}")
                     if self._consecutive_auth_errors >= 2 and not self.is_guest:
                         logger.critical(
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
