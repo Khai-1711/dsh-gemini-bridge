@@ -111,6 +111,68 @@ def _extract_tag_contents(text: str, open_tag: str, close_tag: str) -> List[str]
     return results
 
 
+def _extract_tool_call_blocks(text: str) -> List[str]:
+    """Tách các thẻ <tool_call>...</tool_call> có theo dõi trạng thái chuỗi JSON (" và \\).
+
+    Thẻ </tool_call> nằm bên trong chuỗi JSON (ví dụ khi agent ghi mã nguồn/test)
+    sẽ không cắt sớm block. Nếu gặp <tool_call> nhưng tới EOF vẫn chưa có thẻ đóng
+    hợp lệ bên ngoài chuỗi -> Gate 0 fail-closed, không trả block cắt cụt đó ra ngoài.
+    """
+    open_tag = "<tool_call>"
+    close_tag = "</tool_call>"
+    results: List[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        start = text.find(open_tag, pos)
+        if start == -1:
+            break
+        body_start = start + len(open_tag)
+        i = body_start
+        in_string = False
+        escaped = False
+        found_close = False
+        while i < n:
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                i += 1
+            else:
+                if ch == "<" and text.startswith(close_tag, i):
+                    results.append(text[body_start:i].strip())
+                    pos = i + len(close_tag)
+                    found_close = True
+                    break
+                if ch == '"':
+                    in_string = True
+                    escaped = False
+                i += 1
+        if not found_close:
+            # Gate 0 fail-closed: unclosed/truncated <tool_call> is never partially extracted.
+            break
+    return results
+
+
+def _repair_tool_json_deterministic(raw_json: str) -> Any:
+    """Gate 1 deterministic JSON repair (<2ms) for already-closed tool call blocks."""
+    try:
+        import json_repair
+    except ImportError:
+        return None
+    try:
+        repaired = json_repair.repair_json(raw_json, return_objects=True)
+    except Exception:
+        return None
+    if isinstance(repaired, dict) and "name" in repaired:
+        return repaired
+    return None
+
+
 def _loads_tool_json(raw_json: str) -> Any:
     try:
         return json.loads(raw_json, strict=False)
@@ -279,19 +341,27 @@ def parse_tool_calls_from_reply(
     candidates: List[Tuple[str, bool]] = []
     rejected_candidate = False
 
-    # 1. Quét thẻ <tool_call>...</tool_call> bằng find() O(N) -> is_tagged=True
-    for tag_content in _extract_tag_contents(reply_text, "<tool_call>", "</tool_call>"):
+    # 1. Quét thẻ <tool_call>...</tool_call> theo state machine nhận biết chuỗi JSON -> is_tagged=True
+    for tag_content in _extract_tool_call_blocks(reply_text):
         candidates.append((tag_content, True))
 
-    # 2. Fallback: ```json ... ``` (chỉ khi phản hồi ngắn < 4000 chars và chưa có thẻ <tool_call>) -> is_tagged=False
-    if not candidates and len(reply_text) < 4000:
+    # 2. Fallback: ```tool_call / ```json ... ``` (nâng trần tới 100k khi có nhãn tường minh; chưa có thẻ <tool_call>)
+    if not candidates and len(reply_text) < 100_000:
         for block in _extract_tag_contents(reply_text, "```", "```"):
             clean_block = block.strip()
             first_line, separator, remainder = clean_block.partition("\n")
-            if first_line.strip().lower() in ("json", "tool_call"):
+            label = first_line.strip().lower()
+            is_labeled_tool_fence = label == "tool_call" or (
+                label == "json"
+                and '"name"' in clean_block
+                and ('"arguments"' in clean_block or '"parameters"' in clean_block)
+            )
+            if not is_labeled_tool_fence and len(reply_text) >= 4000:
+                continue
+            if label in ("json", "tool_call"):
                 clean_block = remainder.strip() if separator else ""
             if clean_block.startswith("{") and clean_block.endswith("}"):
-                candidates.append((clean_block, False))
+                candidates.append((clean_block, is_labeled_tool_fence))
 
     # 3. Fallback: toàn bộ reply là JSON -> is_tagged=False
     stripped = reply_text.strip()
@@ -300,7 +370,12 @@ def parse_tool_calls_from_reply(
 
     for raw_json, is_tagged in candidates:
         try:
-            data = _loads_tool_json(raw_json)
+            try:
+                data = _loads_tool_json(raw_json)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                data = _repair_tool_json_deterministic(raw_json) if is_tagged else None
+                if data is None:
+                    raise
             if not isinstance(data, dict) or "name" not in data:
                 rejected_candidate = rejected_candidate or is_tagged
                 continue

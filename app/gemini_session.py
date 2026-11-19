@@ -1,7 +1,9 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,8 +25,6 @@ from app.config import (
     ACCOUNT_CHAIN,
     ALLOW_GUEST_MODE,
     AUTH_COOLDOWN_MINUTES,
-    BACKUP_1PSID,
-    BACKUP_1PSIDTS,
     BASE_DIR,
     BRIDGE_DEBUG_FAKE_QUOTA,
     DISABLE_DRAIN_TIMEOUT,
@@ -53,7 +53,6 @@ from app.errors import (
     BridgeBusyError,
     BridgeControlError,
     BridgeDisabledError,
-    BridgeError,
     BridgeQuotaError,
     BridgeTimeoutError,
     BridgeUpstreamError,
@@ -75,6 +74,83 @@ CACHE_TTL = 300  # 5 phút
 MAX_CACHE_SIZE = 50
 VISION_STREAM_BUFFER_MAX_BYTES = 1024 * 1024
 MODEL_FIRST_BYTE_FALLBACK_TIMEOUT = 35.0
+SESSION_POOL_MAX_SIZE = 16
+SESSION_POOL_TTL = 3600.0
+_AGENT_NAME_RE = re.compile(r'Your name is\s+"([^"]+)"', re.IGNORECASE)
+
+
+@dataclass
+class SessionSlot:
+    """Ngăn phiên chat độc lập cho từng hội thoại/subagent (cô lập cid/rid/rcid)."""
+
+    session_key: str
+    chat_session: Any = None
+    session_initialized: bool = False
+    turn_count: int = 0
+    tool_header_sent: bool = False
+    chat_tool_header_hash: str = ""
+    last_used_ts: float = 0.0
+    model: str = "unspecified"
+
+
+def _message_text_for_session_key(content: Any) -> Tuple[str, bool]:
+    if isinstance(content, str):
+        return content, False
+    if isinstance(content, list):
+        texts = []
+        has_image = False
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "text":
+                texts.append(str(part.get("text", "")))
+            elif part.get("type") == "image_url":
+                has_image = True
+        return "\n".join(texts), has_image
+    return str(content or ""), False
+
+
+def compute_session_key(
+    messages: List[Dict[str, Any]], explicit_session_id: str = ""
+) -> Tuple[str, bool]:
+    """Tính khóa bám phiên (Sticky Routing) tách Lead và từng Subagent.
+
+    Trả về ``(session_key, is_new_conversation)``. Khi có ``explicit_session_id``
+    từ header ``X-Session-Id``/``X-DSH-Session-Id`` thì dùng trực tiếp; ngược lại
+    trích tên agent từ ``Your name is "..."`` kết hợp tin nhắn user đầu tiên
+    (sau khi loại bỏ thẻ động như ``<system-reminder>`` và ``time-context``).
+    """
+    from app.prompt_builder import _strip_injected_boilerplate
+
+    msg_list = [m for m in (messages or []) if isinstance(m, dict)]
+    is_new_conversation = not any(
+        m.get("role") in ("assistant", "tool") for m in msg_list
+    )
+
+    clean_explicit = str(explicit_session_id or "").strip()
+    if clean_explicit:
+        return clean_explicit[:64], is_new_conversation
+
+    agent_name = ""
+    first_user = ""
+    for msg in msg_list:
+        raw_text, has_image = _message_text_for_session_key(msg.get("content"))
+        if raw_text:
+            match = _AGENT_NAME_RE.search(raw_text)
+            if match:
+                agent_name = match.group(1).strip().lower()
+        if not first_user and str(msg.get("role", "")).lower() in ("user", "human"):
+            cleaned = _strip_injected_boilerplate(raw_text)
+            if cleaned:
+                first_user = " ".join(cleaned.split())[:240]
+            elif has_image:
+                first_user = "[image]"
+
+    if not agent_name and not first_user:
+        return "default", is_new_conversation
+
+    material = f"{agent_name}\x00{first_user}".encode("utf-8", errors="replace")
+    return hashlib.sha256(material).hexdigest()[:16], is_new_conversation
 
 
 def _cache_key(prompt: str, model: str = "") -> str:
@@ -289,6 +365,8 @@ class SingleChatManager:
         self.session_initialized = False
         self.last_request_ts = 0.0
         self.turn_count = 0
+        self._session_pool: Dict[str, SessionSlot] = {}
+        self._active_session_key: str = "default"
         self.total_requests = 0
         self.total_errors = 0
         self.start_time = time.time()
@@ -702,28 +780,29 @@ class SingleChatManager:
         if not details:
             _add("unspecified")
 
-        # Khóa toàn bộ về gemini-4-hydrogen (Argon) khi tài khoản hỗ trợ để tránh lỗi 1097/300s của Carbon
-        if any(d["name"] == "gemini-4-hydrogen" for d in details):
-            details = [d for d in details if d["name"] == "gemini-4-hydrogen"]
-        else:
-            has_gen4 = any(d["name"] in ("gemini-4-hydrogen", "gemini-carbon") for d in details)
-            if has_gen4:
-                details = [
-                    d for d in details
-                    if d["name"] not in ("gemini-flash-lite", "gemini-pro")
-                ]
+        # Hiển thị động toàn bộ model thế hệ mới (Neon, Hydrogen, Carbon, ...);
+        # chỉ lọc bớt gemini-flash-lite / gemini-pro cũ khi tài khoản đã có Gen-4.
+        has_gen4 = any(
+            any(k in d["name"].lower() for k in ("4-", "neon", "hydrogen", "carbon"))
+            for d in details
+        )
+        if has_gen4:
+            details = [
+                d for d in details
+                if d["name"] not in ("gemini-flash-lite", "gemini-pro")
+            ]
 
         self.model_details = details
         self.available_models = [d["name"] for d in details]
         return self.available_models
 
     def _ensure_default_model(self) -> None:
-        """Giữ model đang chọn nếu tài khoản còn model đó, ngược lại ưu tiên gemini-4-hydrogen / gemini-carbon."""
+        """Giữ model đang chọn nếu tài khoản còn model đó, ngược lại ưu tiên gemini-4-neon / gemini-4-hydrogen / gemini-carbon."""
         selectable = [m for m in self.available_models if m != "unspecified"]
         current = str(self.default_model or "").strip()
         if current and current not in ("unspecified", "gemini-flash-lite", "gemini-pro") and current in selectable:
             return
-        for preferred in ("gemini-4-hydrogen", "gemini-carbon"):
+        for preferred in ("gemini-4-neon", "gemini-4-hydrogen", "gemini-carbon"):
             if preferred in selectable:
                 self.default_model = preferred
                 return
@@ -755,14 +834,138 @@ class SingleChatManager:
             self.tool_header_sent = False
             self.chat_tool_header_hash = ""
 
+    def _ensure_session_pool(self) -> Dict[str, SessionSlot]:
+        pool = getattr(self, "_session_pool", None)
+        if pool is None:
+            pool = {}
+            self._session_pool = pool
+        if not getattr(self, "_active_session_key", None):
+            self._active_session_key = "default"
+        return pool
+
+    def _snapshot_current_slot(self, session_key: str) -> SessionSlot:
+        return SessionSlot(
+            session_key=session_key,
+            chat_session=self.chat_session,
+            session_initialized=bool(self.session_initialized),
+            turn_count=int(self.turn_count),
+            tool_header_sent=bool(self.tool_header_sent),
+            chat_tool_header_hash=str(getattr(self, "chat_tool_header_hash", "") or ""),
+            last_used_ts=time.time(),
+            model=str(self.default_model or "unspecified"),
+        )
+
+    def _sync_active_session_slot(self) -> None:
+        pool = self._ensure_session_pool()
+        active_key = self._active_session_key
+        pool[active_key] = self._snapshot_current_slot(active_key)
+
+    def _evict_session_pool_locked(self, protected_keys: set) -> None:
+        pool = self._ensure_session_pool()
+        now = time.time()
+        expired = [
+            key
+            for key, slot in pool.items()
+            if key not in protected_keys and (now - slot.last_used_ts) > SESSION_POOL_TTL
+        ]
+        for key in expired:
+            pool.pop(key, None)
+        while len(pool) > SESSION_POOL_MAX_SIZE:
+            candidates = [
+                (slot.last_used_ts, key)
+                for key, slot in pool.items()
+                if key not in protected_keys
+            ]
+            if not candidates:
+                break
+            _, oldest_key = min(candidates)
+            pool.pop(oldest_key, None)
+
+    async def activate_session_slot(
+        self, session_key: str, is_new_conversation: bool
+    ) -> None:
+        """Chọn hoặc tạo ngăn ChatSession riêng theo session_key trong pool.
+
+        Luôn giữ khóa tuần tự ``self.lock`` ở tầng ``self.client`` để chống
+        đứt kết nối chéo khi chạy trên cùng một ``GeminiClient`` (Issue #356).
+        """
+        target_key = str(session_key or "default").strip() or "default"
+        async with self.lock:
+            pool = self._ensure_session_pool()
+            active_key = self._active_session_key
+            has_dirty_chat = bool(
+                self.chat_session is not None
+                and getattr(self.chat_session, "cid", None)
+            )
+            if active_key and (self.turn_count > 0 or has_dirty_chat):
+                pool[active_key] = self._snapshot_current_slot(active_key)
+
+            self._evict_session_pool_locked({target_key, active_key})
+
+            if is_new_conversation:
+                existing_target = pool.get(target_key)
+                target_was_used = bool(
+                    existing_target is not None
+                    and (
+                        existing_target.turn_count > 0
+                        or (
+                            existing_target.chat_session is not None
+                            and getattr(existing_target.chat_session, "cid", None)
+                        )
+                    )
+                )
+                other_active_slots = any(
+                    key != target_key
+                    and (
+                        slot.turn_count > 0
+                        or (
+                            slot.chat_session is not None
+                            and getattr(slot.chat_session, "cid", None)
+                        )
+                    )
+                    for key, slot in pool.items()
+                )
+                needs_fresh = (
+                    target_was_used
+                    or (self.turn_count > 0)
+                    or has_dirty_chat
+                    or other_active_slots
+                )
+                if needs_fresh:
+                    self._create_new_chat_session(preserve_metadata=None)
+                pool[target_key] = self._snapshot_current_slot(target_key)
+            else:
+                if target_key == active_key:
+                    if target_key in pool:
+                        pool[target_key].last_used_ts = time.time()
+                    else:
+                        pool[target_key] = self._snapshot_current_slot(target_key)
+                elif target_key in pool:
+                    slot = pool[target_key]
+                    self.chat_session = slot.chat_session
+                    self.session_initialized = slot.session_initialized
+                    self.turn_count = slot.turn_count
+                    self.tool_header_sent = slot.tool_header_sent
+                    self.chat_tool_header_hash = slot.chat_tool_header_hash
+                    slot.last_used_ts = time.time()
+                else:
+                    if self.turn_count > 0 or has_dirty_chat:
+                        self._create_new_chat_session(preserve_metadata=None)
+                    pool[target_key] = self._snapshot_current_slot(target_key)
+
+            self._active_session_key = target_key
+            self._evict_session_pool_locked({target_key})
+
     def _select_fallback_model(self) -> str:
         """Chọn model fallback khác với model hiện tại để tránh vòng lặp tự đâm vào model vừa lỗi."""
         current = str(self.default_model or "").strip()
-        if current != "gemini-4-hydrogen" and "gemini-4-hydrogen" in (self.available_models or []):
-            return "gemini-4-hydrogen"
+        available = self.available_models or []
+        for preferred in ("gemini-4-hydrogen", "gemini-4-neon"):
+            if preferred != current and preferred in available:
+                return preferred
         if current != "unspecified":
             return "unspecified"
-        for candidate in self.available_models or []:
+        for candidate in available:
             if candidate and candidate != current:
                 return candidate
         return "unspecified"
@@ -794,6 +997,7 @@ class SingleChatManager:
             self._create_new_chat_session(preserve_metadata=list(saved_meta))
         else:
             self._create_new_chat_session(preserve_metadata=None)
+        self._sync_active_session_slot()
 
     def _resume_saved_session(self, saved: dict) -> bool:
         """Khôi phục phiên chat cũ từ metadata đã lưu."""
@@ -873,6 +1077,7 @@ class SingleChatManager:
             self.tool_header_sent = False
             self.chat_tool_header_hash = ""
             self._save_session()
+            self._sync_active_session_slot()
             logger.info(f"==> CHUYỂN MODEL: [{old_model}] --> [{self.default_model}]")
             return self.default_model
 
@@ -1055,6 +1260,8 @@ class SingleChatManager:
             self.mark_exhausted_for(index, "auth", AUTH_COOLDOWN_MINUTES / 60.0)
             return False
         self._create_new_chat_session()
+        self._ensure_session_pool().clear()
+        self._sync_active_session_slot()
         self.vision_disabled_until = 0.0
         self._consecutive_auth_errors = 0
         self._consecutive_transient_errors = 0
@@ -1232,6 +1439,8 @@ class SingleChatManager:
     async def reset_session(self) -> None:
         async with self.lock:
             self._create_new_chat_session()
+            self._ensure_session_pool().clear()
+            self._active_session_key = "default"
             clear_saved_session()
             self.vision_disabled_until = 0.0
             logger.info(f"Đã làm mới phiên ChatSession (Model: {self.default_model}).")
@@ -1482,6 +1691,7 @@ class SingleChatManager:
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
                     self._save_session()
+                    self._sync_active_session_slot()
                     return reply
                 except Exception as img_exc:
                     if (
@@ -1529,6 +1739,8 @@ class SingleChatManager:
             # ─────────────────────────────────────────────────────
             attempt = 0
             quota_switches = 0
+            failover_attempts = 0
+            max_failover_attempts = max(len(self.chain), 1)
             while attempt < 2:
                 stage = "text_generation"
                 saved_meta_before_send = self._sanitize_chat_metadata_before_send()
@@ -1565,6 +1777,7 @@ class SingleChatManager:
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
                     self._save_session()
+                    self._sync_active_session_slot()
 
                     # Cache kết quả (chỉ text response, không cache tool calls)
                     if ENABLE_RESPONSE_CACHE and not image_files and "<tool_call>" not in reply:
@@ -1670,9 +1883,14 @@ class SingleChatManager:
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
                             "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
                         )
-                        if len(self.chain) > 1 and await _await_with_deadline(
-                            self._try_failover_to_backup(), image_deadline
+                        if (
+                            failover_attempts < max_failover_attempts
+                            and len(self.chain) > 1
+                            and await _await_with_deadline(
+                                self._try_failover_to_backup(), image_deadline
+                            )
                         ):
+                            failover_attempts += 1
                             continue
 
                     if attempt == 0:
@@ -1702,9 +1920,14 @@ class SingleChatManager:
                                 f"Lỗi kết nối Gemini Web: {init_exc}", stage=stage
                             )
                         if not self._evaluate_auth():
-                            if len(self.chain) > 1 and await _await_with_deadline(
-                                self._try_failover_to_backup(), image_deadline
+                            if (
+                                failover_attempts < max_failover_attempts
+                                and len(self.chain) > 1
+                                and await _await_with_deadline(
+                                    self._try_failover_to_backup(), image_deadline
+                                )
                             ):
+                                failover_attempts += 1
                                 attempt += 1
                                 continue
                             if not (self.allow_guest and self.is_guest):
@@ -1862,6 +2085,7 @@ class SingleChatManager:
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
                     self._save_session()
+                    self._sync_active_session_slot()
                     for delta in vision_chunks:
                         yield "delta", delta
                     yield "done", full_text.strip()
@@ -1916,6 +2140,8 @@ class SingleChatManager:
             # Tầng 3: stream text
             attempt = 0
             quota_switches = 0
+            failover_attempts = 0
+            max_failover_attempts = max(len(self.chain), 1)
             yielded_any = False
             overall_stream_deadline = (
                 image_deadline
@@ -1969,6 +2195,7 @@ class SingleChatManager:
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
                     self._save_session()
+                    self._sync_active_session_slot()
 
                     if ENABLE_RESPONSE_CACHE and not image_files and "<tool_call>" not in reply:
                         set_cached_response(prompt_to_send, reply, self.default_model)
@@ -2129,9 +2356,14 @@ class SingleChatManager:
                             "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
                             "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
                         )
-                        if len(self.chain) > 1 and await _await_with_deadline(
-                            self._try_failover_to_backup(), image_deadline
+                        if (
+                            failover_attempts < max_failover_attempts
+                            and len(self.chain) > 1
+                            and await _await_with_deadline(
+                                self._try_failover_to_backup(), image_deadline
+                            )
                         ):
+                            failover_attempts += 1
                             continue
                     if attempt == 0:
                         saved_meta = self._chat_metadata_snapshot()
@@ -2166,9 +2398,14 @@ class SingleChatManager:
                             }
                             return
                         if not self._evaluate_auth():
-                            if len(self.chain) > 1 and await _await_with_deadline(
-                                self._try_failover_to_backup(), image_deadline
+                            if (
+                                failover_attempts < max_failover_attempts
+                                and len(self.chain) > 1
+                                and await _await_with_deadline(
+                                    self._try_failover_to_backup(), image_deadline
+                                )
                             ):
+                                failover_attempts += 1
                                 attempt += 1
                                 continue
                             if not (self.allow_guest and self.is_guest):

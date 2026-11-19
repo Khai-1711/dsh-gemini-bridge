@@ -7,7 +7,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -24,7 +24,11 @@ from gemini_webapi.exceptions import AuthError
 from datetime import datetime
 
 from app.accounts import save_state
-from app.activity import ActivityJournal, summarize_tool_calls
+from app.activity import (
+    ActivityJournal,
+    record_failed_tool_trace,
+    summarize_tool_calls,
+)
 from app.config import (
     ALLOW_INSECURE_LAN,
     ALLOWED_HOSTS,
@@ -54,7 +58,11 @@ from app.env_update import (
     update_env_values,
 )
 from app.errors import BridgeError
-from app.gemini_session import clear_response_cache, session_manager
+from app.gemini_session import (
+    clear_response_cache,
+    compute_session_key,
+    session_manager,
+)
 from app.lane_security import (
     check_bind_safety,
     is_host_header_allowed,
@@ -110,6 +118,9 @@ app = FastAPI(
 )
 
 activity = ActivityJournal(INSTANCE_PATHS["activity_file"], INSTANCE_ID)
+FAILURE_TRACES_FILE = LOG_DIR / (
+    f"failure_traces_{INSTANCE_ID}.jsonl" if INSTANCE_ID else "failure_traces.jsonl"
+)
 session_manager.on_event = lambda **kw: activity.write(**kw)
 
 # Gắn thư mục frontend tĩnh
@@ -330,13 +341,7 @@ async def _local_switch_model(model_name: Any, keep_chat: bool = True) -> Tuple[
 
     target = raw_str
     is_valid = False
-    if (
-        target.lower() in ("gemini-carbon", "gemini-pro", "gemini-flash-lite")
-        and "gemini-4-hydrogen" in (session_manager.available_models or [])
-    ):
-        is_valid = True
-        target = "gemini-4-hydrogen"
-    elif target.lower() in (
+    if target.lower() in (
         "unspecified", "", "1", "2", "gemini-1", "gemini-2", "lane-1", "lane-2",
         "lane1", "lane2", "worker-1", "worker-2", "worker1", "worker2",
         "acc1", "acc2", "acc-1", "acc-2", "model-1", "model-2", "default", "auto",
@@ -352,14 +357,29 @@ async def _local_switch_model(model_name: Any, keep_chat: bool = True) -> Tuple[
     else:
         t_low = target.lower()
         matched = None
-        for keyword in ("flash", "pro", "carbon", "hydrogen"):
-            if keyword in t_low:
-                for m in session_manager.available_models:
-                    if keyword in m.lower():
-                        matched = m
-                        break
-            if matched:
+        for detail in (getattr(session_manager, "model_details", None) or []):
+            d_name = str(detail.get("name", "")).strip()
+            disp = str(detail.get("display_name", "")).strip().lower()
+            desc = str(detail.get("description", "")).strip().lower()
+            if d_name and t_low in (disp, desc):
+                matched = d_name
                 break
+        if not matched:
+            for keyword in ("neon", "hydrogen", "carbon", "flash", "pro"):
+                if keyword in t_low:
+                    for m in session_manager.available_models:
+                        if keyword in m.lower():
+                            matched = m
+                            break
+                    if not matched:
+                        for detail in (getattr(session_manager, "model_details", None) or []):
+                            d_name = str(detail.get("name", "")).strip()
+                            meta_txt = f"{detail.get('display_name', '')} {detail.get('description', '')}".lower()
+                            if d_name and keyword in meta_txt:
+                                matched = d_name
+                                break
+                if matched:
+                    break
         if matched:
             target = matched
             is_valid = True
@@ -1033,8 +1053,6 @@ async def chat_completions(request: Request):
         "none", "unspecified", "gemini"
     ):
         model_id = session_manager.default_model
-    elif model_id.lower() in ("gemini-carbon", "gemini-pro", "gemini-flash-lite") and "gemini-4-hydrogen" in (session_manager.available_models or []):
-        model_id = "gemini-4-hydrogen"
     is_stream = body.get("stream", False)
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_ts = int(t0)
@@ -1197,17 +1215,25 @@ async def chat_completions(request: Request):
     else:
         model_id = session_manager.default_model
 
-    # Tự động nhận diện khi DSH mở New Session (chưa có tin nhắn assistant hoặc tool nào trong lịch sử)
-    has_prior_turns = any(
-        m.get("role") in ("assistant", "tool") for m in messages if isinstance(m, dict)
-    )
-    has_dirty_chat_id = bool(
-        getattr(session_manager, "chat_session", None)
-        and getattr(session_manager.chat_session, "cid", None)
-    )
-    if not has_prior_turns and (session_manager.turn_count > 0 or has_dirty_chat_id):
-        logger.info("[SESSION] Phát hiện phiên hội thoại mới từ DSH -> Tự động làm mới ChatSession để tránh lỗi 1097 và nạp lại Tool Header.")
-        await session_manager.reset_session()
+    # Sticky Session Pool: tách riêng ChatSession theo từng hội thoại/subagent
+    explicit_sid = (
+        request.headers.get("X-Session-Id")
+        or request.headers.get("X-DSH-Session-Id")
+        or ""
+    ).strip()
+    conv_key, is_new_conv = compute_session_key(messages, explicit_sid)
+    if hasattr(session_manager, "activate_session_slot"):
+        await session_manager.activate_session_slot(
+            conv_key, is_new_conversation=is_new_conv
+        )
+    else:
+        has_dirty_chat_id = bool(
+            getattr(session_manager, "chat_session", None)
+            and getattr(session_manager.chat_session, "cid", None)
+        )
+        if is_new_conv and (session_manager.turn_count > 0 or has_dirty_chat_id):
+            logger.info("[SESSION] Phát hiện phiên hội thoại mới từ DSH -> Tự động làm mới ChatSession để tránh lỗi 1097 và nạp lại Tool Header.")
+            await session_manager.reset_session()
 
     # Ghi nhận hội thoại và sổ sự thật (Ledger)
     session_manager.remember_transcript(messages)
@@ -1365,6 +1391,13 @@ async def chat_completions(request: Request):
                             tool_calls = repaired
                 if has_tool_call_intent(reply_text) and not tool_calls:
                     schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
+                    record_failed_tool_trace(
+                        FAILURE_TRACES_FILE,
+                        request_id=chat_id,
+                        model=model_id,
+                        reply_text=reply_text,
+                        reason="invalid_tool_call",
+                    )
                     error = {
                         "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
                         "type": "upstream_error",
@@ -1500,6 +1533,13 @@ async def chat_completions(request: Request):
                 tool_calls = repaired
     if has_tool_call_intent(reply_text) and not tool_calls:
         schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
+        record_failed_tool_trace(
+            FAILURE_TRACES_FILE,
+            request_id=chat_id,
+            model=model_id,
+            reply_text=reply_text,
+            reason="invalid_tool_call",
+        )
         error = {
             "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
             "type": "upstream_error",

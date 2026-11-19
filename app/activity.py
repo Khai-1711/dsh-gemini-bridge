@@ -2,6 +2,8 @@
 import json
 import logging
 import logging.handlers
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -105,3 +107,62 @@ def summarize_tool_calls(tool_calls) -> List[Dict[str, str]]:
         name = fn.get("name", "?")
         out.append({"name": str(name)[:80]})
     return out
+
+
+def record_failed_tool_trace(
+    path: Path,
+    *,
+    request_id: str,
+    model: str,
+    reply_text: str,
+    reason: str = "invalid_tool_call",
+    max_entries: int = 50,
+    max_reply_chars: int = 16000,
+) -> None:
+    """Ghi vòng tối đa 50 raw reply khi parse/repair tool call thất bại để phục vụ error analysis."""
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "request_id": str(request_id),
+            "model": str(model),
+            "reason": str(reason),
+            "reply_chars": len(reply_text or ""),
+            "reply_text": (reply_text or "")[:max_reply_chars],
+        }
+        existing: List[str] = []
+        if target.exists():
+            try:
+                existing = [
+                    line
+                    for line in target.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if line.strip()
+                ]
+            except OSError:
+                existing = []
+        keep = existing[-(max_entries - 1):] if max_entries > 1 else []
+        keep.append(json.dumps(entry, ensure_ascii=False))
+        tmp_name = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=".failure_traces_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_name = tmp.name
+                tmp.write("\n".join(keep) + "\n")
+                tmp.flush()
+            os.replace(tmp_name, target)
+            tmp_name = None
+        finally:
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+    except Exception:
+        pass

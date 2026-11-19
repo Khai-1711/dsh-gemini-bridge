@@ -18,21 +18,54 @@ class ToolCallAwareStreamer:
         self._buf = ""               # held text not yet emitted as content
         self._full: list[str] = []   # every fed delta (authoritative full text)
         self._in_tool = False
+        self._in_string = False
+        self._escaped = False
 
     def feed(self, delta: str) -> list[str]:
         """Feed an incremental delta; returns content pieces to emit now."""
         self._full.append(delta)
         self._buf += delta
         out: list[str] = []
-        while True:
+        while self._buf:
             if self._in_tool:
-                idx = self._buf.find(self.CLOSE)
-                if idx == -1:
-                    hold = self._partial_suffix(self._buf, self.CLOSE)
-                    self._buf = self._buf[-hold:] if hold else ""
-                    break
-                self._buf = self._buf[idx + len(self.CLOSE):]
-                self._in_tool = False
+                i = 0
+                buf = self._buf
+                n = len(buf)
+                closed_at = -1
+                hold_from = -1
+                while i < n:
+                    ch = buf[i]
+                    if self._in_string:
+                        if self._escaped:
+                            self._escaped = False
+                        elif ch == "\\":
+                            self._escaped = True
+                        elif ch == '"':
+                            self._in_string = False
+                        i += 1
+                    else:
+                        if ch == "<" and buf.startswith(self.CLOSE, i):
+                            closed_at = i
+                            break
+                        if ch == "<" and (n - i) < len(self.CLOSE) and self.CLOSE.startswith(buf[i:]):
+                            hold_from = i
+                            break
+                        if ch == '"':
+                            self._in_string = True
+                            self._escaped = False
+                        i += 1
+
+                if closed_at != -1:
+                    self._buf = buf[closed_at + len(self.CLOSE):]
+                    self._in_tool = False
+                    self._in_string = False
+                    self._escaped = False
+                    continue
+                if hold_from != -1:
+                    self._buf = buf[hold_from:]
+                else:
+                    self._buf = ""
+                break
             else:
                 idx = self._buf.find(self.OPEN)
                 if idx == -1:
@@ -47,6 +80,8 @@ class ToolCallAwareStreamer:
                 out.append(self._buf[:idx])
                 self._buf = self._buf[idx + len(self.OPEN):]
                 self._in_tool = True
+                self._in_string = False
+                self._escaped = False
         return [p for p in out if p]
 
     def flush(self) -> list[str]:

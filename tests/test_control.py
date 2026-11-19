@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -568,8 +567,7 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
 
         async def malformed_stream(prompt, image_files):
             yield "done", (
-                '<tool_call>{"name":"Inspect","arguments":'
-                '{"format":"summary" "max_items":3}}</tool_call>'
+                '<tool_call>{"name":"Inspect","arguments":{"format":"summary"'
             )
 
         with patch.object(session_manager, "require_on"), \
@@ -620,10 +618,7 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
                  session_manager,
                  "send_prepared_turn",
                  new_callable=AsyncMock,
-                 return_value=(
-                     '<tool_call>{"name":"Inspect","arguments":'
-                     '{"format":"summary" "max_items":3}}</tool_call>'
-                 ),
+                 return_value='```tool_call\nnot valid json at all\n```',
              ), \
              patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
              patch("main.repair_tool_call_active", new_callable=AsyncMock, return_value=None), \

@@ -91,30 +91,32 @@ def spawn_local_lane(lane_id: str) -> bool:
         log_dir = base_dir / "logs"
         log_dir.mkdir(exist_ok=True)
         spawn_log = open(log_dir / f"spawn_{lane_id}.log", "a", encoding="utf-8")
-
-        if sys.platform == "win32":
-            CREATE_NO_WINDOW = 0x08000000
-            CREATE_NEW_PROCESS_GROUP = 0x00000200
-            flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-            subprocess.Popen(
-                [sys.executable, str(base_dir / "main.py")],
-                cwd=str(base_dir),
-                env=env,
-                creationflags=flags,
-                stdout=spawn_log,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
-            )
-        else:
-            subprocess.Popen(
-                [sys.executable, str(base_dir / "main.py")],
-                cwd=str(base_dir),
-                env=env,
-                stdout=spawn_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
-            )
+        try:
+            if sys.platform == "win32":
+                CREATE_NO_WINDOW = 0x08000000
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+                subprocess.Popen(
+                    [sys.executable, str(base_dir / "main.py")],
+                    cwd=str(base_dir),
+                    env=env,
+                    creationflags=flags,
+                    stdout=spawn_log,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
+            else:
+                subprocess.Popen(
+                    [sys.executable, str(base_dir / "main.py")],
+                    cwd=str(base_dir),
+                    env=env,
+                    stdout=spawn_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+        finally:
+            spawn_log.close()
         return True
     except Exception as exc:
         logger.error(f"[LANE] Lỗi spawn tiến trình '{lane_id}': {exc}")
@@ -325,6 +327,15 @@ class LaneRegistry:
         self.is_frontend_gateway = is_frontend_gateway
         self._peer_status_cache: Dict[str, Dict[str, Any]] = {}
         self._peer_cache_ts: Dict[str, float] = {}
+        self._lane_locks: Dict[str, asyncio.Lock] = {}
+        self._cache_lock = asyncio.Lock()
+
+    def _get_lane_lock(self, lane_id: str) -> asyncio.Lock:
+        lock = self._lane_locks.get(lane_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._lane_locks[lane_id] = lock
+        return lock
 
     async def list_lanes(self, local_status: dict, force_refresh: bool = False) -> List[Dict[str, Any]]:
         lanes = [] if self.is_frontend_gateway else [local_status]
@@ -334,8 +345,10 @@ class LaneRegistry:
         now = time.time()
 
         for peer_id, base_url in self.peers.items():
-            cached = self._peer_status_cache.get(peer_id)
-            cached_age = now - self._peer_cache_ts.get(peer_id, 0.0)
+            async with self._cache_lock:
+                cached = self._peer_status_cache.get(peer_id)
+                cached_ts = self._peer_cache_ts.get(peer_id, 0.0)
+            cached_age = now - cached_ts
             if not force_refresh and cached and (cached_age < self.cache_ttl) and (
                 cached.get("reachable") is False or cached.get("control") == "off"
             ):
@@ -399,8 +412,9 @@ class LaneRegistry:
                             "env_file": chk_file,
                             "id_status": "ready" if chk_has else "missing",
                         }
-                self._peer_status_cache[p_id] = dict(lane)
-                self._peer_cache_ts[p_id] = time.time()
+                async with self._cache_lock:
+                    self._peer_status_cache[p_id] = dict(lane)
+                    self._peer_cache_ts[p_id] = time.time()
                 peer_results[p_id] = lane
 
         lanes.extend(peer_results[peer_id] for peer_id in self.peers if peer_id in peer_results)
@@ -433,64 +447,68 @@ class LaneRegistry:
             "X-Lane-Token": self.token,
             "Content-Type": "application/json",
         }
-        cached = self._peer_status_cache.get(lane_id)
-        is_known_down = bool(cached and cached.get("reachable") is False)
-        call_timeout = 2.0 if (action == "enable" and (is_known_down or self.spawn_fn)) else timeout
-        status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=call_timeout)
-        if status_code == 0 and action == "enable" and self.spawn_fn and is_loopback_url(peer_url):
-            if self.spawn_fn(lane_id):
-                for _ in range(12):
-                    await asyncio.sleep(0.8)
-                    st_code, st_body = await self.http_call("GET", f"{peer_url}/v1/lanes/{lane_id}/status", headers=headers, body=None, timeout=2.0)
-                    if st_code == 200 and isinstance(st_body, dict):
-                        if st_body.get("state") != "on":
-                            status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=timeout)
-                        else:
-                            status_code, body = 200, st_body
-                        break
+        async with self._get_lane_lock(lane_id):
+            async with self._cache_lock:
+                cached = self._peer_status_cache.get(lane_id)
+            is_known_down = bool(cached and cached.get("reachable") is False)
+            call_timeout = 2.0 if (action == "enable" and (is_known_down or self.spawn_fn)) else timeout
+            status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=call_timeout)
+            if status_code == 0 and action == "enable" and self.spawn_fn and is_loopback_url(peer_url):
+                if self.spawn_fn(lane_id):
+                    for _ in range(12):
+                        await asyncio.sleep(0.8)
+                        st_code, st_body = await self.http_call("GET", f"{peer_url}/v1/lanes/{lane_id}/status", headers=headers, body=None, timeout=2.0)
+                        if st_code == 200 and isinstance(st_body, dict):
+                            if st_body.get("state") != "on":
+                                status_code, body = await self.http_call("POST", target_url, headers=headers, body=b"{}", timeout=timeout)
+                            else:
+                                status_code, body = 200, st_body
+                            break
 
-        if status_code == 0:
-            err = body.get("error") if isinstance(body, dict) else "unreachable"
-            self._peer_status_cache[lane_id] = {
-                "id": lane_id,
-                "label": lane_id,
-                "url": peer_url,
-                "port": _port_from_url(peer_url),
-                "is_self": False,
-                "reachable": False,
-                "error": err,
-                "control": "off",
-                "controllable": bool(self.token),
-            }
-            self._peer_cache_ts[lane_id] = time.time()
-            return 502, {"error": {"code": "peer_unreachable", "message": f"Không kết nối được tới luồng {lane_id}: {err}"}}
+            if status_code == 0:
+                err = body.get("error") if isinstance(body, dict) else "unreachable"
+                async with self._cache_lock:
+                    self._peer_status_cache[lane_id] = {
+                        "id": lane_id,
+                        "label": lane_id,
+                        "url": peer_url,
+                        "port": _port_from_url(peer_url),
+                        "is_self": False,
+                        "reachable": False,
+                        "error": err,
+                        "control": "off",
+                        "controllable": bool(self.token),
+                    }
+                    self._peer_cache_ts[lane_id] = time.time()
+                return 502, {"error": {"code": "peer_unreachable", "message": f"Không kết nối được tới luồng {lane_id}: {err}"}}
 
-        if 200 <= status_code < 300:
-            cached = dict(self._peer_status_cache.get(lane_id, {}))
-            cached.update({
-                "id": lane_id,
-                "label": (body.get("instance_label") or lane_id) if isinstance(body, dict) else lane_id,
-                "url": peer_url,
-                "port": _port_from_url(peer_url),
-                "is_self": False,
-                "reachable": True,
-                "controllable": bool(self.token),
-            })
-            if isinstance(body, dict):
-                cached.update({key: body[key] for key in ("control", "state", "auth_ok") if key in body})
-                if "state" in body:
-                    cached["control"] = body["state"]
-                elif action == "enable":
-                    cached["control"] = "starting"
-                elif action == "disable":
-                    cached["control"] = "stopping"
-            elif action == "enable":
-                cached["control"] = "starting"
-            elif action == "disable":
-                cached["control"] = "stopping"
-            self._peer_status_cache[lane_id] = cached
-            self._peer_cache_ts[lane_id] = 0.0
-        return status_code, body or {}
+            if 200 <= status_code < 300:
+                async with self._cache_lock:
+                    cached_entry = dict(self._peer_status_cache.get(lane_id, {}))
+                    cached_entry.update({
+                        "id": lane_id,
+                        "label": (body.get("instance_label") or lane_id) if isinstance(body, dict) else lane_id,
+                        "url": peer_url,
+                        "port": _port_from_url(peer_url),
+                        "is_self": False,
+                        "reachable": True,
+                        "controllable": bool(self.token),
+                    })
+                    if isinstance(body, dict):
+                        cached_entry.update({key: body[key] for key in ("control", "state", "auth_ok") if key in body})
+                        if "state" in body:
+                            cached_entry["control"] = body["state"]
+                        elif action == "enable":
+                            cached_entry["control"] = "starting"
+                        elif action == "disable":
+                            cached_entry["control"] = "stopping"
+                    elif action == "enable":
+                        cached_entry["control"] = "starting"
+                    elif action == "disable":
+                        cached_entry["control"] = "stopping"
+                    self._peer_status_cache[lane_id] = cached_entry
+                    self._peer_cache_ts[lane_id] = 0.0
+            return status_code, body or {}
 
     async def proxy_request(
         self,
@@ -522,19 +540,20 @@ class LaneRegistry:
         )
         if status_code == 0:
             err = resp_body.get("error") if isinstance(resp_body, dict) else "unreachable"
-            cached = dict(self._peer_status_cache.get(lane_id, {}))
-            cached.update({
-                "id": lane_id,
-                "label": cached.get("label") or lane_id,
-                "url": peer_url,
-                "port": _port_from_url(peer_url),
-                "is_self": False,
-                "reachable": False,
-                "error": err,
-                "controllable": bool(self.token),
-            })
-            self._peer_status_cache[lane_id] = cached
-            self._peer_cache_ts[lane_id] = time.time()
+            async with self._cache_lock:
+                cached = dict(self._peer_status_cache.get(lane_id, {}))
+                cached.update({
+                    "id": lane_id,
+                    "label": cached.get("label") or lane_id,
+                    "url": peer_url,
+                    "port": _port_from_url(peer_url),
+                    "is_self": False,
+                    "reachable": False,
+                    "error": err,
+                    "controllable": bool(self.token),
+                })
+                self._peer_status_cache[lane_id] = cached
+                self._peer_cache_ts[lane_id] = time.time()
             return 502, {
                 "error": {
                     "code": "peer_unreachable",

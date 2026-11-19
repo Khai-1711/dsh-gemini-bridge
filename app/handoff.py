@@ -4,8 +4,10 @@ Module THUẦN TÚY: không import app.config. Ledger chỉ lưu "con trỏ" (t�
 của lệnh, thành công/lỗi), tuyệt đối không lưu nội dung file và không lưu cookie.
 """
 import json
+import logging
 import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Dict, List
 
@@ -161,16 +163,31 @@ class FactLedger:
             pass
 
     def _save(self) -> None:
+        tmp_name = None
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2),
+            with tempfile.NamedTemporaryFile(
+                mode="w",
                 encoding="utf-8",
+                dir=self.dir,
+                prefix=".ledger_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_name = tmp.name
+                tmp.write(json.dumps(self.data, ensure_ascii=False, indent=2))
+                tmp.flush()
+            os.replace(tmp_name, self.path)
+            tmp_name = None
+        except Exception as exc:
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+            logging.getLogger("dsh_bridge").warning(
+                "Khong luu duoc FactLedger (%s): %s", type(exc).__name__, exc
             )
-            os.replace(tmp, self.path)
-        except Exception:
-            pass
 
     def note_user_goal(self, text) -> None:
         try:
