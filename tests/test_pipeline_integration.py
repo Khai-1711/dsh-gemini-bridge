@@ -10,7 +10,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import httpx
 from fastapi.testclient import TestClient
 
 os.environ.pop("BRIDGE_INSTANCE", None)
@@ -19,14 +18,12 @@ os.environ.setdefault("SECURE_1PSIDTS", "mock_psidts")
 
 import main as app_main
 from app import gemini_session as gs
-from app import tool_repair as app_tool_repair
 from app.activity import record_failed_tool_trace
 from app.errors import BridgeAuthError
 from app.handoff import FactLedger
 from app.lanes import LaneRegistry, spawn_local_lane
 from app.streaming import ToolCallAwareStreamer
 from app.tool_parser import has_tool_call_intent, parse_tool_calls_from_reply
-from app.tool_repair import repair_tool_call_active
 
 
 class TestToolPipelineStateMachine(unittest.TestCase):
@@ -172,45 +169,12 @@ class TestEndToEndChatCompletions(unittest.TestCase):
             }
         ]
 
-    def test_chat_completions_stream_and_nonstream_with_mock_repair_and_trace_ring(self):
+    def test_chat_completions_stream_and_nonstream_with_deterministic_repair_and_trace_ring(self):
         with tempfile.TemporaryDirectory() as td:
             trace_file = Path(td) / "failure_traces.jsonl"
 
-            def _handler(request: httpx.Request) -> httpx.Response:
-                if request.url.path == "/health":
-                    return httpx.Response(200)
-                if request.url.path == "/slots":
-                    return httpx.Response(200, json=[{"id": 0, "is_processing": False}])
-                return httpx.Response(
-                    200,
-                    json={
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": '{"name":"Inspect","arguments":{"format":"summary","max_items":3}}'
-                                }
-                            }
-                        ]
-                    },
-                )
-
-            transport = httpx.MockTransport(_handler)
-
-            async def _fake_active_repair(reply_text, tools_map, request_id="test"):
-                return await repair_tool_call_active(
-                    reply_text,
-                    tools_map,
-                    request_id=request_id,
-                    endpoint="http://127.0.0.1:8000/v1/chat/completions",
-                    model="test-nemotron",
-                    timeout=2.0,
-                    transport=transport,
-                )
-
             with patch.object(app_main, "API_KEY", ""), \
                  patch.object(app_main, "FAILURE_TRACES_FILE", trace_file), \
-                 patch.object(app_main, "TOOL_REPAIR_ENABLED", True), \
-                 patch.object(app_tool_repair, "TOOL_REPAIR_ENABLED", True), \
                  patch.object(app_main.activity, "write"), \
                  patch.object(app_main.session_manager, "require_on"), \
                  patch.object(
@@ -223,24 +187,20 @@ class TestEndToEndChatCompletions(unittest.TestCase):
                      app_main.session_manager,
                      "activate_session_slot",
                      new_callable=AsyncMock,
-                 ), \
-                 patch("main.repair_tool_call_active", new=_fake_active_repair):
+                 ):
                 client = TestClient(app_main.app, base_url="http://127.0.0.1:10001")
 
-                # 1. Non-stream where parser rejects nested missing-required call
-                #    so main calls repair_tool_call_active (MockTransport returns valid Inspect)
+                # 1. Non-stream where syntax-broken tagged call is deterministically repaired via json-repair
                 bad_single = (
                     '<tool_call>{"name":"Inspect","arguments":{"format":"summary" '
                     '"max_items":3}}</tool_call>'
                 )
-                # Force parse_tool_calls_from_reply -> [] on first pass so active repair path runs
-                with patch("main.parse_tool_calls_from_reply", return_value=[]), \
-                     patch.object(
-                         app_main.session_manager,
-                         "send_prepared_turn",
-                         new_callable=AsyncMock,
-                         return_value=bad_single,
-                     ):
+                with patch.object(
+                    app_main.session_manager,
+                    "send_prepared_turn",
+                    new_callable=AsyncMock,
+                    return_value=bad_single,
+                ):
                     resp = client.post(
                         "/v1/chat/completions",
                         json={
@@ -267,7 +227,7 @@ class TestEndToEndChatCompletions(unittest.TestCase):
                     app_main.session_manager,
                     "send_prepared_turn_stream",
                     new=_truncated_stream,
-                ), patch.object(app_main, "TOOL_REPAIR_ENABLED", False):
+                ):
                     stream_resp = client.post(
                         "/v1/chat/completions",
                         json={

@@ -37,7 +37,6 @@ from app.config import (
     BASE_DIR,
     BRIDGE_LOG_FILE,
     DISABLE_DRAIN_TIMEOUT,
-    ENABLE_RESPONSE_CACHE,
     FORBIDDEN_TOOLS,
     HOST,
     INSTANCE_ID,
@@ -48,7 +47,6 @@ from app.config import (
     PEER_LANES,
     PORT,
     SSE_HEARTBEAT_INTERVAL,
-    TOOL_REPAIR_ENABLED,
     logger,
 )
 from app.control import is_origin_allowed
@@ -77,15 +75,9 @@ from app.prompt_builder import (
 )
 from app.streaming import ToolCallAwareStreamer
 from app.tool_parser import has_tool_call_intent, parse_tool_calls_from_reply
-from app.tool_repair import (
-    repair_tool_call_active,
-    schedule_tool_repair_shadow,
-    validate_tool_repair_settings,
-)
 from app.title_generation import extract_local_title_request
 
 FRONTEND_DIR = BASE_DIR / "frontend"
-validate_tool_repair_settings()
 
 
 @asynccontextmanager
@@ -341,12 +333,7 @@ async def _local_switch_model(model_name: Any, keep_chat: bool = True) -> Tuple[
 
     target = raw_str
     is_valid = False
-    if target.lower() in (
-        "unspecified", "", "1", "2", "gemini-1", "gemini-2", "lane-1", "lane-2",
-        "lane1", "lane2", "worker-1", "worker-2", "worker1", "worker2",
-        "acc1", "acc2", "acc-1", "acc-2", "model-1", "model-2", "default", "auto",
-        "none", "gemini"
-    ):
+    if target.lower() in ("unspecified", "", "default", "auto", "none", "gemini"):
         is_valid = True
         target = session_manager.default_model or "unspecified"
     elif session_manager.available_models and target in session_manager.available_models:
@@ -663,7 +650,7 @@ async def list_lanes(refresh: bool = False):
         port=PORT,
         instance_id=INSTANCE_ID or "default",
         instance_label=INSTANCE_LABEL or (INSTANCE_ID or "default"),
-        cache_enabled=ENABLE_RESPONSE_CACHE,
+        cache_enabled=False,
     )
     if refresh:
         lanes = await lane_registry.list_lanes(local_st, force_refresh=True)
@@ -1046,12 +1033,7 @@ async def chat_completions(request: Request):
 
     requested_model = str(body.get("model") or session_manager.default_model).strip()
     model_id = requested_model or session_manager.default_model
-    if model_id.lower() in (
-        "1", "2", "gemini-1", "gemini-2", "lane-1", "lane-2",
-        "lane1", "lane2", "worker-1", "worker-2", "worker1", "worker2",
-        "acc1", "acc2", "acc-1", "acc-2", "model-1", "model-2", "default", "auto",
-        "none", "unspecified", "gemini"
-    ):
+    if model_id.lower() in ("default", "auto", "none", "unspecified", "gemini"):
         model_id = session_manager.default_model
     is_stream = body.get("stream", False)
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -1385,12 +1367,6 @@ async def chat_completions(request: Request):
                 reply_text = done_text if done_text is not None else splitter.full_text
                 tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
                 if has_tool_call_intent(reply_text) and not tool_calls:
-                    if TOOL_REPAIR_ENABLED:
-                        repaired = await repair_tool_call_active(reply_text, tools_map, chat_id)
-                        if repaired:
-                            tool_calls = repaired
-                if has_tool_call_intent(reply_text) and not tool_calls:
-                    schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
                     record_failed_tool_trace(
                         FAILURE_TRACES_FILE,
                         request_id=chat_id,
@@ -1527,12 +1503,6 @@ async def chat_completions(request: Request):
         )
     tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
     if has_tool_call_intent(reply_text) and not tool_calls:
-        if TOOL_REPAIR_ENABLED:
-            repaired = await repair_tool_call_active(reply_text, tools_map, chat_id)
-            if repaired:
-                tool_calls = repaired
-    if has_tool_call_intent(reply_text) and not tool_calls:
-        schedule_tool_repair_shadow(reply_text, tools_map, chat_id)
         record_failed_tool_trace(
             FAILURE_TRACES_FILE,
             request_id=chat_id,

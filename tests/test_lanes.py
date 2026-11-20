@@ -418,16 +418,21 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(code, 200)
             self.assertEqual(res["active_model"], "gemini-flash")
 
-            # Case 5: Model alias 1, 2 (int/str), acc1/acc2 và keyword matching
+            # Case 5: Real default aliases + keyword matching; fake lane aliases rejected
             mock_sw.return_value = "gemini-pro"
-            code, res = await _local_switch_model(1)
+            code, res = await _local_switch_model("default")
             self.assertEqual(code, 200)
 
-            code, res = await _local_switch_model("2")
+            code, res = await _local_switch_model("auto")
             self.assertEqual(code, 200)
 
-            code, res = await _local_switch_model("acc1")
-            self.assertEqual(code, 200)
+            code, err = await _local_switch_model("lane-1")
+            self.assertEqual(code, 400)
+            self.assertEqual(err["error"]["code"], "model_not_available")
+
+            code, err = await _local_switch_model("acc1")
+            self.assertEqual(code, 400)
+            self.assertEqual(err["error"]["code"], "model_not_available")
 
             mock_sw.return_value = "gemini-flash"
             code, res = await _local_switch_model("gemini-2.0-flash")

@@ -28,7 +28,6 @@ from app.config import (
     BASE_DIR,
     BRIDGE_DEBUG_FAKE_QUOTA,
     DISABLE_DRAIN_TIMEOUT,
-    ENABLE_RESPONSE_CACHE,
     GEMINI_HARD_TIMEOUT,
     HANDOFF_ENABLE,
     HANDOFF_FLASH_TIMEOUT,
@@ -64,15 +63,8 @@ from app.handoff import (
     build_handoff_message,
     parse_sections,
 )
-from app.vision import cleanup_temp_images, extract_text_from_image_local
+from app.vision import cleanup_temp_images
 
-# =====================================================================
-# RESPONSE CACHE (TTL-based, tránh gọi lại prompt lặp)
-# =====================================================================
-_response_cache: Dict[str, Tuple[float, str]] = {}
-CACHE_TTL = 300  # 5 phút
-MAX_CACHE_SIZE = 50
-VISION_STREAM_BUFFER_MAX_BYTES = 1024 * 1024
 MODEL_FIRST_BYTE_FALLBACK_TIMEOUT = 35.0
 SESSION_POOL_MAX_SIZE = 16
 SESSION_POOL_TTL = 3600.0
@@ -153,11 +145,6 @@ def compute_session_key(
     return hashlib.sha256(material).hexdigest()[:16], is_new_conversation
 
 
-def _cache_key(prompt: str, model: str = "") -> str:
-    material = f"{model}\x00{prompt}".encode("utf-8", errors="replace")
-    return hashlib.sha256(material).hexdigest()[:16]
-
-
 def _request_deadline(timeout: float) -> float:
     return asyncio.get_running_loop().time() + timeout
 
@@ -198,61 +185,9 @@ async def _iterate_stream_until(
         yield item
 
 
-def _cleanup_after_ocr_worker(task: asyncio.Task, image_files: List[str]) -> None:
-    cleanup_temp_images(image_files)
-    if not task.cancelled():
-        error = task.exception()
-        if error is not None:
-            logger.warning(
-                "Local OCR worker failed after request ended (%s).",
-                type(error).__name__,
-            )
-
-
-async def _extract_text_with_deadline(
-    image_path: str, image_files: List[str], deadline: Optional[float]
-) -> str:
-    task = asyncio.create_task(
-        asyncio.to_thread(extract_text_from_image_local, image_path)
-    )
-    try:
-        if deadline is None:
-            return await asyncio.shield(task)
-        return await asyncio.wait_for(
-            asyncio.shield(task), timeout=_remaining_timeout(deadline)
-        )
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        task.add_done_callback(
-            lambda completed: _cleanup_after_ocr_worker(completed, image_files)
-        )
-        raise
-
-
-def get_cached_response(prompt: str, model: str = "") -> Optional[str]:
-    """Tìm response đã cache cho prompt (theo hash, gồm cả model)."""
-    key = _cache_key(prompt, model)
-    if key in _response_cache:
-        ts, resp = _response_cache[key]
-        if time.time() - ts < CACHE_TTL:
-            logger.info(f"[CACHE HIT] hash={key}")
-            return resp
-        del _response_cache[key]
-    return None
-
-
-def set_cached_response(prompt: str, response: str, model: str = "") -> None:
-    """Lưu response vào cache. Tự xóa entry cũ nhất khi đầy."""
-    if len(_response_cache) >= MAX_CACHE_SIZE:
-        oldest_key = min(_response_cache, key=lambda k: _response_cache[k][0])
-        del _response_cache[oldest_key]
-    _response_cache[_cache_key(prompt, model)] = (time.time(), response)
-
-
 def clear_response_cache() -> int:
-    """Xóa toàn bộ cache. Trả về số entry đã xóa."""
-    count = len(_response_cache)
-    _response_cache.clear()
-    return count
+    """No-op compatibility endpoint after prompt cache removal."""
+    return 0
 
 
 # =====================================================================
@@ -380,7 +315,6 @@ class SingleChatManager:
         self._active_psid: str = initial_acc["psid"]
         self._last_recover_ts: float = 0.0
         self.last_tool_header: str = ""
-        self.vision_disabled_until: float = 0.0
         self._consecutive_transient_errors: int = 0
 
         # T24b: Ghi chain file và kiểm tra trùng lặp giữa các instance
@@ -417,7 +351,7 @@ class SingleChatManager:
 
     @property
     def vision_upload_available(self) -> bool:
-        return time.time() >= self.vision_disabled_until
+        return not self.is_guest
 
     def _is_auth_error(self, exc: BaseException) -> bool:
         if isinstance(exc, AuthError):
@@ -1115,7 +1049,6 @@ class SingleChatManager:
             self._ensure_default_model()
             self._create_new_chat_session()
             clear_saved_session()
-            self.vision_disabled_until = 0.0
             self._consecutive_auth_errors = 0
             self._using_backup = False
             if not ok:
@@ -1180,7 +1113,6 @@ class SingleChatManager:
                     self._ensure_default_model()
                     self._create_new_chat_session()
                     clear_saved_session()
-                    self.vision_disabled_until = 0.0
                     self._consecutive_auth_errors = 0
                     if not ok:
                         raise AuthError("Cookie mới không đăng nhập được (guest mode hoặc cookie hết hạn)")
@@ -1262,7 +1194,6 @@ class SingleChatManager:
         self._create_new_chat_session()
         self._ensure_session_pool().clear()
         self._sync_active_session_slot()
-        self.vision_disabled_until = 0.0
         self._consecutive_auth_errors = 0
         self._consecutive_transient_errors = 0
         self._using_backup = index > 0
@@ -1442,7 +1373,6 @@ class SingleChatManager:
             self._ensure_session_pool().clear()
             self._active_session_key = "default"
             clear_saved_session()
-            self.vision_disabled_until = 0.0
             logger.info(f"Đã làm mới phiên ChatSession (Model: {self.default_model}).")
 
     async def close(self) -> None:
@@ -1567,8 +1497,8 @@ class SingleChatManager:
             "uptime_seconds": int(uptime),
             "using_backup_cookie": self._using_backup,
             "vision_upload_available": self.vision_upload_available,
-            "cache_entries": len(_response_cache),
-            "cache_enabled": bool(ENABLE_RESPONSE_CACHE),
+            "cache_entries": 0,
+            "cache_enabled": False,
             "inflight": self._inflight,
             "chat_key": self.current_chat_key(),
             "last_activity_ts": last_act,
@@ -1609,12 +1539,6 @@ class SingleChatManager:
             _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
         )
 
-        # Kiểm tra cache (chỉ khi bật cache và prompt không có ảnh)
-        if ENABLE_RESPONSE_CACHE and not image_files:
-            cached = get_cached_response(prompt_to_send, self.default_model)
-            if cached:
-                return cached
-
         # Lock với timeout — trả lỗi thay vì chờ vô hạn (M2)
         try:
             lock_timeout = (
@@ -1653,96 +1577,18 @@ class SingleChatManager:
                 self._create_new_chat_session()
 
             base_prompt = prompt_to_send
-
-            # ─────────────────────────────────────────────────────
-            # TẦNG 1: Gửi ảnh trực tiếp lên Gemini (nếu có ảnh)
-            # ─────────────────────────────────────────────────────
-            if image_files and self.vision_upload_available and not self.is_guest:
-                try:
-                    stage = "vision_upload"
-                    logger.info(
-                        f"[Vision Layer 1] Upload {len(image_files)} ảnh lên Gemini..."
-                    )
-                    prompt_with_header = self._ensure_header_in_prompt(
-                        self._apply_pending_handoff(base_prompt),
-                        include_tool_header,
-                    )
-                    coro = self.chat_session.send_message(
-                        prompt_with_header, files=image_files
-                    )
-                    response = await asyncio.wait_for(
-                        coro,
-                        timeout=(
-                            _remaining_timeout(
-                                image_deadline,
-                                min(GEMINI_HARD_TIMEOUT, IMAGE_REQUEST_TIMEOUT / 2),
-                            )
-                            if image_deadline is not None
-                            else GEMINI_HARD_TIMEOUT
-                        ),
-                    )
-                    self.last_request_ts = time.time()
-                    reply = (response.text or "").strip()
-                    del response
-                    self.session_initialized = True
-                    self._mark_tool_header_sent(include_tool_header)
-                    self.turn_count += 1
-                    self._consecutive_auth_errors = 0
-                    self._consecutive_transient_errors = 0
-                    self._pending_handoff = None
-                    self._save_session()
-                    self._sync_active_session_slot()
-                    return reply
-                except Exception as img_exc:
-                    if (
-                        image_deadline is not None
-                        and image_deadline <= asyncio.get_running_loop().time()
-                    ):
-                        raise asyncio.TimeoutError from img_exc
-                    if (self._is_auth_error(img_exc) or not self._evaluate_auth()) and not (self.allow_guest and self.is_guest):
-                        raise BridgeAuthError(
-                            "Gemini chưa đăng nhập (guest/cookie hết hạn).",
-                            stage=stage,
-                        )
-                    logger.warning(
-                        f"Upload ảnh thất bại ({img_exc}). --> Chuyển sang Local OCR!"
-                    )
-                    self.vision_disabled_until = time.time() + 300
-
-            # ─────────────────────────────────────────────────────
-            # TẦNG 2: Local OCR fallback (cross-platform)
-            # ─────────────────────────────────────────────────────
-            if image_files:
-                stage = "ocr"
-                ocr_blocks = []
-                for idx, img_p in enumerate(image_files, 1):
-                    logger.info(
-                        f"[Vision Layer 2] Quét chữ từ ảnh #{idx} bằng Local OCR..."
-                    )
-                    ocr_text = await _extract_text_with_deadline(
-                        img_p, image_files, image_deadline
-                    )
-                    ocr_blocks.append(
-                        f"=== [EXTRACTED TEXT FROM IMAGE #{idx}] ===\n"
-                        f"{ocr_text}\n"
-                        f"========================================"
-                    )
-                base_prompt = (
-                    "\n\n".join(ocr_blocks)
-                    + "\n\n(Above is text extracted from the user's screenshot. "
-                    "Analyze and respond in the SAME LANGUAGE as the user.)\n\n"
-                    + base_prompt
+            if image_files and not self.vision_upload_available:
+                raise BridgeAuthError(
+                    "Gửi ảnh yêu cầu đăng nhập cookie Gemini (không hỗ trợ ở chế độ Guest).",
+                    stage="vision_upload",
                 )
 
-            # ─────────────────────────────────────────────────────
-            # TẦNG 3: Gửi qua cổng Text (luôn sống với 1PSID)
-            # ─────────────────────────────────────────────────────
             attempt = 0
             quota_switches = 0
             failover_attempts = 0
             max_failover_attempts = max(len(self.chain), 1)
             while attempt < 2:
-                stage = "text_generation"
+                stage = "vision_upload" if image_files else "text_generation"
                 saved_meta_before_send = self._sanitize_chat_metadata_before_send()
                 prompt_to_send = self._ensure_header_in_prompt(
                     self._apply_pending_handoff(base_prompt),
@@ -1755,9 +1601,14 @@ class SingleChatManager:
 
                     logger.info(
                         f"Gửi vào ChatSession (Turn={self.turn_count + 1} | "
-                        f"Chars={len(prompt_to_send)})"
+                        f"Chars={len(prompt_to_send)}"
+                        f"{f' | Images={len(image_files)}' if image_files else ''})"
                     )
-                    coro = self.chat_session.send_message(prompt_to_send)
+                    coro = (
+                        self.chat_session.send_message(prompt_to_send, files=image_files)
+                        if image_files
+                        else self.chat_session.send_message(prompt_to_send)
+                    )
                     response = await asyncio.wait_for(
                         coro,
                         timeout=(
@@ -1778,10 +1629,6 @@ class SingleChatManager:
                     self._pending_handoff = None
                     self._save_session()
                     self._sync_active_session_slot()
-
-                    # Cache kết quả (chỉ text response, không cache tool calls)
-                    if ENABLE_RESPONSE_CACHE and not image_files and "<tool_call>" not in reply:
-                        set_cached_response(prompt_to_send, reply, self.default_model)
 
                     # Dọn bộ đệm ngầm mỗi 15 lượt
                     if (
@@ -2039,105 +1886,15 @@ class SingleChatManager:
                 self._create_new_chat_session()
 
             base_prompt = prompt_to_send
+            if image_files and not self.vision_upload_available:
+                yield "error", {
+                    "message": "Gửi ảnh yêu cầu đăng nhập cookie Gemini (không hỗ trợ ở chế độ Guest).",
+                    "type": BridgeAuthError.err_type,
+                    "code": BridgeAuthError.code,
+                    "stage": "vision_upload",
+                }
+                return
 
-            # Tầng 1: stream kèm ảnh trực tiếp (nếu có)
-            if image_files and self.vision_upload_available and not self.is_guest:
-                try:
-                    stage = "vision_upload"
-                    vision_chunks: List[str] = []
-                    vision_buffer_bytes = 0
-                    logger.info(
-                        f"[Vision Layer 1] Stream {len(image_files)} ảnh lên Gemini..."
-                    )
-                    prompt_with_header = self._ensure_header_in_prompt(
-                        self._apply_pending_handoff(base_prompt),
-                        include_tool_header,
-                    )
-                    vision_deadline = min(
-                        image_deadline,
-                        asyncio.get_running_loop().time()
-                        + min(GEMINI_HARD_TIMEOUT, IMAGE_REQUEST_TIMEOUT / 2),
-                    )
-                    async for output in _iterate_stream_until(
-                        self.chat_session.send_message_stream(
-                            prompt_with_header, files=image_files
-                        ),
-                        vision_deadline,
-                    ):
-                        delta = output.text_delta or ""
-                        if delta:
-                            delta_bytes = len(delta.encode("utf-8"))
-                            if (
-                                vision_buffer_bytes + delta_bytes
-                                > VISION_STREAM_BUFFER_MAX_BYTES
-                            ):
-                                raise ValueError(
-                                    "Vision stream response exceeded the buffer limit."
-                                )
-                            vision_chunks.append(delta)
-                            vision_buffer_bytes += delta_bytes
-                    full_text = "".join(vision_chunks)
-                    self.last_request_ts = time.time()
-                    self.session_initialized = True
-                    self._mark_tool_header_sent(include_tool_header)
-                    self.turn_count += 1
-                    self._consecutive_auth_errors = 0
-                    self._consecutive_transient_errors = 0
-                    self._pending_handoff = None
-                    self._save_session()
-                    self._sync_active_session_slot()
-                    for delta in vision_chunks:
-                        yield "delta", delta
-                    yield "done", full_text.strip()
-                    return
-                except asyncio.TimeoutError:
-                    if image_deadline <= asyncio.get_running_loop().time():
-                        raise
-                    logger.warning(
-                        "[Vision] Direct image attempt timed out; switching to OCR fallback."
-                    )
-                    self.total_errors += 1
-                    self.vision_disabled_until = time.time() + 300
-                    full_text = ""
-                except Exception as img_exc:
-                    if (self._is_auth_error(img_exc) or not self._evaluate_auth()) and not (self.allow_guest and self.is_guest):
-                        yield "error", {
-                            "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
-                            "type": BridgeAuthError.err_type,
-                            "code": BridgeAuthError.code,
-                            "stage": stage,
-                        }
-                        return
-                    logger.warning(
-                        f"Stream ảnh thất bại ({img_exc}). --> Chuyển sang Local OCR!"
-                    )
-                    self.vision_disabled_until = time.time() + 300
-                    full_text = ""
-
-            # Tầng 2: OCR fallback
-            if image_files:
-                stage = "ocr"
-                ocr_blocks = []
-                for idx, img_p in enumerate(image_files, 1):
-                    logger.info(
-                        f"[Vision Layer 2] Quét chữ từ ảnh #{idx} bằng Local OCR..."
-                    )
-                    ocr_text = await _extract_text_with_deadline(
-                        img_p, image_files, image_deadline
-                    )
-                    ocr_blocks.append(
-                        f"=== [EXTRACTED TEXT FROM IMAGE #{idx}] ===\n"
-                        f"{ocr_text}\n"
-                        f"========================================"
-                    )
-                base_prompt = (
-                    "\n\n".join(ocr_blocks)
-                    + "\n\n(Above is text extracted from the user's screenshot. "
-                    "Analyze and respond in the SAME LANGUAGE as the user.)\n\n"
-                    + base_prompt
-                )
-
-            # Tầng 3: stream text
             attempt = 0
             quota_switches = 0
             failover_attempts = 0
@@ -2149,7 +1906,7 @@ class SingleChatManager:
                 else asyncio.get_running_loop().time() + GEMINI_HARD_TIMEOUT
             )
             while attempt < 2:
-                stage = "text_generation"
+                stage = "vision_upload" if image_files else "text_generation"
                 saved_meta_before_send = self._sanitize_chat_metadata_before_send()
                 prompt_to_send = self._ensure_header_in_prompt(
                     self._apply_pending_handoff(base_prompt),
@@ -2174,10 +1931,18 @@ class SingleChatManager:
 
                     logger.info(
                         f"Stream vào ChatSession (Turn={self.turn_count + 1} | "
-                        f"Chars={len(prompt_to_send)})"
+                        f"Chars={len(prompt_to_send)}"
+                        f"{f' | Images={len(image_files)}' if image_files else ''})"
+                    )
+                    upstream_stream = (
+                        self.chat_session.send_message_stream(
+                            prompt_to_send, files=image_files
+                        )
+                        if image_files
+                        else self.chat_session.send_message_stream(prompt_to_send)
                     )
                     async for output in _iterate_stream_until(
-                        self.chat_session.send_message_stream(prompt_to_send),
+                        upstream_stream,
                         stream_deadline,
                         first_chunk_deadline=first_chunk_deadline,
                     ):
@@ -2196,9 +1961,6 @@ class SingleChatManager:
                     self._pending_handoff = None
                     self._save_session()
                     self._sync_active_session_slot()
-
-                    if ENABLE_RESPONSE_CACHE and not image_files and "<tool_call>" not in reply:
-                        set_cached_response(prompt_to_send, reply, self.default_model)
 
                     if self.turn_count % 15 == 0 and hasattr(self.chat_session, "metadata"):
                         saved_meta = list(self.chat_session.metadata)

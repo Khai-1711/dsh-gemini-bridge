@@ -499,7 +499,7 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
     async def test_chat_accepts_alias_models(self):
         from main import chat_completions, session_manager
 
-        for alias in ("1", "2", "default", "auto", "acc1", "acc2"):
+        for alias in ("default", "auto", "gemini", "unspecified"):
             request = Request({"type": "http", "headers": []})
             request._json = {
                 "model": alias,
@@ -516,6 +516,25 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.get("object"), "chat.completion")
                 # Không được gọi _local_switch_model vì đã normalize thẳng về default_model
                 switch_model.assert_not_awaited()
+
+        # Fake lane aliases like "lane-1" must NOT be silently coerced to default_model
+        bad_req = Request({"type": "http", "headers": []})
+        bad_req._json = {
+            "model": "lane-1",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        with patch.object(session_manager, "require_on"), \
+             patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+             patch.object(session_manager, "state", "on"), \
+             patch.object(session_manager, "auth_ok", True), \
+             patch.object(session_manager, "available_models", ["unspecified", "gemini-4-hydrogen"]), \
+             patch.object(session_manager, "default_model", "gemini-4-hydrogen"), \
+             patch.object(session_manager, "model_details", []), \
+             patch.object(session_manager.client, "resolve_model", side_effect=Exception("unknown")), \
+             patch("main.activity.write"):
+            bad_resp = await chat_completions(bad_req)
+        self.assertEqual(bad_resp.status_code, 400)
+        self.assertEqual(json.loads(bad_resp.body)["error"]["code"], "model_not_available")
 
     async def test_chat_without_tools_does_not_reuse_stale_tool_header(self):
         from main import chat_completions, session_manager
@@ -573,8 +592,6 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         with patch.object(session_manager, "require_on"), \
              patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
              patch.object(session_manager, "send_prepared_turn_stream", new=malformed_stream), \
-             patch("main.repair_tool_call_active", new_callable=AsyncMock, return_value=None), \
-             patch("main.schedule_tool_repair_shadow") as shadow_repair, \
              patch("main.activity.write"):
             response = await chat_completions(request)
             chunks = [
@@ -585,7 +602,6 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         body = "".join(chunks)
         self.assertIn("invalid_tool_call", body)
         self.assertNotIn('"finish_reason":"stop"', body)
-        shadow_repair.assert_called_once()
 
     async def test_nonstream_rejects_labeled_malformed_tool_call(self):
         from main import chat_completions, session_manager
@@ -621,13 +637,10 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
                  return_value='```tool_call\nnot valid json at all\n```',
              ), \
              patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
-             patch("main.repair_tool_call_active", new_callable=AsyncMock, return_value=None), \
-             patch("main.schedule_tool_repair_shadow", return_value=True) as shadow_repair, \
              patch("main.activity.write"):
             response = await chat_completions(request)
 
         self.assertEqual(response.status_code, 502)
-        shadow_repair.assert_called_once()
         self.assertEqual(
             json.loads(response.body)["error"]["code"], "invalid_tool_call"
         )
@@ -653,7 +666,6 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
              patch.object(session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
              patch.object(session_manager, "send_prepared_turn_stream", new=timed_out_stream), \
              patch("main.build_incremental_prompt_and_files", return_value=("prompt", [])), \
-             patch("main.schedule_tool_repair_shadow") as shadow_repair, \
              patch("main.activity.write") as activity_write:
             response = await chat_completions(request)
             chunks = [
@@ -667,7 +679,6 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"finish_reason":"stop"', body)
         self.assertEqual(activity_write.call_args.kwargs["stage"], "text_generation")
         self.assertNotIn("short timeout test", json.dumps(activity_write.call_args.kwargs))
-        shadow_repair.assert_not_called()
 
     async def test_stream_sends_heartbeat_while_vision_result_is_buffered(self):
         from main import chat_completions, session_manager

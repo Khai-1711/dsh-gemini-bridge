@@ -1,14 +1,12 @@
 import asyncio
 import hashlib
-import json
 import logging
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 # Silence bridge logger during test runs
 logging.disable(logging.CRITICAL)
@@ -18,7 +16,6 @@ from gemini_webapi.constants import AccountStatus
 from app.errors import (
     BridgeAuthError,
     BridgeBusyError,
-    BridgeError,
     BridgeTimeoutError,
     BridgeUpstreamError,
 )
@@ -242,19 +239,18 @@ class TestSessionManager(unittest.TestCase):
             mgr.chat_session.metadata, ["cid_preserved", "rid_preserved"]
         )
 
-    def test_vision_temporary_disable(self):
+    def test_vision_upload_available_depends_on_guest_mode(self):
         mgr = make_manager()
         self.assertTrue(mgr.vision_upload_available)
 
-        # Đặt vision_disabled_until vào 300 giây tương lai
-        mgr.vision_disabled_until = time.time() + 300
+        mgr.is_guest = True
         self.assertFalse(mgr.vision_upload_available)
+        with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+             self.assertRaises(BridgeAuthError) as cm:
+            asyncio.run(mgr.send_prepared_turn("analyze screenshot", ["image.png"]))
+        self.assertEqual(cm.exception.stage, "vision_upload")
 
-        # Hết hạn -> khả dụng trở lại
-        mgr.vision_disabled_until = time.time() - 1
-        self.assertTrue(mgr.vision_upload_available)
-
-    def test_image_request_deadline_covers_upload_and_fallback(self):
+    def test_image_request_deadline_covers_upload(self):
         mgr = make_manager()
 
         async def slow_send(*args, **kwargs):
@@ -270,7 +266,7 @@ class TestSessionManager(unittest.TestCase):
                 asyncio.run(mgr.send_prepared_turn("analyze screenshot", ["image.png"]))
 
         self.assertEqual(cm.exception.code, BridgeTimeoutError.code)
-        self.assertIn(cm.exception.stage, ("vision_upload", "text_generation"))
+        self.assertEqual(cm.exception.stage, "vision_upload")
 
     def test_text_timeout_cancels_upstream_and_releases_lock(self):
         mgr = make_manager()
@@ -301,146 +297,91 @@ class TestSessionManager(unittest.TestCase):
         self.assertEqual(reply, "second request completed")
         self.assertEqual(mgr._inflight, 0)
 
-    def test_temp_image_cleanup_on_success_and_ocr_error(self):
+    def test_temp_image_cleanup_on_success_and_upload_error(self):
         from app.vision import _TEMP_FILES
 
-        for fail_ocr in (False, True):
-            with self.subTest(fail_ocr=fail_ocr):
+        for fail_upload in (False, True):
+            with self.subTest(fail_upload=fail_upload):
                 mgr = make_manager()
-                mgr.is_guest = True
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
                     image_path = image.name
                     image.write(b"test image")
                 _TEMP_FILES.add(image_path)
 
-                def fake_ocr(_path):
-                    if fail_ocr:
-                        raise RuntimeError("mock OCR failure")
-                    return "recognized text"
+                if fail_upload:
+                    mgr.chat_session.send_message = AsyncMock(
+                        side_effect=RuntimeError("mock upload failure")
+                    )
+                else:
+                    mgr.chat_session.send_message = AsyncMock(
+                        return_value=SimpleNamespace(text="direct vision answer")
+                    )
 
                 with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 1), \
                      patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-                     patch(
-                         "app.gemini_session.extract_text_from_image_local",
-                         side_effect=fake_ocr,
-                     ), \
+                     patch.object(mgr, "_create_new_chat_session"), \
                      patch.object(mgr, "_save_session"):
-                    if fail_ocr:
-                        with self.assertRaisesRegex(RuntimeError, "mock OCR failure"):
+                    if fail_upload:
+                        with self.assertRaises(BridgeUpstreamError):
                             asyncio.run(
                                 mgr.send_prepared_turn("analyze", [image_path])
                             )
                     else:
-                        mgr.chat_session.send_message = AsyncMock(
-                            return_value=SimpleNamespace(text="OCR answer")
-                        )
                         reply = asyncio.run(
                             mgr.send_prepared_turn("analyze", [image_path])
                         )
-                        self.assertEqual(reply, "OCR answer")
+                        self.assertEqual(reply, "direct vision answer")
 
                 self.assertFalse(Path(image_path).exists())
                 self.assertNotIn(image_path, _TEMP_FILES)
 
-    def test_image_timeout_defers_temp_cleanup_until_ocr_worker_finishes(self):
+    def test_temp_image_cleanup_on_timeout_and_lock_released(self):
         from app.vision import _TEMP_FILES
 
         mgr = make_manager()
-        mgr.is_guest = True
-        started = threading.Event()
-        release = threading.Event()
-        finished = threading.Event()
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
             image_path = image.name
             image.write(b"test image")
         _TEMP_FILES.add(image_path)
 
-        def slow_ocr(path):
-            with open(path, "rb"):
-                started.set()
-                release.wait(timeout=2)
-            finished.set()
-            return "recognized text"
+        async def slow_send(*args, **kwargs):
+            await asyncio.sleep(1)
 
-        async def run_timeout_and_wait_for_ocr():
-            with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.05), \
+        mgr.chat_session.send_message = AsyncMock(side_effect=slow_send)
+        try:
+            with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.03), \
                  patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-                 patch(
-                     "app.gemini_session.extract_text_from_image_local",
-                     side_effect=slow_ocr,
-                 ), \
                  patch.object(mgr, "_save_session"):
                 with self.assertRaises(BridgeTimeoutError) as cm:
-                    await mgr.send_prepared_turn("analyze", [image_path])
-                self.assertEqual(cm.exception.stage, "ocr")
-
-                self.assertTrue(await asyncio.to_thread(started.wait, 1))
-                release.set()
-                self.assertTrue(await asyncio.to_thread(finished.wait, 1))
-                await asyncio.sleep(0)
-                self.assertFalse(Path(image_path).exists())
-
-        try:
-            asyncio.run(run_timeout_and_wait_for_ocr())
+                    asyncio.run(mgr.send_prepared_turn("analyze", [image_path]))
+                self.assertEqual(cm.exception.stage, "vision_upload")
+            self.assertFalse(Path(image_path).exists())
+            self.assertNotIn(image_path, _TEMP_FILES)
+            self.assertFalse(mgr.lock.locked())
+            self.assertEqual(mgr._inflight, 0)
         finally:
-            release.set()
             if Path(image_path).exists():
                 Path(image_path).unlink()
             _TEMP_FILES.discard(image_path)
 
-        self.assertEqual(mgr._inflight, 0)
-
-    def test_image_request_uses_local_ocr_fallback(self):
+    def test_image_request_uploads_directly_with_files(self):
         mgr = make_manager()
+        captured_files = []
 
         async def send_message(prompt, files=None):
-            if files:
-                raise RuntimeError("mock vision upload failure")
-            self.assertIn("recognized screenshot text", prompt)
-            return SimpleNamespace(text="OCR fallback answer")
+            captured_files.append(list(files or []))
+            return SimpleNamespace(text="direct image answer")
 
         mgr.chat_session.send_message = AsyncMock(side_effect=send_message)
         with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
              patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ), \
              patch.object(mgr, "_save_session"):
             reply = asyncio.run(
                 mgr.send_prepared_turn("analyze screenshot", ["image.png"])
             )
 
-        self.assertEqual(reply, "OCR fallback answer")
-        self.assertEqual(mgr.chat_session.send_message.await_count, 2)
-
-    def test_image_fallback_has_remaining_deadline(self):
-        mgr = make_manager()
-
-        async def send_message(prompt, files=None):
-            if files:
-                await asyncio.sleep(0.07)
-                return SimpleNamespace(text="late direct-image response")
-            await asyncio.sleep(0.01)
-            return SimpleNamespace(text="OCR fallback response")
-
-        mgr.chat_session.send_message = send_message
-        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.12), \
-             patch("app.gemini_session.GEMINI_HARD_TIMEOUT", 1), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ), \
-             patch.object(mgr, "_save_session"):
-            reply = asyncio.run(
-                mgr.send_prepared_turn(
-                    "Analyze the screenshot and report the visible issue.",
-                    ["image.png"],
-                )
-            )
-
-        self.assertEqual(reply, "OCR fallback response")
+        self.assertEqual(reply, "direct image answer")
+        self.assertEqual(captured_files, [["image.png"]])
 
     def test_stream_image_timeout_is_structured(self):
         mgr = make_manager()
@@ -460,7 +401,7 @@ class TestSessionManager(unittest.TestCase):
         errors = [payload for kind, payload in results if kind == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
-        self.assertIn(errors[0]["stage"], ("vision_upload", "text_generation"))
+        self.assertEqual(errors[0]["stage"], "vision_upload")
 
     def test_stream_timeout_cancels_upstream_and_releases_lock(self):
         mgr = make_manager()
@@ -485,183 +426,77 @@ class TestSessionManager(unittest.TestCase):
         errors = [payload for kind, payload in results if kind == "error"]
         self.assertEqual(len(errors), 1)
         self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
-        self.assertIn(errors[0]["stage"], ("vision_upload", "text_generation"))
+        self.assertEqual(errors[0]["stage"], "text_generation")
         self.assertTrue(upstream_cancelled.is_set())
         self.assertFalse(mgr.lock.locked())
         self.assertEqual(mgr._inflight, 0)
 
-    def test_stream_image_deadline_includes_ocr_fallback(self):
+    def test_stream_image_uploads_directly_and_cleans_temp_file(self):
+        from app.vision import _TEMP_FILES
+
         mgr = make_manager()
-        send_calls = []
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
+            image_path = image.name
+            image.write(b"test image")
+        _TEMP_FILES.add(image_path)
+
+        captured_files = []
 
         async def send_stream(prompt, files=None):
-            send_calls.append(bool(files))
-            if files:
-                raise RuntimeError("mock vision upload failure")
-            yield SimpleNamespace(text_delta="unexpected text fallback")
-
-        def slow_ocr(image_path):
-            time.sleep(0.1)
-            return "recognized screenshot text"
-
-        mgr.chat_session.send_message_stream = send_stream
-        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.03), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch("app.gemini_session.extract_text_from_image_local", side_effect=slow_ocr):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream(
-                    "Analyze the screenshot and report the visible issue.",
-                    ["image.png"],
-                )
-            ))
-
-        errors = [payload for kind, payload in results if kind == "error"]
-        self.assertEqual(len(errors), 1)
-        self.assertEqual(errors[0]["code"], BridgeTimeoutError.code)
-        self.assertEqual(send_calls, [True])
-
-    def test_stream_image_fallback_has_remaining_deadline(self):
-        mgr = make_manager()
-
-        async def send_stream(prompt, files=None):
-            if files:
-                await asyncio.sleep(0.07)
-                yield SimpleNamespace(text_delta="late direct-image response")
-            else:
-                await asyncio.sleep(0.01)
-                yield SimpleNamespace(text_delta="OCR fallback response")
-
-        mgr.chat_session.send_message_stream = send_stream
-        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.12), \
-             patch("app.gemini_session.GEMINI_HARD_TIMEOUT", 1), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ), \
-             patch.object(mgr, "_save_session"):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream(
-                    "Analyze the screenshot and report the visible issue.",
-                    ["image.png"],
-                )
-            ))
-
-        self.assertIn(("delta", "OCR fallback response"), results)
-        self.assertIn(("done", "OCR fallback response"), results)
-        self.assertNotIn(("delta", "late direct-image response"), results)
-
-    def test_stream_image_uses_local_ocr_fallback(self):
-        mgr = make_manager()
-
-        async def send_stream(prompt, files=None):
-            if files:
-                raise RuntimeError("mock vision upload failure")
-            self.assertIn("recognized screenshot text", prompt)
-            yield SimpleNamespace(text_delta="OCR fallback answer")
-
-        mgr.chat_session.send_message_stream = send_stream
-        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ), \
-             patch.object(mgr, "_save_session"):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream("analyze screenshot", ["image.png"])
-            ))
-
-        self.assertIn(("delta", "OCR fallback answer"), results)
-        self.assertIn(("done", "OCR fallback answer"), results)
-
-    def test_stream_discards_partial_vision_on_timeout_before_ocr_fallback(self):
-        mgr = make_manager()
-
-        async def send_stream(prompt, files=None):
-            if files:
-                yield SimpleNamespace(text_delta="partial vision answer")
-                await asyncio.sleep(0.18)
-                yield SimpleNamespace(text_delta="late vision answer")
-            else:
-                self.assertIn("recognized screenshot text", prompt)
-                yield SimpleNamespace(text_delta="OCR fallback answer")
-
-        mgr.chat_session.send_message_stream = send_stream
-        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 0.3), \
-             patch("app.gemini_session.GEMINI_HARD_TIMEOUT", 1), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream("analyze", ["image.png"])
-            ))
-
-        self.assertIn(("delta", "OCR fallback answer"), results)
-        self.assertIn(("done", "OCR fallback answer"), results)
-        self.assertFalse(any(
-            kind == "delta" and "vision answer" in payload
-            for kind, payload in results
-        ))
-
-    def test_stream_discards_partial_vision_on_exception_before_ocr_fallback(self):
-        mgr = make_manager()
-
-        async def send_stream(prompt, files=None):
-            if files:
-                yield SimpleNamespace(text_delta="partial vision answer")
-                raise RuntimeError("mock vision stream failure")
-            self.assertIn("recognized screenshot text", prompt)
-            yield SimpleNamespace(text_delta="OCR fallback answer")
-
-        mgr.chat_session.send_message_stream = send_stream
-        with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ), \
-             patch.object(mgr, "_save_session"):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream("analyze", ["image.png"])
-            ))
-
-        self.assertIn(("delta", "OCR fallback answer"), results)
-        self.assertIn(("done", "OCR fallback answer"), results)
-        self.assertFalse(any(
-            kind == "delta" and "partial vision answer" in payload
-            for kind, payload in results
-        ))
-
-    def test_stream_emits_buffered_vision_deltas_after_success(self):
-        mgr = make_manager()
-
-        async def send_stream(prompt, files=None):
+            captured_files.append(list(files or []))
             yield SimpleNamespace(text_delta="vision ")
             yield SimpleNamespace(text_delta="answer")
 
         mgr.chat_session.send_message_stream = send_stream
-        with patch(
-                 "app.gemini_session.VISION_STREAM_BUFFER_MAX_BYTES",
-                 len("vision answer".encode("utf-8")),
-             ), \
-             patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch.object(mgr, "_save_session"):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream("analyze", ["image.png"])
-            ))
+        try:
+            with patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
+                 patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
+                 patch.object(mgr, "_save_session"):
+                results = asyncio.run(_collect_stream_items(
+                    mgr.send_prepared_turn_stream("analyze", [image_path])
+                ))
 
-        self.assertEqual(
-            results,
-            [
-                ("delta", "vision "),
-                ("delta", "answer"),
-                ("done", "vision answer"),
-            ],
-        )
+            self.assertEqual(captured_files, [[image_path]])
+            self.assertEqual(
+                results,
+                [
+                    ("delta", "vision "),
+                    ("delta", "answer"),
+                    ("done", "vision answer"),
+                ],
+            )
+            self.assertFalse(Path(image_path).exists())
+            self.assertNotIn(image_path, _TEMP_FILES)
+        finally:
+            if Path(image_path).exists():
+                Path(image_path).unlink()
+            _TEMP_FILES.discard(image_path)
+
+    def test_stream_image_rejects_guest_mode(self):
+        from app.vision import _TEMP_FILES
+
+        mgr = make_manager()
+        mgr.is_guest = True
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
+            image_path = image.name
+            image.write(b"test image")
+        _TEMP_FILES.add(image_path)
+
+        try:
+            with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0):
+                results = asyncio.run(_collect_stream_items(
+                    mgr.send_prepared_turn_stream("analyze", [image_path])
+                ))
+            errors = [payload for kind, payload in results if kind == "error"]
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(errors[0]["code"], BridgeAuthError.code)
+            self.assertEqual(errors[0]["stage"], "vision_upload")
+            self.assertFalse(Path(image_path).exists())
+            self.assertNotIn(image_path, _TEMP_FILES)
+        finally:
+            if Path(image_path).exists():
+                Path(image_path).unlink()
+            _TEMP_FILES.discard(image_path)
 
     def test_stream_stops_after_delta_for_network_auth_and_quota_errors(self):
         from gemini_webapi.exceptions import UsageLimitExceededError
@@ -781,37 +616,6 @@ class TestSessionManager(unittest.TestCase):
         self.assertIn(("delta", "response after handoff"), results)
         self.assertIn(("done", "response after handoff"), results)
         self.assertFalse(any(kind == "error" for kind, _payload in results))
-
-    def test_oversized_vision_buffer_falls_back_without_leaking_partial_text(self):
-        mgr = make_manager()
-
-        async def send_stream(prompt, files=None):
-            if files:
-                yield SimpleNamespace(text_delta="1234")
-                yield SimpleNamespace(text_delta="56")
-            else:
-                self.assertIn("recognized screenshot text", prompt)
-                yield SimpleNamespace(text_delta="OCR fallback answer")
-
-        mgr.chat_session.send_message_stream = send_stream
-        with patch("app.gemini_session.VISION_STREAM_BUFFER_MAX_BYTES", 5), \
-             patch("app.gemini_session.IMAGE_REQUEST_TIMEOUT", 2), \
-             patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \
-             patch(
-                 "app.gemini_session.extract_text_from_image_local",
-                 return_value="recognized screenshot text",
-             ), \
-             patch.object(mgr, "_save_session"):
-            results = asyncio.run(_collect_stream_items(
-                mgr.send_prepared_turn_stream("analyze", ["image.png"])
-            ))
-
-        self.assertIn(("delta", "OCR fallback answer"), results)
-        self.assertIn(("done", "OCR fallback answer"), results)
-        self.assertFalse(any(
-            kind == "delta" and payload in ("1234", "56")
-            for kind, payload in results
-        ))
 
     def test_error_classes_and_status_codes(self):
         auth_err = BridgeAuthError("Auth error")

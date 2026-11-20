@@ -1,6 +1,6 @@
 import json
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 from app.config import FORBIDDEN_TOOLS, logger
 from app.security import (
     is_path_within_project,
@@ -281,50 +281,6 @@ def has_tool_call_intent(reply_text: str) -> bool:
         ):
             return True
     return False
-
-
-def extract_malformed_tool_call_candidate(
-    reply_text: str, max_chars: int = 4000
-) -> Optional[str]:
-    """Return one explicitly marked, syntactically invalid tool-call candidate."""
-    if not reply_text or len(reply_text) > 100_000:
-        return None
-
-    tagged = _extract_tag_contents(reply_text, "<tool_call>", "</tool_call>")
-    if tagged:
-        if len(tagged) != 1:
-            return None
-        candidate = tagged[0]
-    else:
-        if len(reply_text) >= 4000:
-            return None
-        candidates = []
-        for block in _extract_tag_contents(reply_text, "```", "```"):
-            clean_block = block.strip()
-            first_line, separator, remainder = clean_block.partition("\n")
-            label = first_line.strip().lower()
-            candidate_text = remainder.strip() if separator else ""
-            if label == "tool_call" or (
-                label == "json"
-                and '"name"' in candidate_text
-                and (
-                    '"arguments"' in candidate_text
-                    or '"parameters"' in candidate_text
-                )
-            ):
-                candidates.append(candidate_text)
-        if len(candidates) != 1:
-            return None
-        candidate = candidates[0]
-
-    candidate = candidate.strip()
-    if not candidate or len(candidate) > max_chars or '"name"' not in candidate:
-        return None
-    try:
-        _loads_tool_json(candidate)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return candidate
-    return None
 
 
 def parse_tool_calls_from_reply(
