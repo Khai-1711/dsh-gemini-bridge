@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -6,7 +7,8 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from gemini_webapi import GeminiClient
 from gemini_webapi.constants import AccountStatus
 from gemini_webapi.exceptions import AuthError, UsageLimitExceededError
@@ -52,6 +54,7 @@ from app.errors import (
     BridgeBusyError,
     BridgeControlError,
     BridgeDisabledError,
+    BridgeError,
     BridgeQuotaError,
     BridgeTimeoutError,
     BridgeUpstreamError,
@@ -83,6 +86,23 @@ class SessionSlot:
     chat_tool_header_hash: str = ""
     last_used_ts: float = 0.0
     model: str = "unspecified"
+    ledger: Any = None
+    is_subagent: bool = False
+
+
+def is_subagent_messages(messages: List[Dict[str, Any]]) -> bool:
+    """Trả True nếu lời nhắc đánh dấu hội thoại thuộc về một subagent riêng."""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        raw_text, _ = _message_text_for_session_key(msg.get("content"))
+        if raw_text:
+            match = _AGENT_NAME_RE.search(raw_text)
+            if match:
+                name = match.group(1).strip().lower()
+                if name and name not in ("lead", "main", "default"):
+                    return True
+    return False
 
 
 def _message_text_for_session_key(content: Any) -> Tuple[str, bool]:
@@ -341,11 +361,34 @@ class SingleChatManager:
             logger.warning(f"[ACCOUNTS] Lỗi ghi chain file: {exc}")
 
         # T25: FactLedger & Transcript
-        self.ledger = FactLedger(INSTANCE_PATHS["handoff_dir"])
+        self._lock_owner_task: Optional[asyncio.Task] = None
+        self._active_is_subagent: bool = False
+        self._lead_ledger = FactLedger(
+            INSTANCE_PATHS["handoff_dir"], filename="ledger.json", persist=True
+        )
+        self.ledger = self._lead_ledger
         self.transcript: list = []
         self._pending_handoff = None
         self._fake_quota_done = False
         self.on_event = None
+
+    async def acquire_turn_lock(self, timeout: float = LOCK_ACQUIRE_TIMEOUT) -> bool:
+        """Lấy khóa tuần tự theo lượt; cho phép cùng coroutine task giữ trọn 1 lượt."""
+        cur_task = asyncio.current_task()
+        if (
+            self.lock.locked()
+            and cur_task is not None
+            and getattr(self, "_lock_owner_task", None) is cur_task
+        ):
+            return False
+        await asyncio.wait_for(self.lock.acquire(), timeout=timeout)
+        self._lock_owner_task = cur_task
+        return True
+
+    def release_turn_lock(self, acquired_here: bool = True) -> None:
+        if acquired_here and self.lock.locked():
+            self._lock_owner_task = None
+            self.lock.release()
 
     HEADER_MARKER = "=== WORKSPACE TOOLS"
 
@@ -787,6 +830,30 @@ class SingleChatManager:
             chat_tool_header_hash=str(getattr(self, "chat_tool_header_hash", "") or ""),
             last_used_ts=time.time(),
             model=str(self.default_model or "unspecified"),
+            ledger=getattr(self, "ledger", None),
+            is_subagent=bool(getattr(self, "_active_is_subagent", False)),
+        )
+
+    def _ensure_slot_ledger(self, session_key: str, is_subagent: bool) -> FactLedger:
+        if not is_subagent:
+            lead_ledger = getattr(self, "_lead_ledger", None)
+            if lead_ledger is None:
+                cur_ledger = getattr(self, "ledger", None)
+                if cur_ledger is not None and getattr(cur_ledger, "persist", True):
+                    lead_ledger = cur_ledger
+                else:
+                    lead_ledger = FactLedger(
+                        INSTANCE_PATHS["handoff_dir"],
+                        filename="ledger.json",
+                        persist=True,
+                    )
+                self._lead_ledger = lead_ledger
+            return lead_ledger
+        safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", session_key or "subagent")[:32]
+        return FactLedger(
+            INSTANCE_PATHS["handoff_dir"],
+            filename=f"ledger_{safe_key}.json",
+            persist=False,
         )
 
     def _sync_active_session_slot(self) -> None:
@@ -815,80 +882,108 @@ class SingleChatManager:
             _, oldest_key = min(candidates)
             pool.pop(oldest_key, None)
 
-    async def activate_session_slot(
-        self, session_key: str, is_new_conversation: bool
-    ) -> None:
-        """Chọn hoặc tạo ngăn ChatSession riêng theo session_key trong pool.
-
-        Luôn giữ khóa tuần tự ``self.lock`` ở tầng ``self.client`` để chống
-        đứt kết nối chéo khi chạy trên cùng một ``GeminiClient`` (Issue #356).
-        """
+    def _activate_session_slot_locked(
+        self, session_key: str, is_new_conversation: bool, is_subagent: bool = False
+    ) -> SessionSlot:
+        """Chọn hoặc tạo ngăn ChatSession riêng theo session_key (phải gọi khi đang giữ self.lock)."""
         target_key = str(session_key or "default").strip() or "default"
-        async with self.lock:
-            pool = self._ensure_session_pool()
-            active_key = self._active_session_key
-            has_dirty_chat = bool(
-                self.chat_session is not None
-                and getattr(self.chat_session, "cid", None)
+        pool = self._ensure_session_pool()
+        active_key = self._active_session_key
+        has_dirty_chat = bool(
+            self.chat_session is not None
+            and getattr(self.chat_session, "cid", None)
+        )
+        if active_key and (self.turn_count > 0 or has_dirty_chat):
+            pool[active_key] = self._snapshot_current_slot(active_key)
+
+        self._evict_session_pool_locked({target_key, active_key})
+
+        if is_new_conversation:
+            existing_target = pool.get(target_key)
+            target_was_used = bool(
+                existing_target is not None
+                and (
+                    existing_target.turn_count > 0
+                    or (
+                        existing_target.chat_session is not None
+                        and getattr(existing_target.chat_session, "cid", None)
+                    )
+                )
             )
-            if active_key and (self.turn_count > 0 or has_dirty_chat):
-                pool[active_key] = self._snapshot_current_slot(active_key)
-
-            self._evict_session_pool_locked({target_key, active_key})
-
-            if is_new_conversation:
-                existing_target = pool.get(target_key)
-                target_was_used = bool(
-                    existing_target is not None
-                    and (
-                        existing_target.turn_count > 0
-                        or (
-                            existing_target.chat_session is not None
-                            and getattr(existing_target.chat_session, "cid", None)
-                        )
+            other_active_slots = any(
+                key != target_key
+                and (
+                    slot.turn_count > 0
+                    or (
+                        slot.chat_session is not None
+                        and getattr(slot.chat_session, "cid", None)
                     )
                 )
-                other_active_slots = any(
-                    key != target_key
-                    and (
-                        slot.turn_count > 0
-                        or (
-                            slot.chat_session is not None
-                            and getattr(slot.chat_session, "cid", None)
-                        )
-                    )
-                    for key, slot in pool.items()
+                for key, slot in pool.items()
+            )
+            needs_fresh = (
+                target_was_used
+                or (self.turn_count > 0)
+                or has_dirty_chat
+                or other_active_slots
+            )
+            if needs_fresh:
+                self._create_new_chat_session(preserve_metadata=None)
+            self._active_is_subagent = bool(is_subagent)
+            self.ledger = self._ensure_slot_ledger(target_key, self._active_is_subagent)
+            pool[target_key] = self._snapshot_current_slot(target_key)
+        else:
+            if target_key == active_key:
+                existing_slot = pool.get(target_key)
+                slot_is_subagent = bool(
+                    is_subagent or (existing_slot.is_subagent if existing_slot else getattr(self, "_active_is_subagent", False))
                 )
-                needs_fresh = (
-                    target_was_used
-                    or (self.turn_count > 0)
-                    or has_dirty_chat
-                    or other_active_slots
-                )
-                if needs_fresh:
-                    self._create_new_chat_session(preserve_metadata=None)
-                pool[target_key] = self._snapshot_current_slot(target_key)
-            else:
-                if target_key == active_key:
-                    if target_key in pool:
-                        pool[target_key].last_used_ts = time.time()
-                    else:
-                        pool[target_key] = self._snapshot_current_slot(target_key)
-                elif target_key in pool:
-                    slot = pool[target_key]
-                    self.chat_session = slot.chat_session
-                    self.session_initialized = slot.session_initialized
-                    self.turn_count = slot.turn_count
-                    self.tool_header_sent = slot.tool_header_sent
-                    self.chat_tool_header_hash = slot.chat_tool_header_hash
-                    slot.last_used_ts = time.time()
+                self._active_is_subagent = slot_is_subagent
+                if existing_slot and existing_slot.ledger is not None:
+                    self.ledger = existing_slot.ledger
                 else:
-                    if self.turn_count > 0 or has_dirty_chat:
-                        self._create_new_chat_session(preserve_metadata=None)
+                    self.ledger = self._ensure_slot_ledger(target_key, slot_is_subagent)
+                if target_key in pool:
+                    pool[target_key].ledger = self.ledger
+                    pool[target_key].is_subagent = self._active_is_subagent
+                    pool[target_key].last_used_ts = time.time()
+                else:
                     pool[target_key] = self._snapshot_current_slot(target_key)
+            elif target_key in pool:
+                slot = pool[target_key]
+                self.chat_session = slot.chat_session
+                self.session_initialized = slot.session_initialized
+                self.turn_count = slot.turn_count
+                self.tool_header_sent = slot.tool_header_sent
+                self.chat_tool_header_hash = slot.chat_tool_header_hash
+                slot.is_subagent = bool(is_subagent or slot.is_subagent)
+                if slot.ledger is None:
+                    slot.ledger = self._ensure_slot_ledger(target_key, slot.is_subagent)
+                self._active_is_subagent = slot.is_subagent
+                self.ledger = slot.ledger
+                slot.last_used_ts = time.time()
+            else:
+                if self.turn_count > 0 or has_dirty_chat:
+                    self._create_new_chat_session(preserve_metadata=None)
+                self._active_is_subagent = bool(is_subagent)
+                self.ledger = self._ensure_slot_ledger(target_key, self._active_is_subagent)
+                pool[target_key] = self._snapshot_current_slot(target_key)
 
-            self._active_session_key = target_key
-            self._evict_session_pool_locked({target_key})
+        self._active_session_key = target_key
+        self._evict_session_pool_locked({target_key})
+        return pool[target_key]
+
+    async def activate_session_slot(
+        self, session_key: str, is_new_conversation: bool, is_subagent: bool = False
+    ) -> SessionSlot:
+        """Chọn hoặc tạo ngăn ChatSession riêng theo session_key trong pool."""
+        acquired_here = await self.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
+        try:
+            return self._activate_session_slot_locked(
+                session_key, is_new_conversation, is_subagent=is_subagent
+            )
+        finally:
+            self.release_turn_lock(acquired_here)
 
     def _select_fallback_model(self) -> str:
         """Chọn model fallback khác với model hiện tại để tránh vòng lặp tự đâm vào model vừa lỗi."""
@@ -1368,12 +1463,17 @@ class SingleChatManager:
         return switched
 
     async def reset_session(self) -> None:
-        async with self.lock:
+        acquired_here = await self.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
+        try:
             self._create_new_chat_session()
             self._ensure_session_pool().clear()
             self._active_session_key = "default"
+            self._active_is_subagent = False
+            self.ledger = self._ensure_slot_ledger("default", False)
             clear_saved_session()
             logger.info(f"Đã làm mới phiên ChatSession (Model: {self.default_model}).")
+        finally:
+            self.release_turn_lock(acquired_here)
 
     async def close(self) -> None:
         self._save_session()
@@ -1507,19 +1607,66 @@ class SingleChatManager:
             "id_status": id_status,
         }
 
+    @staticmethod
+    def _bridge_error_from_payload(payload: Any) -> BridgeError:
+        if not isinstance(payload, dict):
+            return BridgeUpstreamError(str(payload or "Streaming failed"))
+        code = str(payload.get("code") or "")
+        msg = str(payload.get("message") or "Không nhận được phản hồi từ Gemini.")
+        stage = payload.get("stage")
+        cls = {
+            BridgeAuthError.code: BridgeAuthError,
+            BridgeBusyError.code: BridgeBusyError,
+            BridgeTimeoutError.code: BridgeTimeoutError,
+            BridgeQuotaError.code: BridgeQuotaError,
+            BridgeDisabledError.code: BridgeDisabledError,
+            BridgeControlError.code: BridgeControlError,
+            BridgeUpstreamError.code: BridgeUpstreamError,
+        }.get(code, BridgeUpstreamError)
+        return cls(msg, stage=stage)
+
+    def _open_chat_stream(self, prompt_to_send: str, image_files: List[str]):
+        """Mở luồng phản hồi thống nhất (hỗ trợ mock chỉ cài send_message)."""
+        stream_fn = getattr(self.chat_session, "send_message_stream", None)
+        if callable(stream_fn):
+            return (
+                stream_fn(prompt_to_send, files=image_files)
+                if image_files
+                else stream_fn(prompt_to_send)
+            )
+        send_fn = getattr(self.chat_session, "send_message", None)
+        if not callable(send_fn):
+            raise RuntimeError(
+                "ChatSession does not expose send_message_stream or send_message."
+            )
+
+        async def _single_shot_stream():
+            response = await (
+                send_fn(prompt_to_send, files=image_files)
+                if image_files
+                else send_fn(prompt_to_send)
+            )
+            yield SimpleNamespace(text_delta=(getattr(response, "text", None) or ""))
+
+        return _single_shot_stream()
+
     async def send_prepared_turn(
         self,
-        prompt_to_send: str,
-        image_files: List[str],
+        prompt_to_send: str = "",
+        image_files: Optional[List[str]] = None,
         include_tool_header: bool = True,
+        turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
     ) -> str:
-        """Gửi 1 lượt hội thoại vào Gemini Web với đầy đủ cơ chế bảo vệ."""
+        """Gửi 1 lượt hội thoại vào Gemini Web (bọc trực tiếp trên luồng stream thống nhất)."""
         self.require_on()
         self._inflight += 1
         self._idle_event.clear()
         try:
             return await self._send_prepared_turn_inner(
-                prompt_to_send, image_files, include_tool_header
+                prompt_to_send,
+                list(image_files or []),
+                include_tool_header,
+                turn_preparer=turn_preparer,
             )
         finally:
             self._inflight -= 1
@@ -1532,283 +1679,30 @@ class SingleChatManager:
         prompt_to_send: str,
         image_files: List[str],
         include_tool_header: bool = True,
+        turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
     ) -> str:
-        self.total_requests += 1
-        stage = "lock"
-        image_deadline = (
-            _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
-        )
-
-        # Lock với timeout — trả lỗi thay vì chờ vô hạn (M2)
-        try:
-            lock_timeout = (
-                _remaining_timeout(image_deadline, LOCK_ACQUIRE_TIMEOUT)
-                if image_deadline is not None
-                else LOCK_ACQUIRE_TIMEOUT
+        reply_text = ""
+        async with contextlib.aclosing(
+            self._send_prepared_turn_stream_inner(
+                prompt_to_send,
+                image_files,
+                include_tool_header,
+                turn_preparer=turn_preparer,
             )
-            await asyncio.wait_for(self.lock.acquire(), timeout=lock_timeout)
-        except asyncio.TimeoutError:
-            cleanup_temp_images(image_files)
-            self.total_errors += 1
-            if image_deadline is not None and image_deadline <= asyncio.get_running_loop().time():
-                raise BridgeTimeoutError(
-                    f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
-                    stage=stage,
-                )
-            raise BridgeBusyError(
-                "Bridge đang bận, thử lại sau vài giây.", stage=stage
-            )
-
-        try:
-            stage = "throttle"
-            # Giãn cách an toàn
-            elapsed = time.time() - self.last_request_ts
-            if elapsed < MIN_REQUEST_INTERVAL:
-                delay = MIN_REQUEST_INTERVAL - elapsed
-                if image_deadline is not None:
-                    await asyncio.wait_for(
-                        asyncio.sleep(delay),
-                        timeout=_remaining_timeout(image_deadline),
-                    )
-                else:
-                    await asyncio.sleep(delay)
-
-            if self.chat_session is None:
-                self._create_new_chat_session()
-
-            base_prompt = prompt_to_send
-            if image_files and not self.vision_upload_available:
-                raise BridgeAuthError(
-                    "Gửi ảnh yêu cầu đăng nhập cookie Gemini (không hỗ trợ ở chế độ Guest).",
-                    stage="vision_upload",
-                )
-
-            attempt = 0
-            quota_switches = 0
-            failover_attempts = 0
-            max_failover_attempts = max(len(self.chain), 1)
-            while attempt < 2:
-                stage = "vision_upload" if image_files else "text_generation"
-                saved_meta_before_send = self._sanitize_chat_metadata_before_send()
-                prompt_to_send = self._ensure_header_in_prompt(
-                    self._apply_pending_handoff(base_prompt),
-                    include_tool_header,
-                )
-                try:
-                    if BRIDGE_DEBUG_FAKE_QUOTA and not self._fake_quota_done:
-                        self._fake_quota_done = True
-                        raise UsageLimitExceededError("DEBUG: giả lập hết quota (BRIDGE_DEBUG_FAKE_QUOTA)")
-
-                    logger.info(
-                        f"Gửi vào ChatSession (Turn={self.turn_count + 1} | "
-                        f"Chars={len(prompt_to_send)}"
-                        f"{f' | Images={len(image_files)}' if image_files else ''})"
-                    )
-                    coro = (
-                        self.chat_session.send_message(prompt_to_send, files=image_files)
-                        if image_files
-                        else self.chat_session.send_message(prompt_to_send)
-                    )
-                    response = await asyncio.wait_for(
-                        coro,
-                        timeout=(
-                            _remaining_timeout(image_deadline, GEMINI_HARD_TIMEOUT)
-                            if image_deadline is not None
-                            else GEMINI_HARD_TIMEOUT
-                        ),
-                    )
-                    self.last_request_ts = time.time()
-                    reply = (response.text or "").strip()
-                    del response
-
-                    self.session_initialized = True
-                    self._mark_tool_header_sent(include_tool_header)
-                    self.turn_count += 1
-                    self._consecutive_auth_errors = 0
-                    self._consecutive_transient_errors = 0
-                    self._pending_handoff = None
-                    self._save_session()
-                    self._sync_active_session_slot()
-
-                    # Dọn bộ đệm ngầm mỗi 15 lượt
-                    if (
-                        self.turn_count % 15 == 0
-                        and hasattr(self.chat_session, "metadata")
-                    ):
-                        saved_meta = list(self.chat_session.metadata)
-                        self._create_new_chat_session(preserve_metadata=saved_meta)
-
-                    return reply
-
-                except asyncio.CancelledError:
-                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
-                    raise
-
-                except asyncio.TimeoutError:
-                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
-                    timeout = (
-                        IMAGE_REQUEST_TIMEOUT
-                        if (
-                            image_deadline is not None
-                            and image_deadline <= asyncio.get_running_loop().time()
-                        )
-                        else GEMINI_HARD_TIMEOUT
-                    )
-                    logger.error(f"Quá thời gian {timeout}s!")
-                    self.total_errors += 1
-                    raise BridgeTimeoutError(
-                        f"Gemini không phản hồi sau {timeout}s.", stage=stage
-                    )
-
-                except UsageLimitExceededError as exc:
-                    logger.warning("[QUOTA] đang chuyển tài khoản, có thể mất 1-3 phút")
-                    if quota_switches < len(self.chain) and await _await_with_deadline(
-                        self._handle_quota_exhausted(exc), image_deadline
-                    ):
-                        quota_switches += 1
-                        continue
-                    raise BridgeQuotaError(
-                        "Tất cả tài khoản đều hết quota. Hãy thử lại sau hoặc nạp thêm tài khoản.",
-                        stage=stage,
-                    )
-
-                except Exception as exc:
-                    self.total_errors += 1
-                    if self._is_auth_error(exc):
-                        self._consecutive_auth_errors += 1
-                    else:
-                        self._consecutive_transient_errors += 1
-                    logger.warning(
-                        f"Lỗi ChatSession (Lần {attempt + 1}/2): {exc}"
-                    )
-
-                    if "1097" in str(exc) or ("carbon" in str(self.default_model).lower() and not self._is_auth_error(exc)):
-                        fallback_target = self._select_fallback_model()
-                        logger.warning(
-                            f"[MODEL_FALLBACK] Model '{self.default_model}' bị lỗi ({exc}). "
-                            f"Tự động fallback sang '{fallback_target}' và mở lại kết nối mới!"
-                        )
-                        try:
-                            # LƯU Ý: gemini_webapi đã tự gọi client.close() trước khi ném lỗi 1097 -> cần init lại client!
-                            try:
-                                await _await_with_deadline(self.client.close(), image_deadline)
-                            except Exception:
-                                pass
-                            await _await_with_deadline(
-                                self.client.init(
-                                    timeout=60,
-                                    auto_close=False,
-                                    close_delay=300,
-                                    auto_refresh=True,
-                                ),
-                                image_deadline,
-                            )
-                            if not self._evaluate_auth():
-                                if len(self.chain) > 1 and await _await_with_deadline(
-                                    self._try_failover_to_backup(), image_deadline
-                                ):
-                                    attempt += 1
-                                    continue
-                                if not (self.allow_guest and self.is_guest):
-                                    raise BridgeAuthError(
-                                        "Gemini chưa đăng nhập (guest/cookie hết hạn).",
-                                        stage=stage,
-                                    )
-                            self.default_model = fallback_target
-                            self._create_new_chat_session(preserve_metadata=None)
-                            self._save_session()
-                            attempt += 1
-                            continue
-                        except BridgeAuthError:
-                            raise
-                        except Exception as fb_exc:
-                            logger.error(f"[MODEL_FALLBACK] Lỗi khi fallback: {fb_exc}")
-
-                    # Cảnh báo cookie hết hạn
-                    if self._consecutive_auth_errors >= 2 and not self.is_guest:
-                        logger.critical(
-                            "⚠️ COOKIE CÓ THỂ HẾT HẠN! "
-                            "Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies"
-                        )
-                        if (
-                            failover_attempts < max_failover_attempts
-                            and len(self.chain) > 1
-                            and await _await_with_deadline(
-                                self._try_failover_to_backup(), image_deadline
-                            )
-                        ):
-                            failover_attempts += 1
-                            continue
-
-                    if attempt == 0:
-                        saved_meta = self._chat_metadata_snapshot()
-                        try:
-                            await _await_with_deadline(self.client.close(), image_deadline)
-                        except Exception:
-                            pass
-                        try:
-                            await _await_with_deadline(
-                                self.client.init(
-                                    timeout=60,
-                                    auto_close=False,
-                                    close_delay=300,
-                                    auto_refresh=True,
-                                ),
-                                image_deadline,
-                            )
-                        except Exception as init_exc:
-                            if (
-                                image_deadline is not None
-                                and image_deadline <= asyncio.get_running_loop().time()
-                            ):
-                                raise asyncio.TimeoutError from init_exc
-                            logger.error(f"Init lại client thất bại: {init_exc}")
-                            raise BridgeUpstreamError(
-                                f"Lỗi kết nối Gemini Web: {init_exc}", stage=stage
-                            )
-                        if not self._evaluate_auth():
-                            if (
-                                failover_attempts < max_failover_attempts
-                                and len(self.chain) > 1
-                                and await _await_with_deadline(
-                                    self._try_failover_to_backup(), image_deadline
-                                )
-                            ):
-                                failover_attempts += 1
-                                attempt += 1
-                                continue
-                            if not (self.allow_guest and self.is_guest):
-                                raise BridgeAuthError(
-                                    "Gemini chưa đăng nhập (guest/cookie hết hạn).",
-                                    stage=stage,
-                                )
-                        self._create_new_chat_session(preserve_metadata=saved_meta)
-                        attempt += 1
-                    else:
-                        raise BridgeUpstreamError(
-                            f"Lỗi kết nối Gemini Web: {exc}", stage=stage
-                        )
-
-            raise BridgeUpstreamError("Không nhận được phản hồi.", stage=stage)
-        except asyncio.TimeoutError as exc:
-            if image_deadline is None:
-                raise
-            self.total_errors += 1
-            logger.error(f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT}s deadline.")
-            raise BridgeTimeoutError(
-                f"Image request exceeded its {IMAGE_REQUEST_TIMEOUT:g}s deadline.",
-                stage=stage,
-            ) from exc
-        finally:
-            if self.lock.locked():
-                self.lock.release()
-            cleanup_temp_images(image_files)
+        ) as stream:
+            async for kind, payload in stream:
+                if kind == "error":
+                    raise self._bridge_error_from_payload(payload)
+                if kind == "done":
+                    reply_text = payload
+        return reply_text
 
     async def send_prepared_turn_stream(
         self,
-        prompt_to_send: str,
-        image_files: List[str],
+        prompt_to_send: str = "",
+        image_files: Optional[List[str]] = None,
         include_tool_header: bool = True,
+        turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
     ):
         """Streaming variant of send_prepared_turn.
 
@@ -1820,10 +1714,16 @@ class SingleChatManager:
         self._inflight += 1
         self._idle_event.clear()
         try:
-            async for item in self._send_prepared_turn_stream_inner(
-                prompt_to_send, image_files, include_tool_header
-            ):
-                yield item
+            async with contextlib.aclosing(
+                self._send_prepared_turn_stream_inner(
+                    prompt_to_send,
+                    list(image_files or []),
+                    include_tool_header,
+                    turn_preparer=turn_preparer,
+                )
+            ) as stream:
+                async for item in stream:
+                    yield item
         finally:
             self._inflight -= 1
             if self._inflight <= 0:
@@ -1835,9 +1735,11 @@ class SingleChatManager:
         prompt_to_send: str,
         image_files: List[str],
         include_tool_header: bool = True,
+        turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
     ):
         self.total_requests += 1
         stage = "lock"
+        image_files = list(image_files or [])
         image_deadline = (
             _request_deadline(IMAGE_REQUEST_TIMEOUT) if image_files else None
         )
@@ -1848,7 +1750,7 @@ class SingleChatManager:
                 if image_deadline is not None
                 else LOCK_ACQUIRE_TIMEOUT
             )
-            await asyncio.wait_for(self.lock.acquire(), timeout=lock_timeout)
+            acquired_here = await self.acquire_turn_lock(timeout=lock_timeout)
         except asyncio.TimeoutError:
             cleanup_temp_images(image_files)
             self.total_errors += 1
@@ -1870,6 +1772,15 @@ class SingleChatManager:
 
         full_text = ""
         try:
+            if turn_preparer is not None:
+                prepared = turn_preparer(self)
+                if asyncio.iscoroutine(prepared):
+                    prepared = await prepared
+                prompt_to_send, prepared_images, include_tool_header = prepared
+                image_files = list(prepared_images or [])
+                if image_files and image_deadline is None:
+                    image_deadline = _request_deadline(IMAGE_REQUEST_TIMEOUT)
+
             stage = "throttle"
             elapsed = time.time() - self.last_request_ts
             if elapsed < MIN_REQUEST_INTERVAL:
@@ -1934,13 +1845,7 @@ class SingleChatManager:
                         f"Chars={len(prompt_to_send)}"
                         f"{f' | Images={len(image_files)}' if image_files else ''})"
                     )
-                    upstream_stream = (
-                        self.chat_session.send_message_stream(
-                            prompt_to_send, files=image_files
-                        )
-                        if image_files
-                        else self.chat_session.send_message_stream(prompt_to_send)
-                    )
+                    upstream_stream = self._open_chat_stream(prompt_to_send, image_files)
                     async for output in _iterate_stream_until(
                         upstream_stream,
                         stream_deadline,
@@ -1969,7 +1874,7 @@ class SingleChatManager:
                     yield "done", reply
                     return
 
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, GeneratorExit):
                     self._restore_chat_metadata_after_abort(saved_meta_before_send)
                     raise
 
@@ -2028,8 +1933,9 @@ class SingleChatManager:
                                 self._handle_quota_exhausted(exc)
                             )
                             while not task.done():
-                                yield "delta", ""
-                                await asyncio.sleep(2.5)
+                                await asyncio.wait({task}, timeout=2.5)
+                                if not task.done():
+                                    yield "delta", ""
                             switched = task.result()
                         if switched:
                             quota_switches += 1
@@ -2207,8 +2113,7 @@ class SingleChatManager:
                 "stage": stage,
             }
         finally:
-            if self.lock.locked():
-                self.lock.release()
+            self.release_turn_lock(acquired_here)
             cleanup_temp_images(image_files)
 
 

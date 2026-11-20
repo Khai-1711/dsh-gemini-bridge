@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import hmac
 import json
 import os
@@ -7,7 +8,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     try:
@@ -43,6 +44,7 @@ from app.config import (
     INSTANCE_LABEL,
     INSTANCE_PATHS,
     LANE_ADMIN_TOKEN,
+    LOCK_ACQUIRE_TIMEOUT,
     LOG_DIR,
     PEER_LANES,
     PORT,
@@ -55,10 +57,11 @@ from app.env_update import (
     is_valid_label,
     update_env_values,
 )
-from app.errors import BridgeError
+from app.errors import BridgeBusyError, BridgeError
 from app.gemini_session import (
     clear_response_cache,
     compute_session_key,
+    is_subagent_messages,
     session_manager,
 )
 from app.lane_security import (
@@ -1197,6 +1200,8 @@ async def chat_completions(request: Request):
     else:
         model_id = session_manager.default_model
 
+    del body
+
     # Sticky Session Pool: tách riêng ChatSession theo từng hội thoại/subagent
     explicit_sid = (
         request.headers.get("X-Session-Id")
@@ -1204,45 +1209,42 @@ async def chat_completions(request: Request):
         or ""
     ).strip()
     conv_key, is_new_conv = compute_session_key(messages, explicit_sid)
-    if hasattr(session_manager, "activate_session_slot"):
-        await session_manager.activate_session_slot(
-            conv_key, is_new_conversation=is_new_conv
-        )
-    else:
-        has_dirty_chat_id = bool(
-            getattr(session_manager, "chat_session", None)
-            and getattr(session_manager.chat_session, "cid", None)
-        )
-        if is_new_conv and (session_manager.turn_count > 0 or has_dirty_chat_id):
-            logger.info("[SESSION] Phát hiện phiên hội thoại mới từ DSH -> Tự động làm mới ChatSession để tránh lỗi 1097 và nạp lại Tool Header.")
-            await session_manager.reset_session()
+    is_subagent = is_subagent_messages(messages)
 
-    # Ghi nhận hội thoại và sổ sự thật (Ledger)
-    session_manager.remember_transcript(messages)
-    if messages and messages[-1].get("role") == "user":
-        session_manager.ledger.note_user_goal(messages[-1].get("content"))
-    for m in reversed(messages):
-        if m.get("role") == "assistant":
-            break
-        if m.get("role") == "tool":
-            session_manager.ledger.note_tool_result(
-                m.get("tool_call_id"), m.get("content")
+    async def _prepare_locked_turn() -> Tuple[str, List[str], bool, Any]:
+        if hasattr(session_manager, "activate_session_slot"):
+            await session_manager.activate_session_slot(
+                conv_key, is_new_conversation=is_new_conv, is_subagent=is_subagent
             )
+        else:
+            has_dirty_chat_id = bool(
+                getattr(session_manager, "chat_session", None)
+                and getattr(session_manager.chat_session, "cid", None)
+            )
+            if is_new_conv and (session_manager.turn_count > 0 or has_dirty_chat_id):
+                logger.info(
+                    "[SESSION] Phát hiện phiên hội thoại mới từ DSH -> Tự động làm mới ChatSession để tránh lỗi 1097 và nạp lại Tool Header."
+                )
+                await session_manager.reset_session()
 
-    # Rút trích prompt gia tăng
-    tool_header = compile_tools_prompt(tools)
-    session_manager.remember_tool_header(tool_header)
-    needs_tool_header = session_manager.needs_tool_header
-    defer_tool_header = (
-        needs_tool_header and is_plain_greeting_request(messages)
-    )
-    prompt_to_send, image_files = build_incremental_prompt_and_files(
-        messages, tools, is_first_turn=needs_tool_header and not defer_tool_header
-    )
-    del body, messages, tools
+        session_manager.remember_transcript(messages)
+        active_ledger = session_manager.ledger
+        if messages and messages[-1].get("role") == "user":
+            active_ledger.note_user_goal(messages[-1].get("content"))
+        for m in reversed(messages):
+            if m.get("role") == "assistant":
+                break
+            if m.get("role") == "tool":
+                active_ledger.note_tool_result(m.get("tool_call_id"), m.get("content"))
 
-    # Tính toán ước tính số token (OpenAI Usage Stats)
-    prompt_tokens = max(1, len(prompt_to_send) // 4)
+        tool_header = compile_tools_prompt(tools)
+        session_manager.remember_tool_header(tool_header)
+        needs_tool_header = session_manager.needs_tool_header
+        defer_tool_header = needs_tool_header and is_plain_greeting_request(messages)
+        prompt_text, img_files = build_incremental_prompt_and_files(
+            messages, tools, is_first_turn=needs_tool_header and not defer_tool_header
+        )
+        return prompt_text, img_files, defer_tool_header, active_ledger
 
     def _content_chunk(piece: str) -> dict:
         return {
@@ -1277,9 +1279,44 @@ async def chat_completions(request: Request):
 
             queue: asyncio.Queue = asyncio.Queue()
             producer_done = asyncio.Event()
+            turn_state: dict = {
+                "prompt_chars": 0,
+                "prompt_tokens": 1,
+                "ledger": session_manager.ledger,
+            }
 
             async def producer():
+                acquired_lock = False
                 try:
+                    try:
+                        acquired_lock = await session_manager.acquire_turn_lock(
+                            LOCK_ACQUIRE_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        session_manager.total_errors += 1
+                        await queue.put(
+                            (
+                                "error",
+                                {
+                                    "message": "Bridge đang bận, thử lại sau vài giây.",
+                                    "type": BridgeBusyError.err_type,
+                                    "code": BridgeBusyError.code,
+                                    "stage": "lock",
+                                },
+                            )
+                        )
+                        return
+
+                    (
+                        prompt_to_send,
+                        image_files,
+                        defer_tool_header,
+                        active_ledger,
+                    ) = await _prepare_locked_turn()
+                    turn_state["prompt_chars"] = len(prompt_to_send)
+                    turn_state["prompt_tokens"] = max(1, len(prompt_to_send) // 4)
+                    turn_state["ledger"] = active_ledger
+
                     if defer_tool_header:
                         turn_stream = session_manager.send_prepared_turn_stream(
                             prompt_to_send,
@@ -1290,8 +1327,9 @@ async def chat_completions(request: Request):
                         turn_stream = session_manager.send_prepared_turn_stream(
                             prompt_to_send, image_files
                         )
-                    async for item in turn_stream:
-                        await queue.put(item)
+                    async with contextlib.aclosing(turn_stream) as stream:
+                        async for item in stream:
+                            await queue.put(item)
                 except Exception as exc:  # defensive
                     logger.error(f"[SSE] producer error: {exc}")
                     if isinstance(exc, BridgeError):
@@ -1308,6 +1346,7 @@ async def chat_completions(request: Request):
                         }
                     await queue.put(("error", error))
                 finally:
+                    session_manager.release_turn_lock(acquired_lock)
                     producer_done.set()
 
             prod_task = asyncio.create_task(producer())
@@ -1392,8 +1431,9 @@ async def chat_completions(request: Request):
                     yield f"data: {json.dumps({'error': error}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
-                session_manager.ledger.note_tool_calls(tool_calls)
-                session_manager.ledger.note_assistant(reply_text)
+                active_ledger = turn_state["ledger"]
+                active_ledger.note_tool_calls(tool_calls)
+                active_ledger.note_assistant(reply_text)
 
                 if tool_calls:
                     tc_deltas = [
@@ -1424,6 +1464,7 @@ async def chat_completions(request: Request):
                     finish_reason = "stop"
 
                 completion_tokens = max(1, len(reply_text) // 4)
+                prompt_tokens = turn_state["prompt_tokens"]
                 end_chunk = {
                     "id": chat_id,
                     "object": "chat.completion.chunk",
@@ -1444,7 +1485,7 @@ async def chat_completions(request: Request):
                     chat_key=session_manager.current_chat_key(),
                     auth_ok=session_manager.auth_ok,
                     stage="complete",
-                    prompt_chars=len(prompt_to_send),
+                    prompt_chars=turn_state["prompt_chars"],
                     reply_chars=len(reply_text),
                     finish=finish_reason,
                     tools=summarize_tool_calls(tool_calls),
@@ -1457,10 +1498,7 @@ async def chat_completions(request: Request):
             finally:
                 if not prod_task.done():
                     prod_task.cancel()
-                    try:
-                        await prod_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                await asyncio.gather(prod_task, return_exceptions=True)
 
         return StreamingResponse(
             sse_generator(),
@@ -1473,9 +1511,36 @@ async def chat_completions(request: Request):
         )
 
     # ─────────────────────────────────────────────────────────────────
-    # LUỒNG NON-STREAMING
+    # LUỒNG NON-STREAMING (1 lần giữ self.lock cho toàn lượt)
     # ─────────────────────────────────────────────────────────────────
+    acquired_lock = False
     try:
+        try:
+            acquired_lock = await session_manager.acquire_turn_lock(
+                LOCK_ACQUIRE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            session_manager.total_errors += 1
+            busy = BridgeBusyError("Bridge đang bận, thử lại sau vài giây.", stage="lock")
+            activity.write(
+                request_id=chat_id,
+                model=model_id,
+                stream=False,
+                chat_key=session_manager.current_chat_key(),
+                auth_ok=session_manager.auth_ok,
+                stage=busy.stage,
+                latency_ms=int((time.time() - t0) * 1000),
+                outcome=f"error:{busy.code}",
+            )
+            return JSONResponse(
+                status_code=busy.status_code,
+                content={"error": {"message": busy.message, "type": busy.err_type, "code": busy.code}},
+            )
+
+        prompt_to_send, image_files, defer_tool_header, active_ledger = (
+            await _prepare_locked_turn()
+        )
+        prompt_tokens = max(1, len(prompt_to_send) // 4)
         if defer_tool_header:
             reply_text = await session_manager.send_prepared_turn(
                 prompt_to_send,
@@ -1501,6 +1566,9 @@ async def chat_completions(request: Request):
             status_code=e.status_code,
             content={"error": {"message": e.message, "type": e.err_type, "code": e.code}},
         )
+    finally:
+        session_manager.release_turn_lock(acquired_lock)
+
     tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
     if has_tool_call_intent(reply_text) and not tool_calls:
         record_failed_tool_trace(
@@ -1529,8 +1597,8 @@ async def chat_completions(request: Request):
             status_code=502,
             content={"error": error},
         )
-    session_manager.ledger.note_tool_calls(tool_calls)
-    session_manager.ledger.note_assistant(reply_text)
+    active_ledger.note_tool_calls(tool_calls)
+    active_ledger.note_assistant(reply_text)
 
     if tool_calls:
         message_obj = {"role": "assistant", "content": None, "tool_calls": tool_calls}

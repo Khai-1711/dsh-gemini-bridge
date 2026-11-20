@@ -144,9 +144,10 @@ def build_handoff_message(
 class FactLedger:
     """Sổ sự thật tự dựng từ các tool call; ghi ledger.json trong thư mục handoff của instance."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, filename: str = "ledger.json", persist: bool = True):
         self.dir = Path(directory)
-        self.path = self.dir / "ledger.json"
+        self.persist = bool(persist)
+        self.path = self.dir / filename
         self.data = {
             "goal": "",
             "files": [],
@@ -155,14 +156,17 @@ class FactLedger:
             "last_reply": "",
             "pending": {},
         }
-        try:
-            old = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(old, dict):
-                self.data.update(old)
-        except Exception:
-            pass
+        if self.persist:
+            try:
+                old = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(old, dict):
+                    self.data.update(old)
+            except Exception:
+                pass
 
     def _save(self) -> None:
+        if not self.persist:
+            return
         tmp_name = None
         try:
             self.dir.mkdir(parents=True, exist_ok=True)

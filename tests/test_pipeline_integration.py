@@ -467,7 +467,8 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
         mgr.allow_guest = False
         mgr.is_guest = False
         mgr.auth_ok = True
-        mgr.vision_disabled_until = 0.0
+        mgr._last_recover_ts = 0.0
+        mgr._evaluate_auth = MagicMock(return_value=True)
         mgr._pending_handoff = None
         mgr._fake_quota_done = False
         mgr._session_pool = {}
@@ -613,6 +614,107 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(new1)
         self.assertFalse(new2)
         self.assertEqual(k1, k2)
+
+    async def test_concurrent_lead_and_subagent_slots_and_ledgers_isolated(self):
+        import contextlib
+        import httpx
+
+        with tempfile.TemporaryDirectory() as td:
+            handoff_dir = Path(td)
+            mgr = self._make_pool_manager()
+            mgr.ensure_authenticated = AsyncMock(return_value=True)
+            with patch.dict(gs.INSTANCE_PATHS, {"handoff_dir": handoff_dir}), \
+                 patch.object(gs, "MIN_REQUEST_INTERVAL", 0):
+                mgr._lead_ledger = FactLedger(handoff_dir, filename="ledger.json", persist=True)
+                mgr.ledger = mgr._lead_ledger
+
+                lead_payload = {
+                    "messages": [
+                        {"role": "user", "content": '<system-reminder>\nYour name is "lead".\n</system-reminder>'},
+                        {"role": "user", "content": "LEAD_UNIQUE_GOAL"},
+                    ],
+                    "stream": True,
+                }
+                sub_payload = {
+                    "messages": [
+                        {"role": "user", "content": '<system-reminder>\nYour name is "agent-qa".\n</system-reminder>'},
+                        {"role": "user", "content": "SUBAGENT_SHOULD_NOT_OVERWRITE_DISK"},
+                    ],
+                    "stream": False,
+                }
+
+                with patch.object(app_main, "session_manager", mgr), \
+                     patch.object(app_main, "API_KEY", ""), \
+                     patch.object(app_main.activity, "write"):
+                    transport = httpx.ASGITransport(app=app_main.app)
+                    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:10001") as ac:
+                        r_lead, r_sub = await asyncio.gather(
+                            ac.post("/v1/chat/completions", json=lead_payload),
+                            ac.post("/v1/chat/completions", json=sub_payload),
+                        )
+
+                self.assertEqual(r_lead.status_code, 200)
+                self.assertEqual(r_sub.status_code, 200)
+                self.assertIn("reply-from-", r_lead.text)
+                self.assertIn("reply-from-", r_sub.json()["choices"][0]["message"]["content"])
+                max_active, created = mgr.get_concurrency_stats()
+                self.assertEqual(max_active, 1)
+                self.assertGreaterEqual(len(created), 2)
+                disk_ledger = json.loads((handoff_dir / "ledger.json").read_text(encoding="utf-8"))
+                self.assertEqual(disk_ledger["goal"], "LEAD_UNIQUE_GOAL")
+                self.assertFalse(mgr.lock.locked())
+
+                # Verify early stream close releases lock and restores metadata
+                slow_chat = created[0]
+                prev_meta = ["cid_prev", "r1", "rc1"] + [None] * 7
+                slow_chat.metadata = list(prev_meta)
+
+                async def _abortable_stream(_prompt):
+                    slow_chat.metadata[1] = "rid_mutated"
+                    yield SimpleNamespace(text_delta="partial")
+                    await asyncio.sleep(5)
+
+                slow_chat.send_message_stream = _abortable_stream
+                mgr.chat_session = slow_chat
+                mgr.turn_count = 1
+                mgr.session_initialized = True
+                stream = mgr.send_prepared_turn_stream("abort test", [])
+                async with contextlib.aclosing(stream) as gen:
+                    first_item = await gen.__anext__()
+                    self.assertEqual(first_item, ("delta", "partial"))
+                self.assertFalse(mgr.lock.locked())
+                self.assertIsNot(mgr.chat_session, slow_chat)
+                self.assertEqual(mgr.chat_session.metadata[0], "cid_prev")
+                self.assertEqual(mgr.chat_session.metadata[1], "r1")
+
+    async def test_nonstream_inherits_soft_first_byte_fallback(self):
+        mgr = self._make_pool_manager()
+        mgr.default_model = "gemini-4-hydrogen"
+        mgr.available_models = ["gemini-4-hydrogen", "unspecified"]
+        mgr.chain = [{"label": "acc1", "psid": "p", "psidts": "t", "key": "k"}]
+
+        async def _slow_stream(_prompt):
+            await asyncio.sleep(0.25)
+            yield SimpleNamespace(text_delta="late")
+
+        async def _fast_stream(_prompt):
+            yield SimpleNamespace(text_delta="fast fallback")
+
+        mgr._create_new_chat_session()
+        mgr.chat_session.send_message_stream = _slow_stream
+        orig_start_chat = mgr.client.start_chat
+
+        def _start_chat_fast(**kw):
+            c = orig_start_chat(**kw)
+            c.send_message_stream = _fast_stream
+            return c
+
+        mgr.client.start_chat = MagicMock(side_effect=_start_chat_fast)
+        with patch.object(gs, "MODEL_FIRST_BYTE_FALLBACK_TIMEOUT", 0.05), \
+             patch.object(gs, "GEMINI_HARD_TIMEOUT", 20.0):
+            reply = await mgr.send_prepared_turn("hello nonstream", [])
+        self.assertEqual(reply, "fast fallback")
+        self.assertEqual(mgr.default_model, "unspecified")
 
 
 if __name__ == "__main__":
