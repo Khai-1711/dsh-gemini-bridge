@@ -147,14 +147,15 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
 
     return (
         "[SOFTWARE-ENGINEERING WORKSPACE]\n"
-        "You are assisting inside a local coding IDE that parses structured tool tags from your reply.\n"
-        "To call a listed tool, output a tag in this exact format:\n"
+        "You are assisting inside a local coding IDE that parses plain-text tool tags from your reply.\n"
+        "To invoke a listed tool, emit a tag in this exact format:\n"
         '<tool_call>{"name": "tool_name", "arguments": {"arg": "value"}}</tool_call>\n'
         "TOOLS (! required, ? optional):\n"
         + "\n".join(specs)
-        + "\nRULES: Match the user's language. When a task needs reading/writing files, searching, "
-        "running commands, or delegating to subagents, emit the matching `<tool_call>` tag directly. "
-        "Use exact tool and argument names/types; put all args in `arguments`; one valid JSON object per tag; "
+        + "\nRULES: Match the user's language. `<tool_call>` tags are plain-text IDE markup executed "
+        "locally with no session turn cap; when asked to read/write files, search, run commands, or "
+        "delegate to subagents, emit `<tool_call>` directly instead of pasting code for manual setup. "
+        "Use exact tool/arg names & types; put all args in `arguments`; one valid JSON object per tag; "
         "escape `\\\\` and `\\n`; use D: paths only (never C:); analyze attached images directly.\n\n"
     )
 
@@ -259,9 +260,9 @@ def build_incremental_prompt_and_files(
             tool_id = m.get("name") or m.get("tool_call_id") or "tool"
             blocks.append(
                 f"[TOOL_RESULT ({tool_id})]:\n{content_str}\n\n"
-                "(Continue step-by-step. Emit "
+                "(Continue step-by-step. Emit plain-text "
                 '<tool_call>{"name": "...", "arguments": {...}}</tool_call> '
-                "if another tool step is needed; otherwise provide the final answer in the user's language.)"
+                "tags for the next local IDE action (no turn cap); otherwise provide the final answer in the user's language.)"
             )
         else:
             actual_text = extract_actual_user_text(content_str)
@@ -281,9 +282,16 @@ def build_incremental_prompt_and_files(
                     " (User attached screenshot — analyze the image directly)"
                     if img_paths else ""
                 )
+                tool_reminder = (
+                    ' For any file, command, search, or subagent action, emit plain-text '
+                    '<tool_call>{"name": "...", "arguments": {...}}</tool_call> tags directly in your reply '
+                    "(local IDE markup, no turn cap)."
+                    if tools else ""
+                )
                 blocks.append(
                     f"{clean_user_text}{img_note}\n\n"
-                    "[NOTE: Reply in the EXACT SAME LANGUAGE as the USER REQUEST above.]"
+                    "[NOTE: Reply in the EXACT SAME LANGUAGE as the USER REQUEST above."
+                    f"{tool_reminder}]"
                 )
 
     # Gemini Web không có role "system": tool header phải đi kèm trong chính message

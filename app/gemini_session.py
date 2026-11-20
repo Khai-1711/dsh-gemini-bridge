@@ -3,14 +3,16 @@ from gemini_webapi import GeminiClient  # noqa: F401
 
 from app.config import (
     DISABLE_DRAIN_TIMEOUT,  # noqa: F401
+    GEMINI_CHUNK_IDLE_TIMEOUT,  # noqa: F401
     GEMINI_HARD_TIMEOUT,  # noqa: F401
+    GEMINI_STREAM_OVERALL_TIMEOUT,  # noqa: F401
     IMAGE_REQUEST_TIMEOUT,  # noqa: F401
     INSTANCE_PATHS,
     MIN_REQUEST_INTERVAL,  # noqa: F401
+    MODEL_FIRST_BYTE_FALLBACK_TIMEOUT,  # noqa: F401
 )
 
 SESSION_STATE_FILE = INSTANCE_PATHS["session_file"]
-MODEL_FIRST_BYTE_FALLBACK_TIMEOUT = 35.0
 
 
 def clear_response_cache() -> int:
@@ -32,7 +34,9 @@ session_manager = SingleChatManager()
 
 __all__ = [
     "DISABLE_DRAIN_TIMEOUT",
+    "GEMINI_CHUNK_IDLE_TIMEOUT",
     "GEMINI_HARD_TIMEOUT",
+    "GEMINI_STREAM_OVERALL_TIMEOUT",
     "GeminiClient",
     "IMAGE_REQUEST_TIMEOUT",
     "INSTANCE_PATHS",

@@ -108,6 +108,21 @@ DISABLE_DRAIN_TIMEOUT = float(os.getenv("DISABLE_DRAIN_TIMEOUT", "120"))
 # Giới hạn cứng 90s (< 120s của gemini_webapi)
 GEMINI_HARD_TIMEOUT = int(os.getenv("GEMINI_HARD_TIMEOUT", "90"))
 
+# Timeout chờ chunk đầu tiên (thoughts hoặc text) trước khi soft-fallback sang model khác (giây)
+MODEL_FIRST_BYTE_FALLBACK_TIMEOUT = float(
+    os.getenv("MODEL_FIRST_BYTE_FALLBACK_TIMEOUT", "50")
+)
+
+# Idle timeout giữa các chunk sau khi đã nhận thoughts_delta hoặc text_delta (giây)
+GEMINI_CHUNK_IDLE_TIMEOUT = float(
+    os.getenv("GEMINI_CHUNK_IDLE_TIMEOUT", "40")
+)
+
+# Trần tổng thời gian cho 1 lượt stream sau khi model đã bắt đầu phản hồi (giây)
+GEMINI_STREAM_OVERALL_TIMEOUT = float(
+    os.getenv("GEMINI_STREAM_OVERALL_TIMEOUT", str(max(180, GEMINI_HARD_TIMEOUT)))
+)
+
 # Total deadline for direct image upload and the Gemini response.
 IMAGE_REQUEST_TIMEOUT = float(os.getenv("IMAGE_REQUEST_TIMEOUT", "90"))
 if not math.isfinite(IMAGE_REQUEST_TIMEOUT) or not 0 < IMAGE_REQUEST_TIMEOUT <= 120:

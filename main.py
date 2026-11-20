@@ -32,6 +32,7 @@ from app.config import (
     logger,
 )
 from app.gemini_session import session_manager
+from app.gateway_router import GatewayRouter
 from app.lane_security import check_bind_safety, is_host_header_allowed, lane_token_ok
 from app.lanes import LaneRegistry, spawn_local_lane
 from app.prompt_builder import build_incremental_prompt_and_files  # noqa: F401
@@ -55,6 +56,11 @@ lane_registry = LaneRegistry(
     spawn_fn=spawn_local_lane,
     is_frontend_gateway=is_frontend_gateway,
 )
+gateway_router = GatewayRouter(
+    lane_registry=lane_registry,
+    api_key=API_KEY,
+    activity_cb=lambda **kw: activity.write(**kw),
+)
 
 
 @asynccontextmanager
@@ -68,8 +74,9 @@ async def lifespan(fastapi_app: FastAPI):
         logger.critical(msg)
 
     if is_frontend_gateway:
+        gateway_router.active = True
         logger.info(
-            f"[GATEWAY] Khởi động Cổng Frontend Gateway trên port {PORT}. Sẵn sàng điều phối các luồng."
+            f"[GATEWAY] Khởi động Cổng Frontend Gateway trên port {PORT}. Sẵn sàng điều phối các luồng: {list(PEER_LANES.keys())}."
         )
     elif API_START_ON:
         try:
@@ -79,6 +86,8 @@ async def lifespan(fastapi_app: FastAPI):
     else:
         logger.info("[CONTROL] Bridge khởi động ở trạng thái TẮT. Hãy bật ở dashboard.")
     yield
+    gateway_router.active = False
+    await gateway_router.close()
     await session_manager.close()
 
 
@@ -89,6 +98,7 @@ app = FastAPI(
 )
 app.state.session_manager = session_manager
 app.state.lane_registry = lane_registry
+app.state.gateway_router = gateway_router
 app.state.activity = activity
 
 if FRONTEND_DIR.exists():

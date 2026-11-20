@@ -572,3 +572,11 @@ async def lane_account_cookies(lane_id: str, slot: int, request: Request):
     req_body = json.dumps({"psid": psid, "psidts": psidts, "label": label}).encode("utf-8")
     status_code, data = await reg.proxy_request(lane_id, "POST", f"accounts/{slot}/cookies", body=req_body, timeout=30.0)
     return JSONResponse(status_code=status_code, content=data)
+
+
+@admin_router.get("/v1/gateway/routes")
+async def gateway_routes():
+    gw = getattr(_m(), "gateway_router", None)
+    if gw is None:
+        return {"active": False}
+    return gw.get_stats()

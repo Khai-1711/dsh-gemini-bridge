@@ -64,25 +64,37 @@ async def _await_with_deadline(awaitable, deadline: Optional[float]):
 
 
 async def _iterate_stream_until(
-    stream, deadline: float, first_chunk_deadline: Optional[float] = None
+    stream,
+    deadline: float,
+    first_chunk_deadline: Optional[float] = None,
+    chunk_idle_timeout: Optional[float] = None,
+    overall_deadline: Optional[float] = None,
 ):
-    """Iterate an async response stream against an absolute deadline."""
+    """Iterate an async response stream with initial, per-chunk idle, and overall deadlines."""
     iterator = stream.__aiter__()
-    got_text = False
+    got_activity = False
+    stream_cap = overall_deadline if overall_deadline is not None else deadline
     while True:
-        active_deadline = (
-            min(deadline, first_chunk_deadline)
-            if (first_chunk_deadline is not None and not got_text)
-            else deadline
-        )
+        if not got_activity:
+            active_deadline = (
+                min(deadline, first_chunk_deadline)
+                if first_chunk_deadline is not None
+                else deadline
+            )
+        else:
+            active_deadline = stream_cap
+            if chunk_idle_timeout is not None:
+                active_deadline = min(
+                    stream_cap, asyncio.get_running_loop().time() + chunk_idle_timeout
+                )
         try:
             item = await asyncio.wait_for(
                 iterator.__anext__(), timeout=_remaining_timeout(active_deadline)
             )
         except StopAsyncIteration:
             return
-        if getattr(item, "text_delta", None):
-            got_text = True
+        if getattr(item, "text_delta", None) or getattr(item, "thoughts_delta", None):
+            got_activity = True
         yield item
 
 
@@ -150,6 +162,9 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         self._active_psid: str = initial_acc["psid"]
         self._last_recover_ts: float = 0.0
         self.last_tool_header: str = ""
+        self.last_turn_model: str = ""
+        self.last_turn_fallback_from: Optional[str] = None
+        self.last_turn_prompt_chars: int = 0
 
         try:
             write_chain_file(
@@ -642,6 +657,8 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         hard_timeout = gs.GEMINI_HARD_TIMEOUT
         min_interval = gs.MIN_REQUEST_INTERVAL
         first_byte_timeout = gs.MODEL_FIRST_BYTE_FALLBACK_TIMEOUT
+        chunk_idle_timeout = gs.GEMINI_CHUNK_IDLE_TIMEOUT
+        stream_overall_timeout = gs.GEMINI_STREAM_OVERALL_TIMEOUT
 
         self.total_requests += 1
         stage = "lock"
@@ -695,17 +712,33 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
             attempt, quota_switches, failover_attempts = 0, 0, 0
             max_failover_attempts = max(len(self.chain), 1)
             yielded_any = False
-            overall_deadline = image_deadline if image_deadline is not None else (asyncio.get_running_loop().time() + hard_timeout)
+            requested_model = str(self.default_model or "unspecified").strip() or "unspecified"
+            fallback_from: Optional[str] = None
+            self.last_turn_model = requested_model
+            self.last_turn_fallback_from = None
+            self.last_turn_prompt_chars = 0
+            turn_start = asyncio.get_running_loop().time()
+            stream_cap = (
+                image_deadline
+                if image_deadline is not None
+                else (turn_start + stream_overall_timeout)
+            )
 
             while attempt < 2:
                 stage = "vision_upload" if image_files else "text_generation"
                 saved_meta_before_send = self._sanitize_chat_metadata_before_send()
                 prompt_to_send = self._ensure_header_in_prompt(self._apply_pending_handoff(base_prompt), include_tool_header)
+                self.last_turn_prompt_chars = len(prompt_to_send)
                 now_ts = asyncio.get_running_loop().time()
+                initial_deadline = (
+                    image_deadline
+                    if image_deadline is not None
+                    else min(stream_cap, now_ts + hard_timeout)
+                )
                 soft_fallback_eligible = (
                     attempt == 0
                     and str(self.default_model or "").strip() not in ("", "unspecified")
-                    and (overall_deadline - now_ts) > (first_byte_timeout + 10.0)
+                    and (initial_deadline - now_ts) > (first_byte_timeout + 10.0)
                 )
                 first_chunk_deadline = (now_ts + first_byte_timeout) if soft_fallback_eligible else None
                 try:
@@ -714,7 +747,13 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         raise UsageLimitExceededError("DEBUG: giả lập hết quota (BRIDGE_DEBUG_FAKE_QUOTA)")
 
                     logger.info(f"Stream vào ChatSession (Turn={self.turn_count + 1} | Chars={len(prompt_to_send)}{f' | Images={len(image_files)}' if image_files else ''})")
-                    async for output in _iterate_stream_until(self._open_chat_stream(prompt_to_send, image_files), overall_deadline, first_chunk_deadline=first_chunk_deadline):
+                    async for output in _iterate_stream_until(
+                        self._open_chat_stream(prompt_to_send, image_files),
+                        initial_deadline,
+                        first_chunk_deadline=first_chunk_deadline,
+                        chunk_idle_timeout=chunk_idle_timeout,
+                        overall_deadline=stream_cap,
+                    ):
                         delta = output.text_delta or ""
                         if delta:
                             yielded_any = True
@@ -728,10 +767,12 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     self._consecutive_auth_errors = 0
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
+                    if fallback_from is not None and hasattr(self.chat_session, "metadata"):
+                        self._create_new_chat_session(preserve_metadata=list(self.chat_session.metadata))
+                    elif self.turn_count % 15 == 0 and hasattr(self.chat_session, "metadata"):
+                        self._create_new_chat_session(preserve_metadata=list(self.chat_session.metadata))
                     self._save_session()
                     self._sync_active_session_slot()
-                    if self.turn_count % 15 == 0 and hasattr(self.chat_session, "metadata"):
-                        self._create_new_chat_session(preserve_metadata=list(self.chat_session.metadata))
                     yield "done", reply
                     return
 
@@ -740,19 +781,38 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     raise
 
                 except asyncio.TimeoutError:
-                    if soft_fallback_eligible and not yielded_any and asyncio.get_running_loop().time() < overall_deadline - 5.0:
-                        old_model = self.default_model
-                        self.default_model = self._select_fallback_model()
-                        logger.warning(f"[MODEL_FALLBACK] Model '{old_model}' không phản hồi sau {first_byte_timeout:g}s -> Tự động chuyển sang '{self.default_model}' và gửi lại!")
-                        self._restore_chat_metadata_after_abort(saved_meta_before_send)
-                        self._save_session()
+                    retry_margin = min(5.0, max(0.05, stream_overall_timeout * 0.1))
+                    if (
+                        soft_fallback_eligible
+                        and not yielded_any
+                        and asyncio.get_running_loop().time() < (stream_cap - retry_margin)
+                    ):
+                        fallback_model = self._select_fallback_model()
+                        fallback_from = requested_model
+                        self.last_turn_model = fallback_model
+                        self.last_turn_fallback_from = fallback_from
+                        logger.warning(
+                            f"[MODEL_FALLBACK] Model '{requested_model}' không phản hồi sau {first_byte_timeout:g}s "
+                            f"-> Tạm chuyển lượt này sang '{fallback_model}' và nạp lại tool header!"
+                        )
+                        self.tool_header_sent = False
+                        self.chat_tool_header_hash = ""
+                        self._restore_chat_metadata_after_abort(saved_meta_before_send, model_override=fallback_model)
                         attempt += 1
                         continue
                     self._restore_chat_metadata_after_abort(saved_meta_before_send)
-                    timeout = img_timeout if (image_deadline is not None and image_deadline <= asyncio.get_running_loop().time()) else hard_timeout
-                    logger.error(f"Quá thời gian {timeout}s!")
+                    now_end = asyncio.get_running_loop().time()
+                    if image_deadline is not None and image_deadline <= now_end:
+                        timeout = img_timeout
+                    elif now_end >= stream_cap - 0.05:
+                        timeout = stream_overall_timeout
+                    elif yielded_any:
+                        timeout = chunk_idle_timeout
+                    else:
+                        timeout = hard_timeout
+                    logger.error(f"Quá thời gian {timeout:g}s!")
                     self.total_errors += 1
-                    yield "error", {"message": f"Gemini không phản hồi sau {timeout}s.", "type": BridgeTimeoutError.err_type, "code": BridgeTimeoutError.code, "stage": stage}
+                    yield "error", {"message": f"Gemini không phản hồi sau {timeout:g}s.", "type": BridgeTimeoutError.err_type, "code": BridgeTimeoutError.code, "stage": stage}
                     return
 
                 except UsageLimitExceededError as exc:
@@ -785,20 +845,25 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         logger.warning("Stream failed after response began (%s).", type(exc).__name__)
                         err_cls = BridgeAuthError if self._is_auth_error(exc) else BridgeUpstreamError
                         msg = "Gemini authentication failed after streaming began." if err_cls is BridgeAuthError else "Gemini stream failed after response began."
+                        if fallback_from is not None:
+                            self._restore_chat_metadata_after_abort(saved_meta_before_send)
                         yield "error", {"message": msg, "type": err_cls.err_type, "code": err_cls.code, "stage": stage}
                         return
 
                     logger.warning(f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {exc}")
                     if "1097" in str(exc) or ("carbon" in str(self.default_model).lower() and not self._is_auth_error(exc)):
+                        old_model = str(self.default_model or "unspecified")
                         fallback_target = self._select_fallback_model()
                         logger.warning(f"[MODEL_FALLBACK] Model '{self.default_model}' bị lỗi ({exc}). Tự động fallback sang '{fallback_target}' và mở lại kết nối mới!")
                         try:
-                            ok, err_payload, failover_attempts = await self._recover_client_after_error(stage, image_deadline, failover_attempts, max_failover_attempts, raise_init_error=False)
+                            ok, err_payload, failover_attempts = await self._recover_client_after_error(stage, stream_cap if image_deadline is None else image_deadline, failover_attempts, max_failover_attempts, raise_init_error=False)
                             if err_payload is not None:
                                 yield "error", err_payload
                                 return
                             if ok:
                                 self.default_model = fallback_target
+                                self.last_turn_model = fallback_target
+                                self.last_turn_fallback_from = old_model
                                 self._create_new_chat_session(preserve_metadata=None)
                                 self._save_session()
                                 attempt += 1
@@ -823,9 +888,13 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                             full_text = ""
                             attempt += 1
                     else:
+                        if fallback_from is not None:
+                            self._restore_chat_metadata_after_abort(saved_meta_before_send)
                         yield "error", {"message": f"Lỗi kết nối Gemini Web: {exc}", "type": BridgeUpstreamError.err_type, "code": BridgeUpstreamError.code, "stage": stage}
                         return
 
+            if fallback_from is not None:
+                self._restore_chat_metadata_after_abort(saved_meta_before_send)
             yield "error", {"message": "Không nhận được phản hồi từ Gemini.", "type": BridgeUpstreamError.err_type, "code": BridgeUpstreamError.code, "stage": stage}
         except asyncio.TimeoutError:
             if image_deadline is None:

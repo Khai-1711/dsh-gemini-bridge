@@ -714,7 +714,131 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
              patch.object(gs, "GEMINI_HARD_TIMEOUT", 20.0):
             reply = await mgr.send_prepared_turn("hello nonstream", [])
         self.assertEqual(reply, "fast fallback")
-        self.assertEqual(mgr.default_model, "unspecified")
+        self.assertEqual(mgr.default_model, "gemini-4-hydrogen")
+        self.assertEqual(mgr.last_turn_model, "unspecified")
+        self.assertEqual(mgr.last_turn_fallback_from, "gemini-4-hydrogen")
+
+    async def test_stream_soft_fallback_logs_actual_model_and_keeps_default_model(self):
+        import httpx
+        from app.activity import ActivityJournal
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            session_file = td_path / "session.json"
+            activity_file = td_path / "activity.jsonl"
+            handoff_dir = td_path / "handoff"
+            handoff_dir.mkdir(parents=True, exist_ok=True)
+            journal = ActivityJournal(activity_file, "acc1")
+            try:
+                req_messages = [
+                    {"role": "user", "content": "len ke hoach"},
+                    {"role": "assistant", "content": "ke hoach ok"},
+                    {"role": "user", "content": "thực hiện đi"},
+                ]
+                conv_key, _ = gs.compute_session_key(req_messages)
+
+                mgr = self._make_pool_manager()
+                mgr.ensure_authenticated = AsyncMock(return_value=True)
+                mgr.chain = [{"label": "acc1", "psid": "p", "psidts": "t", "key": "k"}]
+                mgr.active_index = 0
+                mgr._active_psid = "p"
+                mgr._save_session = gs.SingleChatManager._save_session.__get__(mgr)
+                mgr.default_model = "gemini-neon"
+                mgr.available_models = ["gemini-neon", "gemini-4-hydrogen"]
+                mgr._create_new_chat_session()
+                mgr.session_initialized = True
+                mgr.tool_header_sent = True
+                mgr.turn_count = 1
+                mgr.chat_session.metadata = ["c_prev", "r_prev", "rc_prev"] + [None] * 7
+
+                tools_payload = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "write",
+                            "description": "Write a file",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "file_path": {"type": "string"},
+                                    "content": {"type": "string"},
+                                },
+                                "required": ["file_path", "content"],
+                            },
+                        },
+                    }
+                ]
+                from app.prompt_builder import compile_tools_prompt
+                from app.session_pool import _tool_header_fingerprint
+
+                compiled = compile_tools_prompt(tools_payload)
+                mgr.last_tool_header = compiled
+                mgr.chat_tool_header_hash = _tool_header_fingerprint(compiled)
+                mgr._active_session_key = conv_key
+                mgr._sync_active_session_slot()
+
+                seen_prompts = []
+
+                async def _slow_stream(prompt):
+                    seen_prompts.append(prompt)
+                    await asyncio.sleep(0.25)
+                    yield SimpleNamespace(text_delta="late")
+
+                async def _fast_stream(prompt):
+                    seen_prompts.append(prompt)
+                    yield SimpleNamespace(text_delta="Thuc hien ngay.")
+
+                orig_start_chat = mgr.client.start_chat
+
+                def _start_chat_fallback(**kw):
+                    c = orig_start_chat(**kw)
+                    c.send_message_stream = _fast_stream
+                    return c
+
+                mgr.chat_session.send_message_stream = _slow_stream
+                mgr.client.start_chat = MagicMock(side_effect=_start_chat_fallback)
+
+                recorded_entries = []
+                def _capture_activity(**kw):
+                    entry = journal.write(**kw)
+                    recorded_entries.append(entry)
+                    return entry
+
+                with patch.object(gs, "SESSION_STATE_FILE", session_file), \
+                     patch.dict(gs.INSTANCE_PATHS, {"handoff_dir": handoff_dir}), \
+                     patch.object(gs, "MODEL_FIRST_BYTE_FALLBACK_TIMEOUT", 0.05), \
+                     patch.object(gs, "GEMINI_HARD_TIMEOUT", 20.0), \
+                     patch.object(app_main, "session_manager", mgr), \
+                     patch.object(app_main, "API_KEY", ""), \
+                     patch.object(app_main.activity, "write", side_effect=_capture_activity):
+                    mgr._lead_ledger = FactLedger(handoff_dir, filename="ledger.json", persist=True)
+                    mgr.ledger = mgr._lead_ledger
+                    transport = httpx.ASGITransport(app=app_main.app)
+                    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:10001") as ac:
+                        resp = await ac.post(
+                            "/v1/chat/completions",
+                            json={
+                                "model": "gemini-neon",
+                                "stream": True,
+                                "messages": req_messages,
+                                "tools": tools_payload,
+                            },
+                        )
+
+                self.assertEqual(resp.status_code, 200)
+                self.assertIn("Thuc hien ngay.", resp.text)
+                self.assertEqual(mgr.default_model, "gemini-neon")
+                saved_session = json.loads(session_file.read_text(encoding="utf-8"))
+                self.assertEqual(saved_session["model"], "gemini-neon")
+                self.assertEqual(len(seen_prompts), 2)
+                self.assertNotIn("WORKSPACE TOOLS", seen_prompts[0])
+                self.assertIn("=== WORKSPACE TOOLS ===", seen_prompts[1])
+                self.assertEqual(len(recorded_entries), 1)
+                self.assertEqual(recorded_entries[0]["model"], "gemini-4-hydrogen")
+                self.assertEqual(recorded_entries[0]["fallback_from"], "gemini-neon")
+                self.assertEqual(recorded_entries[0]["prompt_chars"], len(seen_prompts[1]))
+            finally:
+                journal.close()
 
     def test_batch_six_tool_calls_with_one_broken_tag_fails_closed_with_index(self):
         from app.tool_parser import parse_tool_calls_detailed

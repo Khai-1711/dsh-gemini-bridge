@@ -94,6 +94,14 @@ class TestPromptBuilder(unittest.TestCase):
         messages = [{"role": "user", "content": "continue"}]
         prompt, _ = build_incremental_prompt_and_files(messages, tools, is_first_turn=False)
         self.assertNotIn("WORKSPACE TOOLS", prompt)
+        self.assertIn("<tool_call>", prompt)
+
+        prompt_vn, _ = build_incremental_prompt_and_files(
+            [{"role": "user", "content": "thực hiện đi"}], tools, is_first_turn=False
+        )
+        self.assertNotIn("WORKSPACE TOOLS", prompt_vn)
+        self.assertIn("<tool_call>", prompt_vn)
+        self.assertIn("no turn cap", prompt_vn)
 
     def test_compile_tools_prompt_uses_request_schema_without_placeholder_tools(self):
         tools = [
@@ -123,6 +131,10 @@ class TestPromptBuilder(unittest.TestCase):
         self.assertIn("!file_path:string", prompt)
         self.assertIn("Path of the file to inspect", prompt)
         self.assertIn("?recursive:boolean", prompt)
+        self.assertIn("plain-text", prompt)
+        self.assertIn("no session turn cap", prompt)
+        self.assertNotIn("OPERATOR INSTRUCTIONS", prompt)
+        self.assertNotIn("ignore", prompt.lower())
         self.assertNotIn("required_key", prompt)
         self.assertNotIn("ToolName", prompt)
         self.assertNotIn("Pwsh", prompt)

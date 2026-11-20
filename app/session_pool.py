@@ -162,10 +162,15 @@ def _tool_header_fingerprint(header: str) -> str:
 class SessionPoolMixin:
     """Mixin quản lý Sticky Session Pool, metadata và lưu/khôi phục ChatSession."""
 
-    def _create_new_chat_session(self, preserve_metadata: Optional[list] = None) -> None:
+    def _create_new_chat_session(
+        self,
+        preserve_metadata: Optional[list] = None,
+        model_override: Optional[str] = None,
+    ) -> None:
         kwargs = {}
-        if self.default_model and self.default_model != "unspecified":
-            kwargs["model"] = str(self.default_model)
+        target_model = self.default_model if model_override is None else model_override
+        if target_model and target_model != "unspecified":
+            kwargs["model"] = str(target_model)
         if preserve_metadata:
             kwargs["metadata"] = preserve_metadata
 
@@ -364,14 +369,22 @@ class SessionPoolMixin:
             return None
         return saved_meta
 
-    def _restore_chat_metadata_after_abort(self, saved_meta: Optional[list]) -> None:
+    def _restore_chat_metadata_after_abort(
+        self,
+        saved_meta: Optional[list],
+        model_override: Optional[str] = None,
+    ) -> None:
         has_valid_saved = bool(
             saved_meta and len(saved_meta) >= 3 and saved_meta[0] and saved_meta[2]
         )
         if has_valid_saved:
-            self._create_new_chat_session(preserve_metadata=list(saved_meta))
+            self._create_new_chat_session(
+                preserve_metadata=list(saved_meta), model_override=model_override
+            )
         else:
-            self._create_new_chat_session(preserve_metadata=None)
+            self._create_new_chat_session(
+                preserve_metadata=None, model_override=model_override
+            )
         self._sync_active_session_slot()
 
     def _resume_saved_session(self, saved: dict) -> bool:
