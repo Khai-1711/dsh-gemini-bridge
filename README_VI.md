@@ -1,319 +1,162 @@
-# DSH Gemini Agent Bridge (v3.0 - Bản Doanh Nghiệp Chuẩn Modular)
+# DSH Gemini Agent Bridge (v3.1 - Bản Kiến Trúc Gateway Modular)
 
 > 🌐 **Ngôn ngữ:** [English](README.md) | **Tiếng Việt**
 
-> **Cổng Proxy Tương Thích Chuẩn OpenAI & Bộ Điều Phối Coding Agent cho Gemini Web (`gemini_webapi`) trên DeepSeek Harness (`pi-ai`), Cline, và Roo Code.**
+> **Cổng Proxy Chuẩn OpenAI, Bộ Chia Tải Đa Luồng (Gateway `:10000`) & Cầu Nối Thực Thi Agent cho Gemini Web (`gemini_webapi`) trên DeepSeek Harness (`pi-ai`), Cline và Roo Code.**
 
-Dự án này cung cấp một lớp trung gian (Middleware Bridge) biến giao diện **Google Gemini Web** thành một Backend chuẩn **OpenAI Chat Completions API** có đầy đủ khả năng **Function Calling (Tool Use)**, **Multimodal Vision (Đọc hiểu hình ảnh 3 tầng)**, **Stateful Single-Session**, cơ chế **Failover tự động**, và giao diện **Web Dashboard giám sát trực quan**.
+Biến giao diện **Google Gemini Web** thành Backend chuẩn **OpenAI Chat Completions** (`/v1/chat/completions`, `/v1/responses`) hỗ trợ **Tool Calling (`<tool_call>`)**, **chia tải song song Lead + Subagent qua Gateway (`:10000`)**, **gửi ảnh trực tiếp**, **Sticky Session Pool**, **Cookie Failover + Flash Handoff** và **Web Dashboard W3C Custom Elements**.
 
 ---
 
-## Điểm Nhấn Kỹ Thuật (v3.0)
+## Điểm Nhấn Kỹ Thuật (v3.1)
 
-1. **Zero-Spam Single ChatSession:** Gom toàn bộ chuỗi hành động của Agent (Read → Glob → Edit → Pwsh) vào **đúng 1 đoạn chat duy nhất** trên Gemini Web thông qua cơ chế truyền tải Delta gia tăng. Giảm 90% dung lượng prompt và bảo vệ tài khoản khỏi bộ lọc chống spam của Google.
-2. **Anti-Timeout SSE Heartbeat:** Triển khai cơ chế phát xung `: keep-alive\n\n` định kỳ mỗi 2.5 giây trên luồng Server-Sent Events, triệt tiêu hoàn toàn lỗi client idle timeout và vòng lặp treo `[Recovery]`.
-3. **Cookie Failover Pool & Hot-Reload:** Tự động phát hiện khi cookie chính bị hết hạn và chuyển đổi tức thì sang tài khoản Google dự phòng (`BACKUP_1PSID`), hoặc nạp cookie mới qua API `POST /v1/update-cookies` mà không cần tắt server.
-4. **Hàng Đợi Có Giới Hạn Thời Gian (Lock Timeout):** Cơ chế `asyncio.Lock` với giới hạn chờ 30 giây, trả về thông báo bận (HTTP 429) ngay lập tức thay vì để tác vụ treo vô hạn khi nhiều luồng cùng gọi.
-5. **Bộ Nhớ Đệm Phản Hồi (Prompt Cache):** Tự động lưu cache các phản hồi lặp lại (TTL 5 phút) theo mã băm SHA-256 của prompt, giảm thiểu độ trễ xuống dưới 1ms cho các truy vấn trùng lặp.
-6. **Smart Truncation (Rút ngắn ngữ cảnh thông minh):** Ưu tiên bảo vệ và giữ nguyên các khối thông báo lỗi, stack trace quan trọng khi kết quả chạy lệnh vượt quá giới hạn ký tự.
-7. **Tầng Thị Giác Đa Tầng (3-Tier Vision Pipeline):** Tự động nén ảnh Base64 (Pillow JPEG), thử nghiệm gửi trực tiếp Native Gemini Web, và tự động chuyển tiếp qua bộ ba OCR (`RapidOCR` → `Windows 11 Native WinRT OCR` → `Tesseract OCR`) nếu cổng upload gặp sự cố.
-8. **Tường Lửa Ổ C Cứng Rắn (Strict Path & Shell Firewall):** Triệt tiêu hoàn toàn rủi ro vượt ngục đường dẫn (`os.path.realpath` chặn `..\..\..\Windows`) và lọc sạch các biến môi trường, kỹ thuật escape PowerShell can thiệp vào ổ hệ thống (`C:\`).
-9. **Dashboard Theo Chuẩn Web Components:** Giao diện điều khiển module hóa xây dựng bằng **W3C Custom Elements** và **ES Modules** (không cần Node.js, không cần build), hỗ trợ đầy đủ Dark/Light theme và chuyển ngữ EN/VI.
+1. **Bộ Định Tuyến Gateway Thông Minh (`app/gateway_router.py` trên `:10000`):** Tự động tách **Lead** và các **Subagent** chạy song song qua hai luồng worker (`acc1` `:10001` & `acc2` `:10002`) theo `session_key` bám dính (`STICKY_TTL=3600s`) + chọn luồng ít `inflight` nhất, stream SSE pass-through không buffer, tự failover khi gặp `429`/`503`/`ConnectError`, giải phóng `inflight` ngay khi client ngắt kết nối và sinh tiêu đề phiên cục bộ (`GET /v1/gateway/routes`).
+2. **Sticky Session Pool & Tách Ledger Độc Lập (`app/session_pool.py`, `app/handoff.py`):** Cô lập từng ngăn phiên chat (`cid`/`rid`/`rcid`) cho **Lead** (`handoff/<id>/ledger.json` lưu đĩa) và tối đa **16 Subagent** đồng thời (`FactLedger` in-memory để không ghi đè lẫn nhau).
+3. **Timeout Theo Hoạt Động (`thoughts_delta` + `text_delta`) & Soft-Fallback Tạm Thời (`app/gemini_runtime.py`):** Ghi nhận cả `thoughts_delta` lẫn `text_delta` là luồng còn sống; áp dụng `MODEL_FIRST_BYTE_FALLBACK_TIMEOUT` (`50s`), `GEMINI_CHUNK_IDLE_TIMEOUT` (`40s`/chunk) và `GEMINI_STREAM_OVERALL_TIMEOUT` (`180s`). Khi fallback do timeout: **chỉ đổi model cho riêng lượt đó** (không hạ cấp vĩnh viễn `default_model`), reset `tool_header_sent=False` trên đúng `SessionSlot` và **gắn lại ngay `=== WORKSPACE TOOLS ===`** ở lượt retry, đồng thời ghi đúng `model` thực tế + `fallback_from` vào `logs/activity*.jsonl`.
+4. **Parser Batch Fail-Closed (`app/tool_parser.py`, `app/streaming.py`):** Tách `<tool_call>` tuyến tính `O(N)` kết hợp `json-repair` và fallback raw JSON tới `64 KB` (`MAX_RAW_JSON_FALLBACK_CHARS=65536`). Nếu trong batch có bất kỳ thẻ nào vỡ/thiếu thẻ đóng, hệ thống **từ chối cả batch** kèm chẩn đoán rõ (`thẻ #N`), lưu vết vào `logs/failure_traces*.jsonl` và tuyệt đối không chạy dở dang một nửa batch.
+5. **Gửi Ảnh Trực Tiếp Không Qua OCR Cục Bộ (`app/vision.py`):** Trích xuất ảnh Base64, nén tối ưu JPEG (nếu có `pillow` tùy chọn) và upload thẳng lên Gemini Web qua `files=[]`.
+6. **Multi-Account Failover & Flash Handoff (`app/account_pool.py`, `app/handoff_runner.py`):** Tự động xoay tài khoản khi cạn quota/lỗi auth với cooldown từng slot (`QUOTA_COOLDOWN_HOURS`, `AUTH_COOLDOWN_MINUTES`) và dùng Flash tóm tắt `FactLedger` bàn giao sang tài khoản kế tiếp.
+7. **SSE Heartbeat & Khóa Tuần Tự Theo Worker:** Phát `: keep-alive\n\n` mỗi `2.5s` chống idle timeout và tuần tự hóa request trên mỗi worker bằng `asyncio.Lock(timeout=LOCK_ACQUIRE_TIMEOUT)`.
+8. **Tường Lửa Ổ C (`app/security.py`):** Chuẩn hóa đường dẫn bằng `os.path.realpath` theo `DEFAULT_PROJECT_DIR` và chặn các truy cập/lệnh PowerShell nguy hiểm chạm tới ổ `C:\`.
+9. **Dashboard Web Components (`frontend/`):** Giao diện quản trị thuần **W3C Custom Elements + ES Modules** (không cần Node.js/build), hỗ trợ EN/VI, Dark/Light, điều khiển đa luồng và nạp nóng cookie.
 
 ---
 
 ## Cấu Trúc Dự Án
 
-```
+```text
 dsh_gemini_bridge/
-├── app/                          # Backend Core Modules
-│   ├── __init__.py               # Khởi tạo gói core v3.0
-│   ├── config.py                 # Cấu hình tập trung, kiểm tra .env khi khởi động & File Logger
-│   ├── security.py               # Tường lửa ổ C:\ (Path Jail & PowerShell Filter)
-│   ├── vision.py                 # Pipeline xử lý ảnh Base64, nén ảnh & 3-Engine OCR Fallback
-│   ├── prompt_builder.py         # Nạp tool schema, Smart Truncation & Language Matching
-│   ├── tool_parser.py            # Bóc tách thẻ XML <tool_call> (Hỗ trợ Parallel) & Auto-Mapper
-│   └── gemini_session.py         # Quản lý Stateful Session, Lock Timeout, Failover & Cache
-├── frontend/                     # 🧩 Frontend Modular (W3C Web Components)
-│   ├── index.html                # Skeleton ngữ nghĩa (chỉ ~30 dòng gọn gàng)
-│   ├── css/
-│   │   ├── variables.css         # Design Tokens, Colors, Dark/Light Themes
-│   │   ├── terminal.css          # CSS riêng cho Log Console & Syntax
-│   │   └── main.css              # Main Stylesheet tổng hợp & Layout
-│   └── js/
-│       ├── api.js                # API Client Service Layer
-│       ├── state.js              # Reactive State Store & Event Bus
-│       ├── i18n.js               # Từ điển đa ngôn ngữ (EN / VI)
-│       ├── app.js                # Bootstrap Entrypoint
-│       └── components/           # Các Custom Elements độc lập
-│           ├── BridgeNavbar.js        # <bridge-navbar> (Logo, ping, EN/VI & Dark/Light toggle)
-│           ├── BridgeMetrics.js       # <bridge-metrics> (4 Telemetry Cards)
-│           ├── BridgeTerminal.js      # <bridge-terminal> (Console lọc nhật ký & Search)
-│           ├── BridgeModelSwitch.js   # <bridge-model-switch> (Chuyển đổi model Gemini)
-│           ├── BridgeCookieManager.js # <bridge-cookie-manager> (Nạp nóng cookie & ẩn mật khẩu)
-│           ├── BridgeQuickActions.js  # <bridge-quick-actions> (Reset session & Xóa cache)
-│           └── BridgeToast.js         # <bridge-toast> (Hệ thống thông báo nổi)
-├── logs/                         # Thư mục lưu log tự động (xoay vòng 5MB x 3 bản)
-├── main.py                       # FastAPI Controller, Middleware Auth & Static Mounting
-├── .env.example                  # Tệp cấu hình mẫu
-├── requirements.txt              # Danh sách thư viện phụ thuộc
-├── ARCHITECTURE.md               # Tài liệu thiết kế kiến trúc chi tiết (English)
-├── ARCHITECTURE_VI.md            # Tài liệu thiết kế kiến trúc chi tiết (Tiếng Việt)
-├── README.md                     # Tài liệu hướng dẫn triển khai & vận hành (English)
-└── README_VI.md                  # Tài liệu hướng dẫn triển khai & vận hành (Tiếng Việt)
+├── app/
+│   ├── __init__.py
+│   ├── accounts.py           # Nạp chuỗi tài khoản & phát hiện trùng tài khoản giữa các luồng
+│   ├── account_pool.py       # Failover tài khoản, quản lý cooldown & gọi Flash handoff
+│   ├── activity.py           # Nhật ký activity*.jsonl & failure_traces*.jsonl từng instance
+│   ├── config.py             # Đường dẫn theo instance, .env, cấu hình timeout & logger xoay vòng
+│   ├── control.py            # Đọc API_START_STATE & chuẩn hóa trạng thái khởi động
+│   ├── env_update.py         # Cập nhật nóng cookie vào file .env*
+│   ├── errors.py             # Ánh xạ BridgeError -> mã HTTP & JSON chuẩn OpenAI
+│   ├── gateway_router.py     # Bộ chia tải Gateway Sticky + Least-Inflight + Failover (:10000)
+│   ├── gemini_runtime.py     # Lõi SingleChatManager, vòng stream thống nhất & fallback
+│   ├── gemini_session.py     # Facade tương thích ngược xuất session_manager & hằng số
+│   ├── handoff.py            # FactLedger ghi nhận mục tiêu/file/lỗi theo slot
+│   ├── handoff_runner.py     # Sinh bản tóm tắt bàn giao khi chuyển tài khoản
+│   ├── lane_security.py      # Kiểm tra Host, Origin, LAN bind & X-Lane-Token
+│   ├── lanes.py              # LaneRegistry thăm dò trạng thái, proxy & spawn worker cục bộ
+│   ├── openai_adapter.py     # Router /v1/models, /v1/chat/completions, /v1/responses
+│   ├── prompt_builder.py     # Biên dịch tool schema, Smart Truncation & nhắc giao thức trung tính
+│   ├── routes_admin.py       # /health, /dashboard, /v1/control/*, /v1/lanes/*, /v1/gateway/routes
+│   ├── security.py           # Rail-guard ổ D & lọc lệnh PowerShell nguy hiểm
+│   ├── session_pool.py       # Sticky SessionSlot pool & lưu/khôi phục .bridge_session*.json
+│   ├── status_view.py        # Dựng payload trạng thái chẩn đoán cho /v1/status & /health
+│   ├── streaming.py          # ToolCallAwareStreamer ẩn thẻ <tool_call> khỏi luồng chữ SSE
+│   ├── title_generation.py   # Sinh tiêu đề hội thoại DSH cục bộ (< 5ms)
+│   ├── tool_parser.py        # Parser batch fail-closed <tool_call> + json-repair + Auto-Mapper
+│   └── vision.py             # Pipeline Base64 -> file ảnh tạm gửi thẳng Gemini Web
+├── frontend/                 # Web Dashboard W3C Custom Elements
+├── scripts/
+│   └── live_smoke.py         # Kịch bản kiểm tra nhanh với server đang chạy
+├── tests/                    # Bộ unit & integration test (201 tests)
+├── main.py                   # Entrypoint FastAPI mỏng (~206 dòng)
+├── run_all.bat               # Khởi động Gateway (:10000) + acc1 (:10001) + acc2 (:10002)
+├── run_acc1.bat / run_acc2.bat / run_frontend.bat / stop_all.bat
+├── .env.example              # File cấu hình mẫu
+├── requirements.txt          # Thư viện Python phụ thuộc
+├── ARCHITECTURE.md / ARCHITECTURE_VI.md
+└── README.md / README_VI.md
 ```
 
 ---
 
 ## Hướng Dẫn Cài Đặt & Khởi Chạy
 
-### 1. Cài đặt thư viện phụ thuộc
-Yêu cầu Python `>= 3.10`. Mở Terminal tại thư mục `dsh_gemini_bridge/` và chạy:
+### 1. Cài đặt thư viện
+Yêu cầu Python `>= 3.10`. Tại thư mục `dsh_gemini_bridge/`:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-*(Tùy chọn nâng cao cho nhận diện ảnh và nén ảnh)*:
+*(Tùy chọn: cài thêm `pillow` nếu muốn tự động nén/resize ảnh Base64 cỡ lớn trước khi gửi)*:
 ```bash
-pip install rapidocr-onnxruntime pillow
+pip install pillow
 ```
 
-### 2. Thiết lập cấu hình biến môi trường (`.env`)
-Sao chép tệp cấu hình mẫu `.env.example` thành `.env`:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Mở tệp `.env` và điền thông tin cookie từ trình duyệt đang đăng nhập tài khoản Google Gemini (F12 → **Application** → **Cookies** → `https://gemini.google.com`):
+### 2. Cấu hình môi trường (`.env`, `.env.acc1`, `.env.acc2`)
+Copy `.env.example` ra `.env` (và `.env.acc1`, `.env.acc2` khi chạy 2 luồng qua Gateway), lấy cookie từ trình duyệt (`F12` → **Application** → **Cookies** → `https://gemini.google.com`) rồi điền vào:
 
 ```ini
-# [BẮT BUỘC] Cookie tài khoản chính
 SECURE_1PSID=g.a000...
 SECURE_1PSIDTS=sidts-...
-
-# [TÙY CHỌN] Cookie tài khoản dự phòng (tự động chuyển đổi nếu tài khoản chính lỗi)
-BACKUP_1PSID=
-BACKUP_1PSIDTS=
-
-# [TÙY CHỌN] Mã khóa bảo vệ API (để trống nếu chỉ dùng trong mạng nội bộ)
-API_KEY=
-
-# Thư mục làm việc an toàn
 DEFAULT_PROJECT_DIR=D:\ABC
 ```
 
-### 3. Cấp quyền truy cập cho thư mục làm việc trên ổ D
-Để công cụ `Pwsh` của Agent có thể thao tác (tạo thư mục, ghi file, chạy node/python) mà không cần chạy DeepSeek Harness ở quyền Administrator (nhằm bảo vệ ổ C:\), hãy mở PowerShell và chạy lệnh sau một lần:
+*(Trên Windows, cấp quyền ghi thư mục làm việc ổ D một lần: `icacls "D:\ABC" /grant "$($env:USERNAME):(OI)(CI)F" /T`.)*
+
+### 3. Khởi động Gateway + 2 luồng worker (`run_all.bat`)
+- Bấm đúp **`run_all.bat`** để bật đồng bộ:
+  - **Cổng Gateway & Dashboard:** `http://127.0.0.1:10000`
+  - **Worker `acc1`:** `http://127.0.0.1:10001`
+  - **Worker `acc2`:** `http://127.0.0.1:10002`
+- Tắt toàn bộ tiến trình qua **`stop_all.bat`** (hoặc dùng nút **BẬT/TẮT** trên Dashboard để drain an toàn request đang chạy).
+
+---
+
+## Tích Hợp Vào DeepSeek Harness (`pi-ai`)
+
+Chỉ cần trỏ **Base URL** về cổng **Gateway `:10000`** để DSH tự chia tải song song cả Lead và các Subagent qua `acc1` + `acc2`:
+
+| Mục cấu hình | Giá trị |
+|---|---|
+| **API Protocol** | `OpenAI Chat Completions` |
+| **Base URL** | `http://127.0.0.1:10000/v1` |
+| **API Key** | Chuỗi bất kỳ (hoặc khớp `API_KEY` trong `.env` nếu có đặt) |
+| **Model ID** | ID chính xác từ `GET /v1/models` (vd `gemini-4-neon`, `gemini-4-hydrogen`) |
+
+> Khi cần test riêng từng tài khoản vẫn có thể gọi thẳng `http://127.0.0.1:10001/v1` (`acc1`) hoặc `http://127.0.0.1:10002/v1` (`acc2`). Không dùng chung cookie giữa `.env.acc1` và `.env.acc2` (kiểm tra `account_key` khác nhau trên `/v1/status`).
+
+---
+
+## Các Endpoint Quản Trị Hỗ Trợ
+
+| Phương thức | Đường dẫn | Mô tả |
+|---|---|---|
+| **POST** | `/v1/chat/completions`, `/v1/responses` | Xử lý hội thoại & tool calling (Gateway tự điều phối khi chạy `:10000`, worker xử lý trực tiếp). |
+| **GET** | `/v1/models` | Danh sách model thực tế trên tài khoản (Gateway tổng hợp từ các worker đang chạy). |
+| **GET** | `/v1/gateway/routes` | Xem trạng thái Gateway: `active`, `inflight`, `cooldowns` và bảng `sticky` theo session. |
+| **GET** | `/health`, `/v1/status` | Thông số uptime, tổng request, lỗi, trạng thái cookie và slot tài khoản. |
+| **GET** | `/dashboard` | Giao diện Web Dashboard quản trị. |
+| **GET/POST** | `/v1/control`, `/v1/control/enable`, `/v1/control/disable` | Xem/bật/tắt kết nối Gemini Web có drain an toàn. |
+| **POST** | `/v1/update-cookies`, `/v1/accounts/{slot}/cookies` | Nạp nóng cookie chính/dự phòng không cần khởi động lại. |
+| **POST** | `/v1/switch-model`, `/v1/reset`, `/v1/accounts/clear-exhausted` | Đổi model, làm mới phiên chat hoặc xóa thời gian nghỉ cooldown tài khoản. |
+| **GET** | `/v1/logs`, `/v1/activity` | Đọc log gần nhất và nhật ký JSONL (`model`, `fallback_from`, `tools`, `latency_ms`). |
+| **GET/POST** | `/v1/lanes`, `/v1/lanes/{lane_id}/*` | Giám sát và điều khiển từng luồng worker thông qua `X-Lane-Token`. |
+| **POST** | `/v1/cache/clear` | Endpoint tương thích ngược (`{"cleared_entries": 0}`). |
+
+---
+
+## Kiểm Thử & Vận Hành
+
+Chạy toàn bộ 201 unit & integration test:
 
 ```powershell
-icacls "D:\ABC" /grant "$($env:USERNAME):(OI)(CI)F" /T
+python -B -m unittest discover -s tests
 ```
 
-### 4. Khởi động nhanh cả hai luồng (`run_all.bat`)
-`run_all.bat` khởi động Cổng Dashboard (`10000`), Luồng 1 `acc1` (`10001`) và Luồng 2 `acc2` (`10002`) chỉ với **MỘT thao tác**:
-- **(a) Bấm đúp `run_all.bat`:** Script sẽ kiểm tra cổng lắng nghe và tự động khởi động tối đa 3 cửa sổ cmd thu nhỏ (`minimized`): một gateway và hai worker. Nếu tiến trình ở cổng tương ứng đã chạy, script tự động bỏ qua.
-- **(b) Tạo shortcut ra Desktop:** Bấm chuột phải vào `run_all.bat` → *Send to* → *Desktop (create shortcut)* để mở 2 luồng nhanh chóng từ màn hình chính.
-- **(c) Tự chạy khi khởi động máy:** Nhấn tổ hợp phím `Win + R` → gõ `shell:startup` → Enter → kéo shortcut của `run_all.bat` vào thư mục Startup này. Trong thuộc tính của Shortcut (Properties), chọn *Run: Minimized* để chạy ngầm gọn gàng.
-- **Dừng tiến trình:** Khi cần tắt hoàn toàn cả 2 tiến trình ngay lập tức, chạy `stop_all.bat`. Lưu ý: trong vận hành thông thường, hãy sử dụng công tắc **BẬT/TẮT** trên Dashboard để chờ request đang xử lý hoàn tất (drain an toàn).
+Chạy smoke test nhanh với bridge đang bật (`:10000` hoặc `:10001`):
 
-### 5. Khởi động thủ công từng luồng
-Tại thư mục `dsh_gemini_bridge/`, bạn vẫn có thể khởi chạy riêng lẻ từng luồng:
-```bash
-# Chạy luồng mặc định
-python main.py
-
-# Hoặc chạy riêng lẻ qua file .bat:
-run_acc1.bat    # Luồng 1 (acc1), cổng 10001
-run_acc2.bat    # Luồng 2 (acc2), cổng 10002
+```powershell
+python scripts/live_smoke.py --base-url http://127.0.0.1:10000
 ```
 
-Khi khởi động thành công, Terminal sẽ hiển thị:
-
-```
-2026-11-14 12:00:00 | INFO    | [DSH-Bridge] Đang khởi tạo Gemini WebClient...
-2026-11-14 12:00:02 | INFO    | [DSH-Bridge] Model khả dụng: ['unspecified', 'gemini-flash']
-2026-11-14 12:00:02 | INFO    | [DSH-Bridge] SingleChatManager sẵn sàng! Model: [gemini-flash]
-INFO:     Uvicorn running on http://127.0.0.1:10000 (Press CTRL+C to quit)
-```
-
-Mở trình duyệt truy cập Dashboard:
-👉 **`http://127.0.0.1:10000/dashboard`**
-
 ---
 
-## Tích Hợp Vào DeepSeek Harness (pi-ai)
+## Xử Lý Sự Cố Thường Gặp
 
-Vào giao diện **Settings → Model Providers** trên ứng dụng DeepSeek Harness:
-
-| Mục cấu hình     | Giá trị điền                                                    |
-|------------------|-----------------------------------------------------------------|
-| **API Protocol** | `OpenAI Chat Completions`                                       |
-| **Base URL**     | `http://127.0.0.1:10000/v1`                                     |
-| **API Key**      | Nhập chuỗi bất kỳ (hoặc khớp với biến `API_KEY` trong `.env`)   |
-| **Model ID**     | Một ID chính xác được trả về bởi endpoint `/v1/models`           |
-
----
-
-## Chạy 2 Agent Song Song (Multi-Instance Isolation)
-
-Bridge hỗ trợ chạy tối đa 2 Agent DSH độc lập cùng lúc từ **cùng một thư mục mã nguồn**, mỗi con dùng một tài khoản Google riêng biệt và một cổng riêng biệt mà không bao giờ xung đột hay lẫn lộn dữ liệu:
-
-### Bảng Định Danh Instance
-
-| ID | Tài khoản | Cổng | Agent DSH | File cấu hình | File session | Log chạy | Nhật ký công việc |
-|---|---|---|---|---|---|---|---|
-| `acc1` | Google A | 10001 | DSH 1 (dự án 1) | `.env.acc1` | `.bridge_session_acc1.json` | `logs/bridge_acc1.log` | `logs/activity_acc1.jsonl` |
-| `acc2` | Google B | 10002 | DSH 2 (dự án 2) | `.env.acc2` | `.bridge_session_acc2.json` | `logs/bridge_acc2.log` | `logs/activity_acc2.jsonl` |
-| *(default/gateway)* | - | 10000 | Dashboard / gateway | `.env` | `.bridge_session.json` | `logs/bridge.log` | `logs/activity.jsonl` |
-
-### Hướng Dẫn Cấu Hình & Chạy
-
-1. **Tạo 2 file môi trường:**
-   - Copy `.env.example` thành `.env.acc1`:
-     ```ini
-     PORT=10001
-     INSTANCE_LABEL="Agent-1"
-     PEER_LANES="acc2=http://127.0.0.1:10002"
-     LANE_ADMIN_TOKEN="<chuỗi ngẫu nhiên dài dùng chung cho cả 2 luồng>"
-     ```
-   - Copy `.env.example` thành `.env.acc2`:
-     ```ini
-     PORT=10002
-     INSTANCE_LABEL="Agent-2"
-     PEER_LANES="acc1=http://127.0.0.1:10001"
-     LANE_ADMIN_TOKEN="<cùng chuỗi token như ở .env.acc1>"
-     ```
-   - *Tạo token an toàn:* `python -c "import secrets; print(secrets.token_urlsafe(32))"`
-   - *Lưu ý bảo mật:* `LANE_ADMIN_TOKEN` là bí mật xác thực giữa 2 luồng, không commit ra ngoài (tất cả file `.env.*` đã nằm trong `.gitignore`).
-2. **Khởi chạy:**
-   - Nhấp đúp `run_acc1.bat` để chạy con `acc1` (cổng 10001).
-   - Nhấp đúp `run_acc2.bat` để chạy con `acc2` (cổng 10002).
-3. **Cấu hình DeepSeek Harness:**
-   - DSH 1: Base URL `http://127.0.0.1:10001/v1`
-   - DSH 2: Base URL `http://127.0.0.1:10002/v1`
-   - Dùng Model ID chính xác từ `GET /v1/models` của worker tương ứng. Cổng 10000 là gateway/dashboard, không phải endpoint chat của worker.
-4. **Theo dõi công việc riêng biệt:**
-   - Nhật ký hoạt động: `http://127.0.0.1:10001/v1/activity` và `http://127.0.0.1:10002/v1/activity`
-   - Dashboard: `http://127.0.0.1:10000/dashboard` (gateway) hoặc cổng worker tương ứng.
-5. **CẢNH BÁO QUAN TRỌNG VỀ TÀI KHOẢN:**
-   - TUYỆT ĐỐI KHÔNG dùng chung cookie giữa 2 instance (nếu dùng chung sẽ cùng vào 1 tài khoản).
-   - `BACKUP_1PSID` của instance này không được trùng với tài khoản của instance kia.
-   - Để lấy cookie: hãy đăng nhập mỗi tài khoản Google trong 1 Profile Chrome (hoặc cửa sổ ẩn danh Incognito) riêng biệt, copy cookie rồi đóng cửa sổ để tránh xoay cookie ngầm.
-   - Kiểm tra hai con có bị trùng tài khoản không bằng cách đối chiếu mã `account_key` tại `http://127.0.0.1:10001/v1/status` và `http://127.0.0.1:10002/v1/status` (2 mã hash 12 ký tự này bắt buộc phải khác nhau).
-
----
-
-## Danh Sách Các Endpoint Quản Trị Hỗ Trợ
-
-| Phương thức | Đường dẫn               | Mô tả chức năng                                                                            |
-|------------|-------------------------|---------------------------------------------------------------------------------------------|
-| **POST**   | `/v1/chat/completions`  | Endpoint chính xử lý hội thoại, hình ảnh và điều phối Tool Calling.                        |
-| **GET**    | `/v1/models`            | Trả về danh sách model thực tế được phát hiện trên tài khoản Google.                       |
-| **GET**    | `/health`               | Báo cáo chi tiết: Uptime, tổng số request, tỷ lệ lỗi, trạng thái cookie, dung lượng cache.  |
-| **GET**    | `/dashboard`            | Giao diện Web Dashboard điều khiển trực quan.                                              |
-| **GET**    | `/v1/control`           | Lấy trạng thái công tắc API (`off`, `starting`, `on`, `stopping`, `drain_timeout`).        |
-| **POST**   | `/v1/control/enable`    | Bật kết nối Gemini Web & mở nhận request cho Agent.                                       |
-| **POST**   | `/v1/control/disable`   | Tắt kết nối Gemini (chờ request đang chạy xong rồi mới đóng client).                      |
-| **POST**   | `/v1/update-cookies`    | Cập nhật `SECURE_1PSID` và `SECURE_1PSIDTS` mới ngay khi server đang chạy (không cần restart).|
-| **POST**   | `/v1/switch-model`      | Chuyển đổi linh hoạt giữa các model Gemini khả dụng (`gemini-flash`, v.v.).                |
-| **POST**   | `/v1/reset`             | Đóng đoạn chat hiện tại trên Gemini Web và tạo một đoạn chat mới tinh.                      |
-| **POST**   | `/v1/cache/clear`       | Xóa sạch các câu trả lời lưu trong bộ nhớ đệm cache.                                       |
-| **GET**    | `/v1/logs`              | Trích xuất 50 dòng log gần nhất từ file log của instance.                                  |
-| **GET**    | `/v1/activity`          | Nhật ký công việc chi tiết của chính instance (request, tool calls, model, latency).       |
-
----
-
-## Công Tắc BẬT/TẮT API Trên Dashboard (API Control Switch)
-
-Bridge tích hợp cơ chế kiểm soát kết nối chủ động:
-- **Khởi động ở trạng thái TẮT (mặc định):** Server web và dashboard vẫn hoạt động, nhưng **KHÔNG** kết nối Gemini Web và **KHÔNG** chạy vòng tự làm mới token ngầm (chống hao mòn / quét cookie khi không dùng).
-- **Mỗi Instance một công tắc riêng:** `acc1` trên `:10001/dashboard` và `acc2` trên `:10002/dashboard` có công tắc hoàn toàn độc lập. Dashboard gateway tại `:10000/dashboard` có thể điều khiển cả hai worker. Trạng thái không lưu ra đĩa (mỗi lần khởi động luôn theo biến `API_START_STATE`).
-
-### Bảng Hành Vi Trạng Thái
-
-| Trạng thái | Kết nối Gemini | /v1/chat/completions | Dashboard, /health, Công tắc |
-|---|---|---|---|
-| `off` | KHÔNG init | HTTP 503 (`code: "bridge_disabled"`) | Sử dụng bình thường |
-| `starting` | Đang init | HTTP 503 (`code: "bridge_disabled"`, đang khởi động) | Sử dụng bình thường |
-| `on` | Đã init | Nhận và xử lý bình thường | Sử dụng bình thường |
-| `stopping` | Đang chờ drain / ngắt | HTTP 503 (`code: "bridge_disabled"`, đang tắt) | Sử dụng bình thường |
-
-### Cấu Hình Liên Quan Trong `.env`
-
-```ini
-# Trạng thái lúc khởi động: off (mặc định) = chờ bấm BẬT trên dashboard; on = tự bật lúc chạy
-API_START_STATE=off
-
-# Số giây tối đa chờ request đang chạy dở hoàn thành khi bấm TẮT (mặc định: 120 giây)
-DISABLE_DRAIN_TIMEOUT=120
-
-# Deadline tổng cho mỗi yêu cầu có ảnh, gồm upload, OCR dự phòng và phản hồi (mặc định 90, tối đa 120 giây).
-# Xử lý ảnh trực tiếp dùng tối đa một nửa thời gian để dành phần còn lại cho OCR và phản hồi.
-IMAGE_REQUEST_TIMEOUT=90
-```
-
-### Cơ Chế Draining Khi Bấm TẮT
-1. Request **MỚI** sẽ lập tức bị từ chối với HTTP 503 `bridge_disabled`.
-2. Request **ĐANG CHẠY** được giữ cho chạy tới khi hoàn thành (tối đa `DISABLE_DRAIN_TIMEOUT` giây), sau đó Bridge lưu metadata session và đóng client.
-3. Nếu request chạy quá thời hạn quy định, Bridge sẽ **KHÔNG cắt ngang** (trả HTTP 409 `bridge_control_conflict` và giữ nguyên trạng thái `on` để bảo vệ dữ liệu).
-
-### Dùng Từ Máy Thứ Hai (An Toàn Mạng LAN)
-Khi cần truy cập Bridge hoặc Dashboard từ một máy tính khác trong cùng mạng nội bộ (LAN):
-1. **Thiết lập an toàn bắt buộc:**
-   - Trong file `.env` (hoặc `.env.acc1`, `.env.acc2`), đặt `HOST=0.0.0.0` VÀ BẮT BUỘC ĐẶT `API_KEY`:
-     ```ini
-     HOST=0.0.0.0
-     API_KEY=chuỗi_khóa_bí_mật_tự_chọn
-     ```
-   - *Cơ chế phòng thủ:* Nếu đặt `HOST=0.0.0.0` mà `API_KEY` để trống, Bridge sẽ **TỪ CHỐI KHỞI ĐỘNG** (thoát mã lỗi 1) để bảo vệ tài khoản Google của bạn khỏi truy cập trái phép từ các thiết bị khác trong mạng (trừ khi cố ý đặt `ALLOW_INSECURE_LAN=true`).
-2. **Tạo luật Windows Firewall giới hạn địa chỉ IP:**
-   Khuyến nghị chỉ cho phép IP cụ thể của máy thứ hai truy cập vào các cổng 10000/10001/10002 (chạy trong PowerShell với quyền Administrator):
-   ```powershell
-   New-NetFirewallRule -DisplayName "DSH Bridge" -Direction Inbound -LocalPort 10000,10001,10002 -Protocol TCP -RemoteAddress <IP_MÁY_2> -Action Allow
-   ```
-3. **Lưu ý bảo mật đường truyền:**
-   - Kết nối trên mạng LAN sử dụng giao thức HTTP thông thường (chưa mã hóa TLS/HTTPS), do đó API Key có thể bị nghe lén nếu kết nối qua mạng Wi-Fi không tin cậy. Chỉ nên sử dụng tính năng này trên mạng gia đình hoặc văn phòng tin cậy.
-
----
-
-## Xử Lý Sự Cố Thường Gặp (Troubleshooting)
-
-0. **Agent nhận mã lỗi HTTP 503 `bridge_disabled`:**
-   * **Triệu chứng:** Agent thông báo `Bridge đang TẮT. Hãy bật ở dashboard rồi thử lại.`
-   * **Cách xử lý:** Mở Dashboard của instance tương ứng (`http://127.0.0.1:10001/dashboard` cho `acc1` hoặc `http://127.0.0.1:10002/dashboard` cho `acc2`), hoặc Dashboard gateway `http://127.0.0.1:10000/dashboard` để điều khiển cả hai; bấm nút **BẬT**. Sau khi trạng thái chuyển sang màu xanh **BẬT**, gửi lại prompt trên Agent.
-
-1. **Xử lý khi bridge rơi vào Guest mode (Chưa đăng nhập):**
-   * **Triệu chứng:** Dashboard hiển thị huy hiệu `GUEST (CHƯA ĐĂNG NHẬP)` màu đỏ, request API từ Agent trả về HTTP 503 với mã lỗi `{"error": {"code": "gemini_not_authenticated", "message": "Gemini chưa đăng nhập..."}}`.
-   * **Nguyên nhân:** Cookie `SECURE_1PSID` hoặc `SECURE_1PSIDTS` đã hết hạn hoặc bị Google thu hồi (khi bạn đăng xuất trình duyệt hoặc đổi IP/đăng nhập từ thiết bị khác). Thư viện `gemini-webapi` 2.x có cơ chế tự động fallback về phiên Guest, nhưng Bridge đã chủ động chặn đứng phiên Guest để không làm hỏng dữ liệu chat và không mất tính năng Gemini Pro.
-   * **Cách xử lý:**
-     1. Mở trình duyệt Chrome → truy cập [https://gemini.google.com](https://gemini.google.com) → đảm bảo đang đăng nhập tài khoản Google của bạn.
-     2. Bấm `F12` → tab **Application** (hoặc Lưu trữ) → **Storage** → **Cookies** → `https://gemini.google.com`.
-     3. Sao chép giá trị của 2 cookie: `__Secure-1PSID` và `__Secure-1PSIDTS`.
-     4. Mở Dashboard Bridge (`http://127.0.0.1:10000/dashboard`) → dán vào thẻ **Quản Lý Cookie (Hot-Reload)** → bấm **Lưu & Cập Nhật**. Hoặc gửi API `POST /v1/update-cookies`. Cookie sẽ được nạp ngay mà không cần khởi động lại server.
-
-2. **Lỗi `[CONFIG ERROR] SECURE_1PSID is empty!` khi khởi động:**
-   * Bạn chưa tạo tệp `.env` hoặc chưa điền cookie. Hãy sao chép từ `.env.example` sang `.env` và điền giá trị.
-3. **Cảnh báo `COOKIE CÓ THỂ HẾT HẠN!` trong Logs:**
-   * Cookie phiên làm việc trên trình duyệt của bạn đã hết hạn. Mở lại trình duyệt Google Gemini, lấy lại 2 chuỗi cookie mới và gửi qua giao diện Dashboard hoặc lệnh:
-     ```bash
-     curl -X POST http://127.0.0.1:10000/v1/update-cookies -H "Content-Type: application/json" -d "{\"SECURE_1PSID\":\"...\",\"SECURE_1PSIDTS\":\"...\"}"
-     ```
-4. **Agent báo lỗi `missing required property` khi gọi Tool:**
-   * Cơ chế `Auto-Mapper` trong `app/tool_parser.py` sẽ tự động bổ sung và chuẩn hóa tên tham số (`path` → `file_path`, `cmd` → `command`, `filePath` ↔ `file_path`). Nếu có custom tool mới, bạn có thể bổ sung quy tắc ánh xạ vào hàm `normalize_tool_arguments()`.
-
----
-
-## Cập Nhật Gần Đây
-
-- **Fallback Thông Minh & Chống Treo 90s (`app/gemini_session.py`, `main.py`):**
-  - Ưu tiên `gemini-4-hydrogen` và chặn vòng lặp `MODEL_FALLBACK` tự fallback lại chính model vừa lỗi.
-  - Khi gặp lỗi `1097` hoặc chờ quá `35s` chưa có byte đầu tiên, tự động chuyển sang `unspecified` (`model=None`) và gọi `_evaluate_auth()` để báo lỗi xác thực rõ ràng thay vì âm thầm tụt xuống Guest Mode.
-  - Dọn/rollback metadata dở dang `[cid, rid, None]` khi timeout hoặc hủy giữa chừng, và tự động `reset_session()` khi DSH mở phiên hội thoại mới.
-- **Giao Thức Tool Text & Sửa JSON Chủ Động Bằng Local AI (`app/prompt_builder.py`, `app/tool_repair.py`, `app/tool_parser.py`):**
-  - Nén gọn schema tool và làm rõ `<tool_call>` là giao thức plain-text XML cho client ngoài (không phải tool nội bộ của Gemini), giúp agent chạy thông suốt qua các lượt `[TOOL_RESULT]` nối tiếp.
-  - Bật cơ chế chủ động sửa lỗi JSON tool call bằng Local AI (`Nemotron`, `TOOL_REPAIR_ENABLED=true`, hỗ trợ payload tới `16,000` ký tự / `4,096` token đầu ra) và giữ lại các tool call hợp lệ khi gọi song song.
-- **Đa Luồng Trên Windows & Kiểm Thử (`app/lanes.py`, `run_all.bat`, `tests/`):**
-  - Dùng `CREATE_NO_WINDOW` khi spawn worker trên Windows / Python 3.14 và sửa lỗi khoảng trắng biến môi trường trong `run_all.bat`.
-  - Đã kiểm thử tự động với **198 unit test**: `python -m unittest discover -s tests -q`.
+1. **Lỗi HTTP 503 `bridge_disabled` hoặc `no_healthy_lane`:**
+   Mở `http://127.0.0.1:10000/dashboard`, đảm bảo `acc1` và `acc2` đang ở trạng thái **BẬT** (`auth_ok=true`), hoặc đặt `API_START_STATE=on` trong `.env*`.
+2. **Cookie hết hạn hoặc rơi vào Guest Mode:**
+   Lấy lại `__Secure-1PSID` và `__Secure-1PSIDTS` từ `gemini.google.com` rồi dán vào **Quản Lý Cookie (Hot-Reload)** trên Dashboard (hoặc `POST /v1/update-cookies`). Đặt `ALLOW_GUEST_MODE=false` nếu muốn chặn hẳn Guest Mode thay vì cho chạy dự phòng.
+3. **Sửa code hoặc đổi cấu hình nhưng server vẫn chạy bản cũ:**
+   Nút Tắt/Bật trên Dashboard chỉ đóng/mở `GeminiClient` trong tiến trình Python đang nằm trên RAM. Sau khi sửa code, chạy `stop_all.bat` → xóa `.bridge_session*.json` nếu cần → mở lại `run_all.bat` rồi tạo **New Session** mới trên DSH.
+4. **Tool call báo lỗi cú pháp / thiếu thẻ đóng:**
+   Parser fail-closed trong [app/tool_parser.py](app/tool_parser.py) chặn thực thi nửa vời cả batch và ghi raw reply vào `logs/failure_traces*.jsonl` để kiểm tra nguyên nhân.

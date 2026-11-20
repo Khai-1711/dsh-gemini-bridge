@@ -1,128 +1,98 @@
-# System Architecture & Execution Pipeline (v3.0)
+# System Architecture & Execution Pipeline (v3.1)
 
 > 🌐 **Language:** **English** | [Tiếng Việt](ARCHITECTURE_VI.md)
 
-This document provides a comprehensive technical breakdown of the internal design, data flow pipelines, fault tolerance mechanisms, and multi-layered defense architecture in **DSH Gemini Agent Bridge v3.0**.
+This document breaks down the modular architecture, Gateway load-balancing pipeline, streaming timeout state machine, and fail-closed safety gates in **DSH Gemini Agent Bridge v3.1**.
 
 ---
 
 ## 1. End-to-End Request Lifecycle
 
-```
+```text
 [DeepSeek Harness (pi-ai) / Coding Agent Client]
         │
-        │ 1. POST /v1/chat/completions (OpenAI Payload: messages + tools + base64 images)
+        │ 1. POST /v1/chat/completions or /v1/responses (messages + tools + base64 images)
         ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ main.py (FastAPI Controller & SSE Multiplexer)                          │
-│  ├─ [Optional] API Key Authentication Middleware                        │
-│  ├─ Rút trích Delta Prompt & immediately release heavy payload from RAM │
-│  ├─ SHA-256 Response Cache lookup (TTL 5 mins, returns in <1ms)         │
-│  ├─ Immediate SSE stream initiation (First Chunk within 1ms)            │
-│  └─ Background heartbeat ": keep-alive\n\n" every 2.5s                  │
-└──────────────────────────────────┬──────────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│ app/gemini_session.py (SingleChatManager - Stateful Session Engine)     │
-│  ├─ asyncio.Lock(timeout=30s): Race condition & overload prevention     │
-│  ├─ Rate-Limit Pacing: Safe 0.5s - 2.0s interval smoothing              │
-│  ├─ Cookie Failover Pool: Auto-switches to standby backup on error      │
-│  └─ Maintains EXACTLY ONE PERSISTENT THREAD on Gemini Web               │
+│ Frontend Gateway (:10000) — main.py + app/openai_adapter.py             │
+│  ├─ Auth Middleware (API_KEY / X-Lane-Token / Allowed Hosts)            │
+│  ├─ app/title_generation.py: Local DSH session-title fast path (<5ms)   │
+│  └─ app/gateway_router.py (when GATEWAY is active):                     │
+│       ├─ compute_session_key() + is_subagent_messages()                 │
+│       ├─ Sticky binding (STICKY_TTL=3600s) + Least-Inflight selection   │
+│       ├─ Role spread: Lead -> acc1, parallel Subagents -> acc2 / idle   │
+│       └─ Zero-buffer SSE pass-through + 429/503/ConnectError failover   │
 └──────────────┬───────────────────────────────────────┬──────────────────┘
-               │                                       ▲
-               ▼ 2. Prompt Compilation & Vision        │ 6. Raw Response
-┌──────────────────────────────┐             ┌─────────┴──────────────────┐
-│ app/prompt_builder.py        │             │ Gemini Web (Google Server) │
-│  + app/vision.py             │────────────►│  - Handled on 1 Session    │
-│  ├─ Smart Truncation: Error  │ 3. Send via │  - Native image upload     │
-│     and stacktrace protection│    files=[] │  - auto_refresh=True       │
-│  ├─ Tier 1: Native Vision    │             └────────────────────────────┘
-│  ├─ Tier 2: 3-Engine OCR (RapidOCR -> WinRT -> Tesseract Fallback)      │
-│  └─ Sandwich Prompting: Strict Language Matching & Clarification First  │
-└──────────────────────────────┘
-               │
-               ▼ 7. Extraction & Security Gate
+               │ acc1 (:10001)                         │ acc2 (:10002)
+               ▼                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ app/tool_parser.py + app/security.py (Auto-Mapper & Hardened Sandbox)   │
-│  ├─ Linear O(N) tag parsing for <tool_call> (Parallel Tools Supported)  │
-│  ├─ Auto-Mapper: Key alignment (path->file_path, cmd->command, etc.)    │
-│  ├─ Path Jail: Realpath traversal neutralization blocking C:\           │
-│  └─ Shell Firewall: Drops Pwsh containing $env, backticks, IEX, C:\     │
+│ Worker OpenAI Adapter — app/openai_adapter.py                           │
+│  ├─ Select / isolate SessionSlot (app/session_pool.py) & FactLedger     │
+│  ├─ app/prompt_builder.py: Tool compiler (Turn 1), plain-text protocol  │
+│  │  reminders (Turn 2+), Smart Truncation on role=="tool" outputs       │
+│  ├─ app/vision.py: Base64 extract -> optional Pillow compress -> files  │
+│  └─ StreamingResponse + 2.5s ": keep-alive\n\n" SSE heartbeat           │
 └──────────────────────────────────┬──────────────────────────────────────┘
                                    │
-                                   │ 8. Stream OpenAI tool_calls or content
                                    ▼
-          [DeepSeek Harness executes local tools inside Drive D:]
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Worker Execution Core — app/gemini_runtime.py (SingleChatManager)       │
+│  ├─ SessionPoolMixin (app/session_pool.py): 16 slots, cid/rid/rcid lock │
+│  ├─ AccountPoolMixin (app/account_pool.py): Failover & cooldowns        │
+│  ├─ HandoffRunnerMixin (app/handoff_runner.py): Flash FactLedger handoff│
+│  └─ Stream Deadlines:                                                   │
+│       ├─ First activity (thoughts_delta OR text_delta): 50s fallback    │
+│       ├─ Per-chunk idle timeout: 40s | Overall stream cap: 180s         │
+│       └─ Ephemeral soft-fallback resets slot tool_header_sent + retries │
+│          immediately with WORKSPACE TOOLS, then restores default_model  │
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │ 3. Parsed Response Text
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Fail-Closed Protocol Gate — app/streaming.py + app/tool_parser.py       │
+│  ├─ ToolCallAwareStreamer suppresses <tool_call>...</tool_call> in SSE  │
+│  ├─ Linear O(N) extraction + json-repair + 64 KB raw JSON fallback      │
+│  ├─ Auto-Mapper normalizes arg aliases (path->file_path, cmd->command)  │
+│  └─ Any broken/unclosed tag fails the ENTIRE batch (failure_traces*.jsonl)
+└──────────────────────────────────┬──────────────────────────────────────┘
+                                   │ 4. OpenAI tool_calls or assistant text
+                                   ▼
+                [DeepSeek Harness executes local tools on Drive D:]
 ```
 
 ---
 
-## 2. In-Depth Component Analysis
+## 2. Core Subsystems
 
-### 2.1. Stateful Single-Chat Engine & Cookie Failover Pool
-* **The Stateless Dilemma:** Standard OpenAI-compatible coding agents re-send the full conversation history on each tool step. When calling standard web APIs, this creates dozens of separate conversations, causing prompt token bloat and Google anti-spam triggers.
-* **Stateful Delta Solution:**
-  * `SingleChatManager` initializes a single persistent `ChatSession` (`self.client.start_chat()`).
-  * On subsequent turns (`FirstTurn = False`), only the incremental delta (tool results `[TOOL_RESULT]` or new user feedback) is transmitted.
-* **Authentication Verification & Guest Mode Interception:**
-  * `gemini-webapi` 2.x silently drops into an unauthenticated Guest mode when cookies are invalid. The bridge explicitly verifies `client.account_status == AccountStatus.AVAILABLE` and `client._cookie_source != "Guest"` after every `init()`.
-  * If unauthenticated, requests are blocked with HTTP 503 (`gemini_not_authenticated`) to preserve the persistent chat and Gemini Pro access.
-* **Account-Bound Session Persistence (`account_key`):**
-  * `.bridge_session.json` includes an `account_key` (short SHA-256 hash of active PSID). On startup or cookie switch, session restoration requires matching account keys, preventing conversation cross-contamination.
-* **Failover Cookie Pool:**
-  * Tracks consecutive authentication errors (`_consecutive_auth_errors >= 2`).
-  * If consecutive auth errors occur, the system tears down the active client and re-initializes with the backup account (`BACKUP_1PSID`, `BACKUP_1PSIDTS`).
-  * Endpoints like `POST /v1/update-cookies` allow hot-reloading cookies at runtime without restarting the process.
-* **Queue Lock with Timeout:**
-  * Enforces `asyncio.wait_for(self.lock.acquire(), timeout=30.0)` so requests return a clean 429 Busy response rather than freezing indefinitely under load.
+### 2.1. Gateway Router (`app/gateway_router.py`)
+* **Automatic Multi-Lane Fan-Out:** Activated in `main.py` `lifespan()` when `PORT == 10000`, `INSTANCE_ID` is empty/`default`/`frontend`/`gateway`, and `PEER_LANES` is configured (`acc1=10001`, `acc2=10002`).
+* **Sticky + Least-Inflight Routing:** Computes the same `(conv_key, is_new_conv)` and `is_subagent` signals as workers. Subsequent turns of an active conversation stay pinned to their assigned worker (`STICKY_TTL=3600s`, `MAX_STICKY_SESSIONS=128`), while new Lead requests prefer `acc1` and new Subagents balance onto the lowest-inflight healthy peer (`acc2` first when tied with `acc1`).
+* **Resilient Failover & Cleanup:** On `ConnectError` or HTTP `429`/`503`, marks the failing lane in cooldown (`15s`) and retries once on an alternate healthy worker. On SSE client disconnect or upstream close, decrements `_gateway_inflight` in `finally`.
 
-### 2.2. Prompt Response Caching (Disabled by Default)
-* An in-memory SHA-256 prompt response cache with a 5-minute TTL.
-* **Disabled by default (`ENABLE_RESPONSE_CACHE=false`):** For coding agents, freshest code output is required. Only enable for static Q&A workloads via environment variable.
+### 2.2. Worker Runtime, Session Pool & Account Failover
+* **`app/gemini_runtime.py` (`SingleChatManager`):** Orchestrates per-turn `asyncio.Lock` serialization, throttling (`MIN_REQUEST_INTERVAL`), retry/recovery, and unified streaming (`send_prepared_turn` delegates directly to `_send_prepared_turn_stream_inner`).
+* **`app/session_pool.py` (`SessionPoolMixin`):** Maps each `conv_key` to an isolated `SessionSlot` (`SESSION_POOL_MAX_SIZE=16`, `SESSION_POOL_TTL=3600s`) so concurrent Lead and Subagent conversations never collide on `cid/rid/rcid` metadata. Lead persists `FactLedger` to `handoff/<id>/ledger.json`; Subagent slots use `FactLedger(..., persist=False)`.
+* **`app/account_pool.py` & `app/handoff_runner.py`:** Rotates backup cookies (`BACKUP_1PSID`..`BACKUP_4PSID`) on quota/auth errors with `.bridge_accounts*.json` cooldown tracking and Flash-model `FactLedger` handoff summaries. When `ALLOW_GUEST_MODE=false`, unauthenticated guest sessions are blocked with HTTP 503 (`gemini_not_authenticated`).
 
-### 2.3. 3-Tier Multimodal Vision Pipeline
-When screenshots are passed via Base64:
-1. **Pillow Optimization & Alpha Compositing:** Image dimensions are capped at 1600x1600 and compressed with JPEG 85% to protect RAM. Transparent images (RGBA/LA/paletted with transparency) are composited onto a white background before JPEG conversion. `Image.MAX_IMAGE_PIXELS = 50_000_000` prevents decompression bomb attacks.
-2. **Tier 1 (Native Vision Upload):** Directly streamed to Gemini Web's file attachment API. If transient errors occur, uploads are paused for 5 minutes (`vision_disabled_until`) rather than disabled permanently.
-3. **Tier 2 (3-Engine OCR Fallback):** If upload is blocked or fails:
-   * **Engine 1 - RapidOCR:** Lightweight ONNX Runtime OCR.
-   * **Engine 2 - Windows 11 Native WinRT OCR:** Zero-Python-memory extraction via Windows PowerShell `Windows.Media.Ocr`.
-   * **Engine 3 - Tesseract OCR:** Cross-platform fallback on Linux/macOS with automatic fallback from `-l eng+vie` to `-l eng`.
-   Extracted text is appended into the prompt context for native text analysis.
-4. **Safe Temporary File Lifecycle:** Only bridge-generated files in `_TEMP_FILES` are removed upon turn completion.
+### 2.3. Thoughts-Aware Deadlines & Ephemeral Soft-Fallback
+* `_iterate_stream_until()` monitors both `thoughts_delta` and `text_delta` so reasoning models (`gemini-neon`) are never aborted while emitting thinking chunks.
+* **Three-tier budget:** initial wait capped by `GEMINI_HARD_TIMEOUT` (`90s`) and `MODEL_FIRST_BYTE_FALLBACK_TIMEOUT` (`50s`); once `thoughts_delta` or `text_delta` starts, switches to `GEMINI_CHUNK_IDLE_TIMEOUT` (`40s`) per chunk under `GEMINI_STREAM_OVERALL_TIMEOUT` (`180s`).
+* **Ephemeral Soft-Fallback:** If the first chunk times out before `text_delta` begins, `SingleChatManager` uses `model_override` to retry on the fallback model **for that turn only**, resets `tool_header_sent=False` on the active `SessionSlot` so `_ensure_header_in_prompt` immediately re-attaches `=== WORKSPACE TOOLS ===`, restores `default_model` before `_save_session()`, and records actual `model` + `fallback_from` to `logs/activity*.jsonl`.
 
-### 2.4. Smart Truncation Engine
-* **Tool Result Only:** User and assistant conversation content is never truncated; smart truncation applies exclusively to `role == "tool"` outputs exceeding `MAX_TOOL_RESULT_CHARS` (default 12,000 characters).
-* Scans middle output for critical keywords (`Traceback`, `Error:`, `Exception:`, `fatal:`, etc.), preserves these in a protected `KEY ERRORS/WARNINGS PRESERVED` block, and safely handles any tail offsets.
+### 2.4. Direct Vision & Smart Truncation (`app/vision.py`, `app/prompt_builder.py`)
+* **Direct Native Vision:** Decodes Base64 images (optionally compressing large screenshots via `pillow`) and passes temporary files directly via Gemini Web's `files=[]` upload without local OCR layers. `_TEMP_FILES` cleanup runs in `finally`.
+* **Neutral Tool Protocol:** Frames `<tool_call>{...}</tool_call>` as plain-text IDE markup with no session turn cap, avoiding adversarial system-override phrases while reinforcing tool-tag output on `[TOOL_RESULT]` and subsequent user turns.
+* **Smart Truncation:** Applied strictly to `role == "tool"` messages exceeding `MAX_TOOL_RESULT_CHARS` (`12,000`), preserving head, tail, and error/traceback lines extracted from the middle.
 
-### 2.5. Rail-Guard Sandbox & Firewall
-* **Design Scope:** `app/security.py` operates as an internal developer rail guard for a single user, preventing common AI hallucination blunders; it is not an OS-level sandbox replacement.
-* **Path Traversal Neutralization:** Uses `os.path.realpath(os.path.abspath(path))` relative to `DEFAULT_PROJECT_DIR` to prevent traversal attacks (e.g. `..\..\Windows\System32`) aimed at Drive C:\ or system folders (`WINDOWS`, `PROGRAM FILES`, `PROGRAMDATA`).
-* **PowerShell Injection Filter:** Drops dangerous disk operations (`format <drive>:`), system registry tampering, environment variables (`$env:SystemDrive`, `$env:windir`), backtick escaping, `Invoke-Expression`, and .NET file API calls before execution reaches the agent. Safe CLI flags such as `prettier --format` are permitted.
+### 2.5. Fail-Closed Parsing & Rail-Guard Security (`app/tool_parser.py`, `app/security.py`)
+* **Batch Fail-Closed Parsing:** Extracts `<tool_call>` blocks sequentially, repairs minor JSON formatting issues via `json-repair`, supports raw JSON fallback up to `65,536` chars, and normalizes parameter aliases (`Auto-Mapper`). Any invalid or unclosed tag in a parallel batch aborts the entire batch (`HTTP 502` / SSE `invalid_tool_call`), logs raw output to `logs/failure_traces*.jsonl`, and executes zero tools.
+* **Drive D Rail-Guard (`app/security.py`):** Developer-focused guard validating `os.path.realpath` relative to `DEFAULT_PROJECT_DIR` and sanitizing dangerous PowerShell / Drive `C:\` patterns.
 
-### 2.6. Standard HTTP Status Code Mapping (OpenAI API Standard)
-All internal conditions map to standard HTTP errors:
-* **HTTP 429 (`rate_limit_error / bridge_busy`):** Concurrency lock timeout.
-* **HTTP 502 (`upstream_error / gemini_upstream_error`):** Gemini Web connection or upstream processing failure.
-* **HTTP 503 (`authentication_error / gemini_not_authenticated`):** Unauthenticated session or expired cookies (guest mode detected).
-* **HTTP 504 (`timeout_error / gemini_timeout`):** Gemini Web request timed out past `GEMINI_HARD_TIMEOUT`.
-
-### 2.6. Observability & File Logging
-* Dual logging to stdout and rotating log files (`logs/bridge.log`, 5MB × 3 backups).
-* Telemetry exposed via `GET /health` (uptime, throughput, error rates, cache statistics).
-
-### 2.7. Component-Driven Dashboard (`frontend/`)
-* Modular W3C Custom Elements and ES Modules without Node.js or bundlers.
-* Declarative skeleton in `frontend/index.html` (~30 lines).
-* Reactive store in `frontend/js/state.js`, modular API client in `frontend/js/api.js`, and i18n dictionary in `frontend/js/i18n.js`.
-
-### 2.8. On-Demand Connection Control & Draining
-* **Safe Default Startup:** Bridge starts in the `off` state by default (`API_START_STATE=off`). FastAPI and Dashboard remain online, but Gemini Web is completely disconnected without background token refresh loops running.
-* **4-State Lifecycle:** `off` → `starting` → `on` → `stopping` → `off`.
-* **Graceful In-flight Draining:** When STOP is clicked on the Dashboard:
-  1. Bridge enters `stopping` state and rejects new requests immediately with HTTP 503 `bridge_disabled`.
-  2. In-flight requests are awaited up to `DISABLE_DRAIN_TIMEOUT` seconds (default: 120s).
-  3. Once all active requests finish (`_inflight == 0`), session state is cleanly saved to disk and the client is closed.
-  4. If draining times out, bridge aborts disabling, stays `on`, and returns HTTP 409 `bridge_control_conflict` without terminating running requests.
-* **Origin Guard & LAN Support:** Protects state-mutation endpoints (`/v1/control/enable`, `/v1/control/disable`) against unauthorized browser origins while natively allowing localhost, loopback, and private LAN IP ranges (RFC 1918) for multi-computer setups.
+### 2.6. Observability & On-Demand Lifecycle
+* **Per-Instance Logging & Journals:** Rotating server logs (`logs/bridge*.log`), structured JSONL activity (`logs/activity*.jsonl`), and tool parse traces (`logs/failure_traces*.jsonl`).
+* **HTTP Error Mapping (`app/errors.py`):**
+  * `429` (`bridge_busy`): Worker turn lock timeout or Gateway upstream busy.
+  * `502` (`gemini_upstream_error` / `invalid_tool_call`): Upstream failure or malformed tool batch.
+  * `503` (`bridge_disabled` / `gemini_not_authenticated` / `no_healthy_lane`): Disabled switch, unauthenticated session, or no healthy Gateway worker.
+  * `504` (`gemini_timeout`): Exceeded initial, idle, or overall stream timeout.
+* **Graceful Draining & Origin Guard (`app/control.py`, `app/lane_security.py`):** Supports `off` → `starting` → `on` → `stopping` lifecycle with `DISABLE_DRAIN_TIMEOUT` draining and CSRF Origin checks on control endpoints.
