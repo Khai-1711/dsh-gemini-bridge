@@ -716,6 +716,86 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply, "fast fallback")
         self.assertEqual(mgr.default_model, "unspecified")
 
+    def test_batch_six_tool_calls_with_one_broken_tag_fails_closed_with_index(self):
+        from app.tool_parser import parse_tool_calls_detailed
+
+        tools_payload = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["file_path", "content"],
+                    },
+                },
+            }
+        ]
+        tools_map = {"write": tools_payload[0]["function"]}
+        valid_tags = [
+            f'<tool_call>{{"name":"write","arguments":{{"file_path":"D:\\\\ABC\\\\f{i}.txt","content":"ok{i}"}}}}</tool_call>'
+            for i in range(5)
+        ]
+        broken_sixth = '<tool_call>{"name":"write","arguments":{"file_path":"D:\\\\ABC\\\\f5.txt"}}</tool_call>'
+        reply = "\n".join(valid_tags + [broken_sixth])
+
+        detailed = parse_tool_calls_detailed(reply, tools_map)
+        self.assertEqual(detailed.tool_calls, [])
+        self.assertEqual(len(detailed.malformed_tags), 1)
+        self.assertEqual(detailed.malformed_tags[0]["index"], 6)
+
+        with tempfile.TemporaryDirectory() as td:
+            trace_file = Path(td) / "failure_traces.jsonl"
+            with patch.object(app_main, "API_KEY", ""), \
+                 patch.object(app_main, "FAILURE_TRACES_FILE", trace_file), \
+                 patch.object(app_main.activity, "write"), \
+                 patch.object(app_main.session_manager, "require_on"), \
+                 patch.object(app_main.session_manager, "ensure_authenticated", new_callable=AsyncMock, return_value=True), \
+                 patch.object(app_main.session_manager, "activate_session_slot", new_callable=AsyncMock), \
+                 patch.object(app_main.session_manager, "send_prepared_turn", new_callable=AsyncMock, return_value=reply):
+                client = TestClient(app_main.app, base_url="http://127.0.0.1:10001")
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": "write 6 files"}], "tools": tools_payload},
+                )
+            self.assertEqual(resp.status_code, 502)
+            err = resp.json()["error"]
+            self.assertEqual(err["code"], "invalid_tool_call")
+            self.assertIn("thẻ #6", err["message"])
+            self.assertTrue(trace_file.exists())
+            self.assertEqual(len(trace_file.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_raw_json_fallback_above_4000_chars_succeeds(self):
+        from app.tool_parser import parse_tool_calls_detailed
+
+        tools_map = {
+            "write": {
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                }
+            }
+        }
+        large_content = "x" * 10_000
+        raw_reply = json.dumps(
+            {
+                "name": "write",
+                "arguments": {"file_path": r"D:\ABC\big.py", "content": large_content},
+            }
+        )
+        res = parse_tool_calls_detailed(raw_reply, tools_map)
+        self.assertEqual(len(res.tool_calls), 1)
+        self.assertEqual(res.malformed_tags, [])
+        self.assertEqual(json.loads(res.tool_calls[0]["function"]["arguments"])["content"], large_content)
+
 
 if __name__ == "__main__":
     unittest.main()

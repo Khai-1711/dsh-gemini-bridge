@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import json
 import uuid
 from typing import Any, Dict, List, Tuple
@@ -111,16 +112,25 @@ def _extract_tag_contents(text: str, open_tag: str, close_tag: str) -> List[str]
     return results
 
 
-def _extract_tool_call_blocks(text: str) -> List[str]:
-    """Tách các thẻ <tool_call>...</tool_call> có theo dõi trạng thái chuỗi JSON (" và \\).
+@dataclass
+class ToolParseResult:
+    """Kết quả parse chi tiết kèm chẩn đoán từng thẻ cho cơ chế fail-closed (4A)."""
 
-    Thẻ </tool_call> nằm bên trong chuỗi JSON (ví dụ khi agent ghi mã nguồn/test)
-    sẽ không cắt sớm block. Nếu gặp <tool_call> nhưng tới EOF vẫn chưa có thẻ đóng
-    hợp lệ bên ngoài chuỗi -> Gate 0 fail-closed, không trả block cắt cụt đó ra ngoài.
+    tool_calls: List[Dict[str, Any]]
+    malformed_tags: List[Dict[str, Any]] = field(default_factory=list)
+    has_unclosed_tag: bool = False
+
+
+def _scan_tool_call_blocks(text: str) -> Tuple[List[str], bool]:
+    """Tách các thẻ <tool_call>...</tool_call> nhận biết chuỗi JSON (" và \\).
+
+    Trả về ``(blocks, has_unclosed)``; nếu có thẻ mở nhưng tới EOF vẫn chưa
+    đóng hợp lệ bên ngoài chuỗi -> ``has_unclosed=True`` (Gate 0 fail-closed).
     """
     open_tag = "<tool_call>"
     close_tag = "</tool_call>"
     results: List[str] = []
+    has_unclosed = False
     pos = 0
     n = len(text)
     while pos < n:
@@ -153,9 +163,22 @@ def _extract_tool_call_blocks(text: str) -> List[str]:
                     escaped = False
                 i += 1
         if not found_close:
-            # Gate 0 fail-closed: unclosed/truncated <tool_call> is never partially extracted.
+            has_unclosed = True
             break
-    return results
+    return results, has_unclosed
+
+
+def _extract_tool_call_blocks(text: str) -> List[str]:
+    return _scan_tool_call_blocks(text)[0]
+
+
+def _has_unclosed_fenced_tool_block(text: str) -> bool:
+    parts = text.split("```")
+    if len(parts) % 2 == 1:
+        return False
+    trailing = parts[-1].lstrip()
+    first_line = trailing.splitlines()[0].strip().lower() if trailing else ""
+    return first_line == "tool_call" or (first_line == "json" and '"name"' in trailing)
 
 
 def _repair_tool_json_deterministic(raw_json: str) -> Any:
@@ -283,26 +306,24 @@ def has_tool_call_intent(reply_text: str) -> bool:
     return False
 
 
-def parse_tool_calls_from_reply(
+def parse_tool_calls_detailed(
     reply_text: str, tools_map: Dict[str, Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    Bóc tách danh sách lệnh gọi công cụ từ phản hồi văn bản của Gemini.
-    Hỗ trợ MULTIPLE <tool_call> blocks (parallel tool calls).
-    """
+) -> ToolParseResult:
+    """Bóc tách toàn bộ batch tool call theo nguyên tắc fail-closed tuyệt đối (4A)."""
     if not reply_text or len(reply_text) > 100_000:
-        return []
+        return ToolParseResult(tool_calls=[], malformed_tags=[], has_unclosed_tag=False)
 
     extracted_calls: List[Dict[str, Any]] = []
+    malformed_tags: List[Dict[str, Any]] = []
     candidates: List[Tuple[str, bool]] = []
-    rejected_candidate = False
 
-    # 1. Quét thẻ <tool_call>...</tool_call> theo state machine nhận biết chuỗi JSON -> is_tagged=True
-    for tag_content in _extract_tool_call_blocks(reply_text):
+    # 1. Quét thẻ <tool_call>...</tool_call> theo state machine nhận biết chuỗi JSON
+    tagged_blocks, has_unclosed = _scan_tool_call_blocks(reply_text)
+    for tag_content in tagged_blocks:
         candidates.append((tag_content, True))
 
-    # 2. Fallback: ```tool_call / ```json ... ``` (nâng trần tới 100k khi có nhãn tường minh; chưa có thẻ <tool_call>)
-    if not candidates and len(reply_text) < 100_000:
+    # 2. Fallback: ```tool_call / ```json ... ```
+    if not candidates and not has_unclosed and len(reply_text) < 100_000:
         for block in _extract_tag_contents(reply_text, "```", "```"):
             clean_block = block.strip()
             first_line, separator, remainder = clean_block.partition("\n")
@@ -318,13 +339,34 @@ def parse_tool_calls_from_reply(
                 clean_block = remainder.strip() if separator else ""
             if clean_block.startswith("{") and clean_block.endswith("}"):
                 candidates.append((clean_block, is_labeled_tool_fence))
+            elif is_labeled_tool_fence:
+                malformed_tags.append(
+                    {
+                        "index": len(candidates) + len(malformed_tags) + 1,
+                        "reason": "Malformed JSON inside tool_call fence",
+                        "snippet": (clean_block or block)[:160],
+                    }
+                )
+        if not candidates and not malformed_tags and _has_unclosed_fenced_tool_block(reply_text):
+            has_unclosed = True
 
-    # 3. Fallback: toàn bộ reply là JSON -> is_tagged=False
+    # 3. Fallback: toàn bộ reply là JSON (mở rộng trần tới 64k khi mang cấu trúc tool call)
     stripped = reply_text.strip()
-    if not candidates and len(stripped) < 4000 and stripped.startswith("{") and stripped.endswith("}"):
-        candidates.append((stripped, False))
+    has_tool_shape = '"name"' in stripped and (
+        '"arguments"' in stripped or '"parameters"' in stripped
+    )
+    raw_limit = 64_000 if has_tool_shape else 4000
+    if (
+        not candidates
+        and not malformed_tags
+        and not has_unclosed
+        and len(stripped) < raw_limit
+        and stripped.startswith("{")
+        and stripped.endswith("}")
+    ):
+        candidates.append((stripped, has_tool_shape))
 
-    for raw_json, is_tagged in candidates:
+    for tag_idx, (raw_json, is_tagged) in enumerate(candidates, 1):
         try:
             try:
                 data = _loads_tool_json(raw_json)
@@ -333,7 +375,14 @@ def parse_tool_calls_from_reply(
                 if data is None:
                     raise
             if not isinstance(data, dict) or "name" not in data:
-                rejected_candidate = rejected_candidate or is_tagged
+                if is_tagged:
+                    malformed_tags.append(
+                        {
+                            "index": tag_idx,
+                            "reason": "Missing 'name' field",
+                            "snippet": raw_json[:160],
+                        }
+                    )
                 continue
             fn_name = str(data["name"]).strip()
             for prefix in ("functions.", "tools."):
@@ -345,7 +394,14 @@ def parse_tool_calls_from_reply(
                 or not tools_map
                 or fn_name not in tools_map
             ):
-                rejected_candidate = True
+                if is_tagged:
+                    malformed_tags.append(
+                        {
+                            "index": tag_idx,
+                            "reason": f"Unknown or forbidden tool '{fn_name}'",
+                            "snippet": raw_json[:160],
+                        }
+                    )
                 continue
 
             if "arguments" in data:
@@ -373,8 +429,32 @@ def parse_tool_calls_from_reply(
                     },
                 }
             )
-        except (json.JSONDecodeError, TypeError, ValueError):
-            rejected_candidate = True
-            logger.warning("[PARSER] Rejected malformed or schema-invalid tool call.")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning("[PARSER] Rejected malformed or schema-invalid tool call (#%d): %s", tag_idx, exc)
+            if is_tagged:
+                malformed_tags.append(
+                    {
+                        "index": tag_idx,
+                        "reason": str(exc) or type(exc).__name__,
+                        "snippet": raw_json[:160],
+                    }
+                )
 
-    return extracted_calls if extracted_calls else ([] if rejected_candidate else [])
+    if malformed_tags or has_unclosed:
+        return ToolParseResult(
+            tool_calls=[],
+            malformed_tags=malformed_tags,
+            has_unclosed_tag=has_unclosed,
+        )
+    return ToolParseResult(
+        tool_calls=extracted_calls,
+        malformed_tags=[],
+        has_unclosed_tag=False,
+    )
+
+
+def parse_tool_calls_from_reply(
+    reply_text: str, tools_map: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Bóc tách danh sách lệnh gọi công cụ từ phản hồi văn bản của Gemini."""
+    return parse_tool_calls_detailed(reply_text, tools_map).tool_calls

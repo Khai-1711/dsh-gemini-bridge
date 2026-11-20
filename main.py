@@ -77,7 +77,11 @@ from app.prompt_builder import (
     is_plain_greeting_request,
 )
 from app.streaming import ToolCallAwareStreamer
-from app.tool_parser import has_tool_call_intent, parse_tool_calls_from_reply
+from app.tool_parser import (
+    ToolParseResult,
+    has_tool_call_intent,
+    parse_tool_calls_detailed,
+)
 from app.title_generation import extract_local_title_request
 
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -1257,6 +1261,32 @@ async def chat_completions(request: Request):
             ],
         }
 
+    def _invalid_tool_batch_error(parse_res: ToolParseResult) -> Optional[dict]:
+        has_invalid = bool(
+            parse_res.malformed_tags
+            or parse_res.has_unclosed_tag
+            or (has_tool_call_intent(parse_res._raw_reply) and not parse_res.tool_calls)
+        )
+        if not has_invalid:
+            return None
+        if parse_res.malformed_tags:
+            details = "; ".join(
+                f"thẻ #{item['index']}: {item['reason']}"
+                for item in parse_res.malformed_tags[:3]
+            )
+            msg = (
+                f"Gemini trả về tool call không hợp lệ ({details}); "
+                "chưa có tool nào được thực thi."
+            )
+        elif parse_res.has_unclosed_tag:
+            msg = (
+                "Gemini trả về thẻ <tool_call> bị cắt cụt (thiếu thẻ đóng </tool_call>); "
+                "chưa có tool nào được thực thi."
+            )
+        else:
+            msg = "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi."
+        return {"message": msg, "type": "upstream_error", "code": "invalid_tool_call"}
+
     # ─────────────────────────────────────────────────────────────────
     # LUỒNG STREAMING (SSE + Keep-Alive Heartbeat + real text deltas)
     # ─────────────────────────────────────────────────────────────────
@@ -1404,8 +1434,11 @@ async def chat_completions(request: Request):
                     yield f"data: {json.dumps(_content_chunk(piece), ensure_ascii=False)}\n\n"
 
                 reply_text = done_text if done_text is not None else splitter.full_text
-                tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
-                if has_tool_call_intent(reply_text) and not tool_calls:
+                parse_res = parse_tool_calls_detailed(reply_text, tools_map)
+                parse_res._raw_reply = reply_text
+                tool_calls = parse_res.tool_calls
+                invalid_err = _invalid_tool_batch_error(parse_res)
+                if invalid_err is not None:
                     record_failed_tool_trace(
                         FAILURE_TRACES_FILE,
                         request_id=chat_id,
@@ -1413,11 +1446,6 @@ async def chat_completions(request: Request):
                         reply_text=reply_text,
                         reason="invalid_tool_call",
                     )
-                    error = {
-                        "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
-                        "type": "upstream_error",
-                        "code": "invalid_tool_call",
-                    }
                     activity.write(
                         request_id=chat_id,
                         model=model_id,
@@ -1428,7 +1456,7 @@ async def chat_completions(request: Request):
                         latency_ms=int((time.time() - t0) * 1000),
                         outcome="error:invalid_tool_call",
                     )
-                    yield f"data: {json.dumps({'error': error}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'error': invalid_err}, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
                 active_ledger = turn_state["ledger"]
@@ -1569,8 +1597,11 @@ async def chat_completions(request: Request):
     finally:
         session_manager.release_turn_lock(acquired_lock)
 
-    tool_calls = parse_tool_calls_from_reply(reply_text, tools_map)
-    if has_tool_call_intent(reply_text) and not tool_calls:
+    parse_res = parse_tool_calls_detailed(reply_text, tools_map)
+    parse_res._raw_reply = reply_text
+    tool_calls = parse_res.tool_calls
+    invalid_err = _invalid_tool_batch_error(parse_res)
+    if invalid_err is not None:
         record_failed_tool_trace(
             FAILURE_TRACES_FILE,
             request_id=chat_id,
@@ -1578,11 +1609,6 @@ async def chat_completions(request: Request):
             reply_text=reply_text,
             reason="invalid_tool_call",
         )
-        error = {
-            "message": "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi.",
-            "type": "upstream_error",
-            "code": "invalid_tool_call",
-        }
         activity.write(
             request_id=chat_id,
             model=model_id,
@@ -1595,7 +1621,7 @@ async def chat_completions(request: Request):
         )
         return JSONResponse(
             status_code=502,
-            content={"error": error},
+            content={"error": invalid_err},
         )
     active_ledger.note_tool_calls(tool_calls)
     active_ledger.note_assistant(reply_text)
