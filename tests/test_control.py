@@ -537,7 +537,7 @@ class TestControlEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["choices"][0]["message"]["content"], "hello back")
         prompt = send_turn.await_args.args[0]
         self.assertNotIn("stale tool schema", prompt)
-        self.assertNotIn("OPERATOR INSTRUCTIONS", prompt)
+        self.assertNotIn("WORKSPACE TOOLS", prompt)
 
     async def test_stream_reports_unparseable_tool_call(self):
         from main import chat_completions, session_manager

@@ -413,7 +413,7 @@ class SingleChatManager:
         self._fake_quota_done = False
         self.on_event = None
 
-    HEADER_MARKER = "=== OPERATOR INSTRUCTIONS"
+    HEADER_MARKER = "=== WORKSPACE TOOLS"
 
     @property
     def vision_upload_available(self) -> bool:
@@ -593,7 +593,7 @@ class SingleChatManager:
         ):
             return (
                 prompt
-                + "\n\n=== OPERATOR INSTRUCTIONS (apply to every reply in this chat) ===\n"
+                + "\n\n=== WORKSPACE TOOLS ===\n"
                 + self.last_tool_header
             )
         return prompt

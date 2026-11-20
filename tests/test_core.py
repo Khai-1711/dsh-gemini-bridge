@@ -86,14 +86,14 @@ class TestPromptBuilder(unittest.TestCase):
         tools = [{"type": "function", "function": {"name": "Read", "description": "read a file"}}]
         messages = [{"role": "user", "content": "review code"}]
         prompt, _ = build_incremental_prompt_and_files(messages, tools, is_first_turn=True)
-        self.assertIn("OPERATOR INSTRUCTIONS", prompt)
+        self.assertIn("WORKSPACE TOOLS", prompt)
         self.assertIn("Read", prompt)
 
     def test_subsequent_turn_omits_tool_header(self):
         tools = [{"type": "function", "function": {"name": "Read", "description": "read a file"}}]
         messages = [{"role": "user", "content": "continue"}]
         prompt, _ = build_incremental_prompt_and_files(messages, tools, is_first_turn=False)
-        self.assertNotIn("OPERATOR INSTRUCTIONS", prompt)
+        self.assertNotIn("WORKSPACE TOOLS", prompt)
 
     def test_compile_tools_prompt_uses_request_schema_without_placeholder_tools(self):
         tools = [
