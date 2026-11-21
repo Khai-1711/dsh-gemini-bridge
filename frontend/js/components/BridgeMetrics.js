@@ -100,24 +100,20 @@ export class BridgeMetrics extends HTMLElement {
           </div>
         </div>
 
-        <!-- Card 4: Response Cache (Chân thực theo cấu hình) -->
+        <!-- Card 4: Live Inflight & Chat Session -->
         <div class="metric-card" style="--card-accent: var(--status-warning);">
           <div class="metric-header">
-            <span class="metric-label">${t("promptCache", lang)}</span>
+            <span class="metric-label">${lang === "vi" ? "Phiên & Đang Chạy" : "Session & Inflight"}</span>
             <span class="metric-icon">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
             </span>
           </div>
           <div class="metric-value">
-            <span id="m-cache">${cacheOn ? "0" : "--"}</span>
-            <span style="font-size: 13px; font-weight: normal; color: var(--text-muted);">${cacheOn ? t("cached", lang) : ""}</span>
+            <span id="m-inflight">0</span>
+            <span style="font-size: 13px; font-weight: normal; color: var(--text-muted);">${lang === "vi" ? "đang xử lý" : "inflight"}</span>
           </div>
           <div class="metric-sub">
-            ${
-              cacheOn
-                ? `<span class="badge-tag badge-warning">Cache: BẬT - TTL 5p</span>`
-                : `<span class="badge-tag" style="background: var(--bg-card-sub, #182030); color: var(--text-muted, #9ca3af);">${lang === "vi" ? "Cache: TẮT" : "Cache: OFF"}</span>`
-            }
+            <span class="badge-tag" id="m-chat-key" style="background: var(--bg-card-sub, #182030); color: var(--text-muted, #9ca3af);">chat: new</span>
           </div>
         </div>
       </section>
@@ -138,14 +134,16 @@ export class BridgeMetrics extends HTMLElement {
     const mErrCount = this.querySelector("#m-err-count");
     const mUptime = this.querySelector("#m-uptime");
     const mBackup = this.querySelector("#m-backup");
-    const mCache = this.querySelector("#m-cache");
+    const mInflight = this.querySelector("#m-inflight");
+    const mChatKey = this.querySelector("#m-chat-key");
 
     if (mModel) {
       mModel.innerText = lane.model || "unspecified";
     }
 
     if (mTurns) {
-      mTurns.innerText = `${t("turn", lang)}: ${state.turnCount || 0}`;
+      const turns = lane.turn_count !== undefined ? lane.turn_count : (state.turnCount || 0);
+      mTurns.innerText = `${t("turn", lang)}: ${turns}`;
     }
 
     if (mAuthBadge) {
@@ -194,8 +192,11 @@ export class BridgeMetrics extends HTMLElement {
       mBackup.innerText = `${accLabel} (${accIdx}/${accTotal})`;
     }
 
-    if (mCache && Boolean(lane.cache_enabled)) {
-      mCache.innerText = state.cacheEntries || 0;
+    if (mInflight) {
+      mInflight.innerText = lane.inflight || 0;
+    }
+    if (mChatKey) {
+      mChatKey.innerText = `chat: ${lane.chat_key || "new"}`;
     }
   }
 }

@@ -1,5 +1,3 @@
-import asyncio
-from datetime import datetime
 import json
 import logging
 import os
@@ -13,13 +11,11 @@ os.environ.pop("BRIDGE_INSTANCE", None)
 logging.disable(logging.CRITICAL)
 
 from gemini_webapi.constants import AccountStatus
-from gemini_webapi.exceptions import AuthError, UsageLimitExceededError
+from gemini_webapi.exceptions import UsageLimitExceededError
 
 from app.accounts import (
-    account_key,
     build_account_chain,
     find_chain_overlap,
-    first_available_index,
     is_available,
     load_state,
     mark_exhausted,
@@ -444,7 +440,6 @@ class TestMockQuotaSwitch(unittest.IsolatedAsyncioTestCase):
     async def test_failover_all_fail_restores_state(self):
         m = self._make_manager(3)
         initial_index = 0
-        initial_psid = m.chain[0]["psid"]
 
         # Accounts 1 and 2 both fail auth when switching
         async def fake_switch_fail(idx):

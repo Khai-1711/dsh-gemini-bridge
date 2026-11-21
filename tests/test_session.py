@@ -96,6 +96,7 @@ class TestSessionManager(unittest.TestCase):
 
     def test_guest_mode_enabled_and_ready(self):
         mgr = make_manager(AccountStatus.UNAUTHENTICATED, "Guest")
+        mgr.chain = []  # Explicit cookie-less guest mode
         self.assertTrue(mgr.is_guest)
         self.assertFalse(mgr.auth_ok)
         self.assertTrue(mgr.allow_guest)
@@ -104,6 +105,78 @@ class TestSessionManager(unittest.TestCase):
             self.assertTrue(loop.run_until_complete(mgr.ensure_authenticated()))
         finally:
             loop.close()
+
+    def test_configured_cookies_never_silently_degrade_to_guest_mode(self):
+        mgr = make_manager(AccountStatus.UNAUTHENTICATED, "Cache")
+        mgr.chain = [{"label": "acc1", "psid": "p1", "psidts": "t1", "key": "k1"}]
+        mgr.allow_guest = True
+        self.assertTrue(mgr.is_guest)
+        self.assertFalse(mgr.auth_ok)
+        self.assertFalse(mgr._guest_mode_permitted())
+        mgr.client.init = AsyncMock()
+        mgr.client.close = AsyncMock()
+        self.assertFalse(asyncio.run(mgr.ensure_authenticated()))
+
+    def test_force_reauth_bypasses_cooldown_and_reinitializes(self):
+        mgr = make_manager(AccountStatus.UNAUTHENTICATED, "Cache")
+        mgr.chain = [{"label": "acc1", "psid": "p1", "psidts": "t1", "key": "k1"}]
+        mgr._last_recover_ts = 9e12  # simulate recent attempt within 60s window
+        init_called = 0
+
+        async def _reinit(**_kw):
+            nonlocal init_called
+            init_called += 1
+            mgr.client.account_status = AccountStatus.AVAILABLE
+            mgr.client._cookie_source = "Cache"
+
+        mgr.client.init = _reinit
+        mgr.client.close = AsyncMock()
+        mgr.client.list_models = lambda: ["gemini-pro"]
+        # Non-force throttled
+        self.assertFalse(asyncio.run(mgr.ensure_authenticated(force=False)))
+        self.assertEqual(init_called, 0)
+        # Force reauth actually re-initializes and restores auth_ok
+        self.assertTrue(asyncio.run(mgr.ensure_authenticated(force=True)))
+        self.assertEqual(init_called, 1)
+        self.assertTrue(mgr.auth_ok)
+
+    def test_update_slot_cookie_rolls_back_on_bad_cookie_and_clears_pool_on_success(self):
+        from gemini_webapi.exceptions import AuthError
+
+        mgr = make_manager(AccountStatus.AVAILABLE, "Base Cookies", psid="orig_psid")
+        mgr.chain = [{"label": "acc1", "psid": "orig_psid", "psidts": "orig_ts", "key": "orig_key"}]
+        mgr.active_index = 0
+        orig_client = mgr.client
+        mgr._session_pool = {"slot_sub": SimpleNamespace(session_key="slot_sub")}
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            fake_paths = {
+                "accounts_state_file": td_path / "acc.json",
+                "chain_file": td_path / "chain.json",
+                "handoff_dir": td_path / "handoff",
+            }
+            bad_client = MockClient(AccountStatus.UNAUTHENTICATED, "Guest")
+            good_client = MockClient(AccountStatus.AVAILABLE, "Base Cookies")
+            good_client.list_models = lambda: ["gemini-pro"]
+
+            with patch.dict("app.gemini_session.INSTANCE_PATHS", fake_paths), \
+                 patch("app.gemini_session.SESSION_STATE_FILE", td_path / "session.json"), \
+                 patch("app.gemini_session.GeminiClient", return_value=bad_client):
+                with self.assertRaises(AuthError):
+                    asyncio.run(mgr.update_slot_cookie(0, "bad_psid", "bad_ts"))
+                # Original client, chain, and pool untouched on failure
+                self.assertIs(mgr.client, orig_client)
+                self.assertEqual(mgr.chain[0]["psid"], "orig_psid")
+                self.assertIn("slot_sub", mgr._session_pool)
+
+            with patch.dict("app.gemini_session.INSTANCE_PATHS", fake_paths), \
+                 patch("app.gemini_session.SESSION_STATE_FILE", td_path / "session.json"), \
+                 patch("app.gemini_session.GeminiClient", return_value=good_client):
+                res = asyncio.run(mgr.update_slot_cookie(0, "new_good_psid", "new_good_ts"))
+                self.assertTrue(res["ok"])
+                self.assertIs(mgr.client, good_client)
+                self.assertNotIn("slot_sub", mgr._session_pool)
 
     def test_session_state_bound_to_account(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -529,11 +602,11 @@ class TestSessionManager(unittest.TestCase):
                     mgr._consecutive_auth_errors = 1
                 send_calls = 0
 
-                async def send_stream(prompt, files=None):
+                async def send_stream(prompt, files=None, _exc=failure):
                     nonlocal send_calls
                     send_calls += 1
                     yield SimpleNamespace(text_delta="first partial answer")
-                    raise failure
+                    raise _exc
 
                 mgr.chat_session.send_message_stream = send_stream
                 with patch("app.gemini_session.MIN_REQUEST_INTERVAL", 0), \

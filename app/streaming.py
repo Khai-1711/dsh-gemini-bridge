@@ -20,6 +20,12 @@ class ToolCallAwareStreamer:
         self._in_tool = False
         self._in_string = False
         self._escaped = False
+        self._last_emitted_char = ""
+
+    def _append_out(self, out: list[str], piece: str) -> None:
+        if piece:
+            out.append(piece)
+            self._last_emitted_char = piece[-1]
 
     def feed(self, delta: str) -> list[str]:
         """Feed an incremental delta; returns content pieces to emit now."""
@@ -71,27 +77,37 @@ class ToolCallAwareStreamer:
                 if idx == -1:
                     hold = self._partial_suffix(self._buf, self.OPEN)
                     if hold:
-                        out.append(self._buf[: len(self._buf) - hold])
+                        self._append_out(out, self._buf[: len(self._buf) - hold])
                         self._buf = self._buf[-hold:]
                     else:
-                        out.append(self._buf)
+                        self._append_out(out, self._buf)
                         self._buf = ""
                     break
-                out.append(self._buf[:idx])
+
+                prev_char = self._buf[idx - 1] if idx > 0 else self._last_emitted_char
+                if prev_char == "`":
+                    # Inline code mention like `<tool_call>` in prose: emit verbatim.
+                    end_pos = idx + len(self.OPEN)
+                    self._append_out(out, self._buf[:end_pos])
+                    self._buf = self._buf[end_pos:]
+                    continue
+
+                self._append_out(out, self._buf[:idx])
                 self._buf = self._buf[idx + len(self.OPEN):]
                 self._in_tool = True
                 self._in_string = False
                 self._escaped = False
-        return [p for p in out if p]
+        return out
 
     def flush(self) -> list[str]:
         """Emit any remaining content once the stream ends."""
         if self._in_tool:
             self._buf = ""
             return []
-        out = [self._buf]
+        out: list[str] = []
+        self._append_out(out, self._buf)
         self._buf = ""
-        return [p for p in out if p]
+        return out
 
     @property
     def full_text(self) -> str:

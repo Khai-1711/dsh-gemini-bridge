@@ -1,162 +1,109 @@
-# DSH Gemini Agent Bridge (v3.1 - Modular Gateway Edition)
+# DSH Gemini Agent Bridge (v3.2)
 
-> 🌐 **Language:** **English** | [Tiếng Việt](README_VI.md)
+> 🌐 **Language:** **English** | [Tiếng Việt](docs/README.vi.md) | [한국어](docs/README.ko.md)  
+> 📐 **Architecture, Algorithms & Research References:** [English](docs/ARCHITECTURE.en.md) | [Tiếng Việt](docs/ARCHITECTURE.vi.md) | [한국어](docs/ARCHITECTURE.ko.md)
 
-> **High-Reliability OpenAI-Compatible Reverse Proxy, Multi-Lane Gateway & Agent Execution Bridge for Gemini Web (`gemini_webapi`) on DeepSeek Harness (`pi-ai`), Cline, and Roo Code.**
-
-Transforms **Google Gemini Web** into an OpenAI Chat Completions (`/v1/chat/completions`, `/v1/responses`) backend with **Function Calling (`<tool_call>`)**, **Sticky + Least-Inflight Multi-Lane Gateway (`:10000`)**, **Direct Multimodal Vision**, **Sticky Conversation Pools**, **Cookie Failover + Flash Handoff**, and a **W3C Custom-Elements Dashboard**.
-
----
-
-## Technical Highlights (v3.1)
-
-1. **Sticky Gateway Load Balancer (`app/gateway_router.py` on `:10000`):** Automatically distributes **Lead** and parallel **Subagents** across worker lanes (`acc1` `:10001`, `acc2` `:10002`) via sticky session keys (`STICKY_TTL=3600s`) and least-inflight selection, with zero-buffer SSE pass-through, automatic `429`/`503`/`ConnectError` failover, client-disconnect inflight cleanup, and local DSH session-title interception.
-2. **Sticky Session Pool & Isolated Per-Slot Ledgers (`app/session_pool.py`, `app/handoff.py`):** Maintains isolated `ChatSession` slots (`cid`/`rid`/`rcid`) for the root Lead agent (disk-persisted `handoff/<id>/ledger.json`) and up to 16 concurrent Subagents (in-memory ledger, no disk overwrite collisions).
-3. **Thoughts-Aware Stream Deadlines & Ephemeral Soft-Fallback (`app/gemini_runtime.py`):** Treats both `thoughts_delta` and `text_delta` as live upstream activity; applies `MODEL_FIRST_BYTE_FALLBACK_TIMEOUT` (`50s`), per-chunk `GEMINI_CHUNK_IDLE_TIMEOUT` (`40s`), and `GEMINI_STREAM_OVERALL_TIMEOUT` (`180s`). Timeout fallback applies **only for that turn** (never permanently downgrading `default_model`), resets `SessionSlot.tool_header_sent`, immediately re-attaches `=== WORKSPACE TOOLS ===` on retry, and records actual `model` + `fallback_from` in `logs/activity*.jsonl`.
-4. **Fail-Closed Batch Tool Parser & Streaming Filter (`app/tool_parser.py`, `app/streaming.py`):** Linear `O(N)` `<tool_call>` extraction with `json-repair` and 64 KB raw JSON fallback (`MAX_RAW_JSON_FALLBACK_CHARS=65536`). Rejects an entire batch if any tag in a parallel batch is malformed or unclosed (reporting exact `thẻ #N` diagnostics and saving traces to `logs/failure_traces*.jsonl`) so partial broken tool batches are never executed.
-5. **Direct Multimodal Image Upload (`app/vision.py`):** Extracts Base64 image parts, optimizes dimensions/JPEG via optional `pillow`, and attaches files directly to Gemini Web (`files=[]`) with temporary-file cleanup.
-6. **Multi-Account Failover & Flash Handoff (`app/account_pool.py`, `app/handoff_runner.py`):** Rotates exhausted/unauthenticated accounts with per-slot cooldowns (`QUOTA_COOLDOWN_HOURS`, `AUTH_COOLDOWN_MINUTES`) and summarizes active `FactLedger` state via Flash handoff when switching accounts.
-7. **Anti-Timeout SSE Heartbeat & Single-Lock Concurrency:** Emits `: keep-alive\n\n` every `2.5s` over SSE while serializing turns on each worker with `asyncio.Lock(timeout=LOCK_ACQUIRE_TIMEOUT)`.
-8. **Hardened C-Drive Rail-Guard (`app/security.py`):** Normalizes paths with `os.path.realpath` relative to `DEFAULT_PROJECT_DIR` and blocks dangerous Drive `C:\` path traversals or PowerShell patterns (`$env:SystemDrive`, `Invoke-Expression`, encoded commands).
-9. **Component-Driven Web Dashboard (`frontend/`):** Zero-build W3C Custom Elements + ES Modules console with EN/VI i18n, Dark/Light themes, multi-lane switching, cookie hot-reload, and live activity logs.
+**DSH Gemini Agent Bridge** is a modular, OpenAI-compatible (`/v1/models`, `/v1/chat/completions`, `/v1/responses`) reverse proxy and multi-lane execution engine that connects coding agents (DeepSeek Harness / `pi-ai`, IDE agents, OpenAI SDK clients) to **Gemini Web** with real SSE streaming, multi-account failover, isolated browser Profile Vault auto-sync, and fail-closed tool calling.
 
 ---
 
-## Directory Structure
+## Key Capabilities
+
+- **Multi-Lane Frontend Gateway (`:10000` → `:10001`, `:10002`, ...):** Sticky conversation affinity, least-inflight routing, model-aware lane selection, pre-SSE turn-lock admission control (`HTTP 429` real failover before opening `200 text/event-stream`), and zero-buffer SSE pass-through.
+- **100% User-Chosen Models & Per-Slot Isolation:** Exposes every model available on your Gemini account with zero hardcoded preferences or hidden models. Each `SessionSlot` owns its own model and workspace context; `FALLBACK_MODEL` is strictly opt-in.
+- **Open Workspace Support:** Automatically follows whatever project directory is open in your IDE/chat (`X-Workspace-Dir` or prompt context) across any drive (`C:`, `D:`, `E:`, ...), blocking only destructive OS-level paths/commands (`System32`, UNC, `format`, `diskpart`, `IWR | IEX`, etc.). Supports `WORKSPACE_SANDBOX_MODE=client|workspace`.
+- **Profile Vault & Headless Auto Cookie Sync (0 Open Tabs):** Manage unlimited Google accounts (`acc1`, `acc2`, `work3`, ..., `workN`) without storing passwords or keeping browser tabs open. Sign in manually once in a clean isolated Chrome/Edge profile; future refreshes run silently via `--headless=new` + stdlib RFC 6455 CDP WebSocket in ~2–4s, exporting the full Google/Gemini cookie jar (`OSID`, `__Secure-OSID`, `SID`, `__Secure-1PSID`, `__Secure-1PSIDTS`, `__Secure-1PSIDCC`, `NID`) and hot-reloading workers automatically.
+- **Fail-Closed Tool Calling & Self-Correction:** $O(N)$ prefix-holding SSE streamer, inline-backtick prose safety, Gemini Web URL auto-linkification reversal (`[http://...](http://...)` → `http://...`), deterministic `json-repair`, 1-round internal self-correction before emitting `invalid_tool_call`, and 1-round empty-reply retry.
+- **Completion-First Thinking Budgets:** Generous defaults (`GEMINI_HARD_TIMEOUT=180s`, `GEMINI_CHUNK_IDLE_TIMEOUT=120s`, `GEMINI_STREAM_OVERALL_TIMEOUT=420s`, `2.5s` SSE keep-alive) paired with a deadlock-safe `25s` init guard (`_safe_init_client`) and proportional fair-share budgeting across parallel tool results (`MAX_TOTAL_TOOL_RESULTS_CHARS=36000`).
+- **Live Web Dashboard (`/dashboard`):** Bilingual VI/EN SPA with real-time lane switches, model picker, Profile Vault manager (`Login Once`, `Done & Sync`, `Sync`, `Sync All`), live metrics, and tail logs.
+
+---
+
+## Repository Structure
 
 ```text
-dsh_gemini_bridge/
-├── app/
-│   ├── __init__.py
-│   ├── accounts.py           # Account chain loader & overlap detection
-│   ├── account_pool.py       # Account failover, cooldown & Flash handoff trigger
-│   ├── activity.py           # Per-instance JSONL activity journal & failure traces
-│   ├── config.py             # Instance paths, env loader, timeouts & rotating logger
-│   ├── control.py            # API_START_STATE parser & turn/init state helpers
-│   ├── env_update.py         # Runtime .env cookie updater (hot-reload)
-│   ├── errors.py             # Structured BridgeError -> OpenAI HTTP status mapping
-│   ├── gateway_router.py     # Sticky + least-inflight + failover Gateway proxy (:10000)
-│   ├── gemini_runtime.py     # SingleChatManager core, unified stream loop & fallback
-│   ├── gemini_session.py     # Compatibility facade exporting session_manager & config
-│   ├── handoff.py            # Structured FactLedger (persistent Lead / in-memory Subagent)
-│   ├── handoff_runner.py     # Flash summary builder on account failover
-│   ├── lane_security.py      # Host, Origin, LAN bind & X-Lane-Token guards
-│   ├── lanes.py              # LaneRegistry cross-worker status, proxy & spawn helpers
-│   ├── openai_adapter.py     # /v1/models, /v1/chat/completions, /v1/responses router
-│   ├── prompt_builder.py     # Compact tool compiler, Smart Truncation & delta prompts
-│   ├── routes_admin.py       # /health, /dashboard, /v1/control/*, /v1/lanes/*, /v1/gateway/routes
-│   ├── security.py           # Drive D rail-guard path & PowerShell sanitizer
-│   ├── session_pool.py       # Sticky SessionSlot pool & .bridge_session*.json persistence
-│   ├── status_view.py        # Diagnostic payload builder for /v1/status & /health
-│   ├── streaming.py          # ToolCallAwareStreamer hiding <tool_call> tags from text SSE
-│   ├── title_generation.py   # Zero-latency local DSH session title generator
-│   ├── tool_parser.py        # Fail-closed batch <tool_call> parser + json-repair + Auto-Mapper
-│   └── vision.py             # Direct Base64 -> temp image pipeline for Gemini Web
-├── frontend/                 # Component-driven Web Dashboard (W3C Custom Elements)
-├── scripts/
-│   └── live_smoke.py         # Optional live smoke harness against a running bridge
-├── tests/                    # Automated unittest + httpx integration test suite (201 tests)
-├── main.py                   # Thin FastAPI entrypoint (~206 lines)
-├── run_all.bat               # Launch Gateway (:10000) + acc1 (:10001) + acc2 (:10002)
-├── run_acc1.bat / run_acc2.bat / run_frontend.bat / stop_all.bat
-├── .env.example              # Environment configuration template
-├── requirements.txt          # Python runtime dependencies
-├── ARCHITECTURE.md / ARCHITECTURE_VI.md
-└── README.md / README_VI.md
+dsh-gemini-bridge/
+├── app/                     # Core runtime, Gateway router, CDP Profile Vault, tool parser, security
+├── docs/                    # Multilingual READMEs & Architecture / Algorithms / Research docs (EN/VI/KO)
+├── frontend/                # Zero-build Web Components Dashboard (/dashboard)
+├── scripts/                 # CLI tools (cookie_sync.py, live_smoke.py) & single-lane launchers/
+├── tests/                   # 230 offline-isolated unit & integration tests
+├── main.py                  # FastAPI entrypoint (Gateway or Worker depending on BRIDGE_INSTANCE)
+├── requirements.txt         # Minimal Python dependencies
+├── run_all.bat              # One-click Windows launcher (Gateway :10000 + Workers :10001, :10002)
+├── stop_all.bat             # One-click Windows stopper (ports 10000..10002)
+└── .env.example             # Full configuration reference
 ```
 
 ---
 
-## Quick Start Guide
+## Quick Start
 
 ### 1. Install Dependencies
-Requires Python `>= 3.10`. From `dsh_gemini_bridge/`:
-
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
-*(Optional, for resizing/JPEG-compressing large Base64 screenshots before upload)*:
-```bash
-pip install pillow
+### 2. Configure Environment Files
+Copy `.env.example` into `.env` (Gateway on `:10000`) and `.env.acc1`, `.env.acc2` (Workers on `:10001`, `:10002`):
+- Set a shared `LANE_ADMIN_TOKEN` across `.env`, `.env.acc1`, and `.env.acc2`.
+- In `.env`, configure `PEER_LANES="acc1=http://127.0.0.1:10001,acc2=http://127.0.0.1:10002"`.
+
+### 3. Sign In Once per Google Account (Profile Vault)
+No DevTools copy-paste or permanently open tabs required:
+```powershell
+python scripts/cookie_sync.py login acc1 --lane acc1 --slot 0 --label "Work 1"
+python scripts/cookie_sync.py login acc2 --lane acc2 --slot 0 --label "Work 2"
+# Add backup failover accounts (slots 1..4) or extra lanes anytime:
+python scripts/cookie_sync.py login work3 --lane acc1 --slot 1 --label "Backup 1"
+```
+Refresh all accounts silently anytime (0 visible browser windows):
+```powershell
+python scripts/cookie_sync.py sync-all
+python scripts/cookie_sync.py list
 ```
 
-### 2. Configure Environment (`.env` / `.env.acc1` / `.env.acc2`)
-Copy `.env.example` to `.env` (and `.env.acc1`, `.env.acc2` for multi-lane Gateway mode) and populate your Gemini Web cookies from Chrome DevTools (`F12` → **Application** → **Cookies** → `https://gemini.google.com`):
-
-```ini
-SECURE_1PSID=g.a000...
-SECURE_1PSIDTS=sidts-...
-DEFAULT_PROJECT_DIR=D:\ABC
+### 4. Start & Monitor
+```powershell
+.\run_all.bat
+# Open Dashboard: http://127.0.0.1:10000/dashboard
+# OpenAI Base URL: http://127.0.0.1:10000/v1
+# Stop all processes:
+.\stop_all.bat
 ```
-
-*(On Windows, grant normal write permissions on your Drive D workspace once: `icacls "D:\ABC" /grant "$($env:USERNAME):(OI)(CI)F" /T`.)*
-
-### 3. Launch Gateway + Both Workers
-- Double-click **`run_all.bat`** to start:
-  - **Gateway Router & Dashboard:** `http://127.0.0.1:10000` (`/dashboard`, `/v1/*`)
-  - **Worker `acc1`:** `http://127.0.0.1:10001`
-  - **Worker `acc2`:** `http://127.0.0.1:10002`
-- Stop all bridge processes cleanly anytime via **`stop_all.bat`** (or toggle individual lanes via the Dashboard On/Off switch for graceful in-flight draining).
 
 ---
 
-## DeepSeek Harness (`pi-ai`) Integration
+## Key Environment Variables
 
-Point DSH directly at the **Gateway Router (`:10000`)** so Lead + Subagents automatically fan out in parallel across `acc1` and `acc2`:
-
-| Field | Value |
-|---|---|
-| **API Protocol** | `OpenAI Chat Completions` |
-| **Base URL** | `http://127.0.0.1:10000/v1` |
-| **API Key** | Any string (or your `.env` `API_KEY` if set) |
-| **Model ID** | Exact ID from `GET /v1/models` (e.g. `gemini-4-neon`, `gemini-4-hydrogen`) |
-
-> For single-worker debugging, `http://127.0.0.1:10001/v1` (`acc1`) and `http://127.0.0.1:10002/v1` (`acc2`) remain independently reachable. Never share the same Google account cookies across `.env.acc1` and `.env.acc2` (verify `account_key` differs on `/v1/status`).
-
----
-
-## API & Management Endpoints
-
-| Method | Endpoint | Description |
+| Variable | Default | Description |
 |---|---|---|
-| **POST** | `/v1/chat/completions`, `/v1/responses` | OpenAI chat/tool completions (proxied by Gateway when `:10000` is active, executed locally on workers). |
-| **GET** | `/v1/models` | Live Gemini models discovered on worker accounts (aggregated on Gateway). |
-| **GET** | `/v1/gateway/routes` | Inspect Gateway `active` flag, live `inflight`, `cooldowns`, and `sticky` session bindings. |
-| **GET** | `/health`, `/v1/status` | Runtime telemetry, auth/account state, uptime, and error rates. |
-| **GET** | `/dashboard` | Web management console. |
-| **GET/POST** | `/v1/control`, `/v1/control/enable`, `/v1/control/disable` | Inspect or toggle Gemini connection with graceful drain. |
-| **POST** | `/v1/update-cookies`, `/v1/accounts/{slot}/cookies` | Hot-reload primary or backup cookies without restarting. |
-| **POST** | `/v1/switch-model`, `/v1/reset`, `/v1/accounts/clear-exhausted` | Switch model, reset active chat session, or clear account cooldowns. |
-| **GET** | `/v1/logs`, `/v1/activity` | Recent rotating logs and structured JSONL activity (`model`, `fallback_from`, `tools`, `latency_ms`). |
-| **GET/POST** | `/v1/lanes`, `/v1/lanes/{lane_id}/*` | Aggregate lane status and control remote worker lanes via `X-Lane-Token`. |
-| **POST** | `/v1/cache/clear` | Compatibility no-op endpoint (`{"cleared_entries": 0}`). |
+| `GATEWAY_MODE` | `auto` | `auto` \| `on` \| `off` — enables Frontend Gateway when `PEER_LANES` is set |
+| `DEFAULT_MODEL` | `""` | Optional default model; empty keeps account/Dashboard selection |
+| `FALLBACK_MODEL` | `""` | Opt-in fallback model; empty never silently switches away from user choice |
+| `WORKSPACE_SANDBOX_MODE` | `client` | `client` (follow IDE workspace on any drive) \| `workspace` (soft-lock to chat dir) |
+| `AUTO_COOKIE_SYNC` | `true` | Auto-recover expired worker cookies silently from Profile Vault |
+| `GEMINI_HARD_TIMEOUT` | `180` | Max seconds waiting for first thought/text chunk |
+| `GEMINI_CHUNK_IDLE_TIMEOUT` | `120` | Max seconds between consecutive chunks during deep thinking |
+| `GEMINI_STREAM_OVERALL_TIMEOUT` | `420` | Overall turn ceiling (7 minutes) |
+| `MAX_TOTAL_TOOL_RESULTS_CHARS` | `36000` | Fair-share character budget across parallel `role: "tool"` batches |
+| `TOOL_PARSE_SELF_CORRECTION` | `true` | 1-round internal self-correction on malformed `<tool_call>` |
 
 ---
 
-## Testing & Verification
-
-Run the full automated unit + integration test suite:
+## Verification & Quality Gates
 
 ```powershell
+# Run all 230 offline-isolated unit & integration tests
 python -B -m unittest discover -s tests
-```
 
-Optional live smoke check against a running instance (`:10000` or `:10001`):
-
-```powershell
-python scripts/live_smoke.py --base-url http://127.0.0.1:10000
+# Static lint check (Pyflakes + Syntax + Bugbear)
+ruff check --no-cache --select F,E9,B main.py app tests scripts
 ```
 
 ---
 
-## Troubleshooting
-
-1. **HTTP 503 `bridge_disabled` / `no_healthy_lane`:**
-   Open `http://127.0.0.1:10000/dashboard` and make sure `acc1` / `acc2` are switched **ON** (green) and `API_START_STATE=on` in `.env*`.
-2. **Cookies expired or unintended Guest fallback:**
-   Refresh `__Secure-1PSID` and `__Secure-1PSIDTS` from `gemini.google.com` and paste them into **Cookie Manager (Hot-Reload)** on the dashboard or `POST /v1/update-cookies`. Set `ALLOW_GUEST_MODE=false` if you prefer strict blocking over Guest fallback.
-3. **Gateway not reloading code after edits:**
-   The Dashboard **OFF/ON** toggle only closes/reopens `GeminiClient` inside the running Python process. Run `stop_all.bat` then `run_all.bat` after code updates, and start a **New Session** in DSH if `.bridge_session*.json` was cleared.
-4. **Missing required property on tool calls:**
-   `normalize_tool_arguments()` in [app/tool_parser.py](app/tool_parser.py) maps common aliases (`path` → `file_path`, `cmd` → `command`, `filePath` ↔ `file_path`); malformed tags reject the entire batch fail-closed and record diagnostics in `logs/failure_traces*.jsonl`.
+## Security Notes
+- `.env*`, `.cookie_profiles/`, `.gemini_cookies*/`, `logs/`, and `.bridge_*.json` are strictly gitignored.
+- Profile Vault endpoints (`/v1/profiles/*`) enforce both Origin validation and loopback-only (`127.0.0.1`) access.
+- `HOST` defaults to `127.0.0.1`; binding to `0.0.0.0` is refused at startup unless `API_KEY` is configured.

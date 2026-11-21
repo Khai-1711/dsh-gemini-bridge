@@ -6,15 +6,31 @@ import { displayName } from "../lane-name.js";
 
 const getApi = () => (typeof api !== "undefined" && api ? api : (window.api || {}));
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 /**
- * <bridge-cookie-manager> Component (T40E)
- * Cookie Manager supporting slots 0..4 (Chính, Dự phòng 1..4) routed to selectedLane.
+ * <bridge-cookie-manager> Component (T40E + Profile Vault Auto Cookie Sync)
+ * Cookie Manager supporting slots 0..4 (Chính, Dự phòng 1..4) routed to selectedLane,
+ * plus Profile Vault for managing N Google accounts with 0 open browser tabs.
  * QUY TẮC BẮT BUỘC: Poll không được render lại ô nhập/chọn!
  */
 export class BridgeCookieManager extends HTMLElement {
   connectedCallback() {
+    this._profiles = [];
+    this._browserInfo = { browser_available: true, browser_name: "" };
+    this._vaultSignature = "";
+    this._lastVaultFetchTs = 0;
+
     this.render();
     this.setupEvents();
+    this.refreshProfiles(true);
 
     this.unsubscribe = store.subscribe((state, prevState) => {
       if (!prevState) return;
@@ -24,11 +40,16 @@ export class BridgeCookieManager extends HTMLElement {
 
       if (langChanged || selectedLaneChanged) {
         // Chỉ render lại toàn bộ khi đổi ngôn ngữ hoặc người dùng chủ động chọn luồng khác
+        this._vaultSignature = "";
         this.render();
         this.setupEvents();
+        this.renderVaultList(state.lang);
       } else {
         // Vòng poll 3s (lanes thay đổi) -> CHỈ cập nhật nhãn động tại chỗ, TUYỆT ĐỐI không thay phần tử DOM
         this.updateDynamicValues(state);
+        if (Date.now() - this._lastVaultFetchTs >= 4500) {
+          this.refreshProfiles(false);
+        }
       }
     });
   }
@@ -200,6 +221,38 @@ export class BridgeCookieManager extends HTMLElement {
             <input type="text" class="input-text code-font" id="cm-label" placeholder="vd: my_account_1">
           </div>
 
+          <!-- Profile Vault: Đăng nhập 1 lần, tự nạp ngầm không mở tab -->
+          <div class="vault-box" style="margin: 12px 0 14px 0; padding: 12px; border-radius: 8px; border: 1px solid var(--border-color, rgba(148,163,184,0.22)); background: rgba(59,130,246,0.05);">
+            <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; flex-wrap:wrap;">
+              <strong style="font-size:12.5px; color: var(--text-primary);">🔐 ${t("vaultTitle", lang)}</strong>
+              <button type="button" class="btn btn-secondary" id="cm-vault-sync-all-btn" style="padding:4px 10px; font-size:11.5px;">
+                🔄 ${t("vaultSyncAllBtn", lang)}
+              </button>
+            </div>
+            <div style="font-size:11.5px; color: var(--text-secondary); margin-bottom:10px; line-height:1.4;">
+              ${t("vaultDesc", lang)}
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px;">
+              <input
+                type="text"
+                class="input-text code-font"
+                id="cm-vault-pid"
+                placeholder="${escapeHtml(laneId === "default" ? "acc1" : laneId)}"
+                value="${escapeHtml(savedSlot === "0" ? (laneId === "default" ? "acc1" : laneId) : `${laneId}_s${savedSlot}`)}"
+                style="flex:1; min-width:130px;"
+                aria-label="${t("vaultProfileIdLabel", lang)}"
+              />
+              <button type="button" class="btn btn-primary" id="cm-vault-login-btn" style="padding:7px 12px; font-size:12px; white-space:nowrap;">
+                🌐 ${t("vaultLoginOnceBtn", lang)}
+              </button>
+            </div>
+            <div id="cm-vault-list" style="display:flex; flex-direction:column; gap:6px; max-height:210px; overflow-y:auto;"></div>
+          </div>
+
+          <div style="font-size:11.5px; color: var(--text-secondary); margin: 4px 0 8px 0; font-weight:600;">
+            ${t("vaultManualSection", lang)}
+          </div>
+
           <!-- SECURE_1PSID -->
           <div class="form-field">
             <label class="field-label" for="cm-psid">
@@ -238,6 +291,10 @@ export class BridgeCookieManager extends HTMLElement {
 
     this.slotSelect = this.querySelector("#cm-slot");
     this.labelInput = this.querySelector("#cm-label");
+    this.vaultPidInput = this.querySelector("#cm-vault-pid");
+    this.vaultLoginBtn = this.querySelector("#cm-vault-login-btn");
+    this.vaultSyncAllBtn = this.querySelector("#cm-vault-sync-all-btn");
+    this.vaultListEl = this.querySelector("#cm-vault-list");
     this.psidInput = this.querySelector("#cm-psid");
     this.psidtsInput = this.querySelector("#cm-psidts");
     this.saveBtn = this.querySelector("#cm-save-btn");
@@ -246,6 +303,87 @@ export class BridgeCookieManager extends HTMLElement {
       this.updateSlotOptions(accounts, lang, lane);
       this.slotSelect.value = this.getSelectableSlot(savedSlot, Math.max(accounts.length, lane.has_env_id ? 1 : 0));
     }
+    this.renderVaultList(lang);
+  }
+
+  async refreshProfiles(force = false) {
+    if (!force && this._vaultFetching) return;
+    if (typeof getApi().listProfiles !== "function") return;
+    this._vaultFetching = true;
+    this._lastVaultFetchTs = Date.now();
+    try {
+      const data = await getApi().listProfiles();
+      this._profiles = Array.isArray(data.profiles) ? data.profiles : [];
+      this._browserInfo = {
+        browser_available: data.browser_available !== false,
+        browser_name: data.browser_name || "",
+      };
+      this.renderVaultList(store.getState().lang);
+    } catch (_err) {
+      // Nếu mở từ LAN (403 loopback-only) hoặc chưa hỗ trợ -> giữ yên lặng không spam toast
+    } finally {
+      this._vaultFetching = false;
+    }
+  }
+
+  renderVaultList(lang = "vi") {
+    if (!this.vaultListEl) return;
+    const profiles = this._profiles || [];
+    const sig = JSON.stringify({ lang, profiles });
+    if (sig === this._vaultSignature) return;
+    this._vaultSignature = sig;
+
+    if (!profiles.length) {
+      this.vaultListEl.innerHTML = `<div style="font-size:11.5px; color: var(--text-secondary); padding:4px 2px;">${t("vaultEmpty", lang)}</div>`;
+      return;
+    }
+
+    this.vaultListEl.innerHTML = profiles
+      .map((p) => {
+        const pid = escapeHtml(p.profile_id);
+        const label = p.label && p.label !== p.profile_id ? ` (${escapeHtml(p.label)})` : "";
+        const bindTag = p.lane_id
+          ? `<span class="badge-tag badge-cyan" style="font-size:10px; padding:1px 5px;">${escapeHtml(p.lane_id)}:slot${p.slot ?? 0}</span>`
+          : `<span class="badge-tag" style="font-size:10px; padding:1px 5px; opacity:0.7;">vault</span>`;
+        let stHtml = `<span style="font-size:11px; color:#10b981;">${t("vaultReady", lang)}</span>`;
+        if (p.runtime_state === "waiting_login" || p.last_status === "waiting_login") {
+          stHtml = `<span style="font-size:11px; color:#f59e0b;">${t("vaultWaitingLogin", lang)}</span>`;
+        } else if (p.runtime_state === "syncing") {
+          stHtml = `<span style="font-size:11px; color:#38bdf8;">${t("vaultSyncing", lang)}</span>`;
+        } else if (p.last_status === "login_required" || !p.has_profile_data) {
+          stHtml = `<span style="font-size:11px; color:#f59e0b;">${t("vaultLoginRequired", lang)}</span>`;
+        } else if (p.last_status === "error") {
+          stHtml = `<span style="font-size:11px; color:#ef4444;" title="${escapeHtml(p.last_error || "")}">❌ ${escapeHtml((p.last_error || "error").slice(0, 48))}</span>`;
+        }
+        const isWaitingLogin = p.runtime_state === "waiting_login" || p.last_status === "waiting_login";
+        const isSyncing = p.runtime_state === "syncing";
+        const busy = isWaitingLogin || isSyncing;
+        const primaryActionBtn = isWaitingLogin
+          ? `<button type="button" class="btn btn-primary cm-vault-finish" data-pid="${pid}" style="padding:3px 9px; font-size:11px; background:#10b981; border-color:#10b981;">✅ ${t("vaultFinishLoginBtn", lang)}</button>`
+          : `<button type="button" class="btn btn-secondary cm-vault-sync-one" data-pid="${pid}" ${busy ? "disabled" : ""} style="padding:3px 8px; font-size:11px;">🔄 ${t("vaultSyncBtn", lang)}</button>`;
+        return `
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px; border-radius:6px; background: rgba(15,23,42,0.28); border: 1px solid rgba(148,163,184,0.16); flex-wrap:wrap;">
+            <div style="display:flex; flex-direction:column; gap:2px; min-width:130px;">
+              <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                <code style="font-size:12px; font-weight:600;">${pid}</code>
+                <span style="font-size:11px; opacity:0.85;">${label}</span>
+                ${bindTag}
+              </div>
+              ${stHtml}
+            </div>
+            <div style="display:flex; gap:5px; align-items:center;">
+              ${primaryActionBtn}
+              <button type="button" class="btn btn-secondary cm-vault-relogin" data-pid="${pid}" ${busy ? "disabled" : ""} style="padding:3px 8px; font-size:11px;">
+                🌐
+              </button>
+              <button type="button" class="btn btn-secondary cm-vault-del" data-pid="${pid}" ${busy ? "disabled" : ""} style="padding:3px 7px; font-size:11px; color:#f87171;">
+                ✕
+              </button>
+            </div>
+          </div>
+        `;
+      })
+      .join("");
   }
 
   updateDynamicValues(state) {
@@ -325,6 +463,109 @@ export class BridgeCookieManager extends HTMLElement {
     });
 
     this.saveBtn?.addEventListener("click", () => this.handleSave());
+    this.vaultLoginBtn?.addEventListener("click", () => this.handleVaultLogin());
+    this.vaultSyncAllBtn?.addEventListener("click", () => this.handleVaultSyncAll());
+    this.vaultListEl?.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn) return;
+      const pid = btn.getAttribute("data-pid");
+      if (!pid) return;
+      if (btn.classList.contains("cm-vault-sync-one")) {
+        this.handleVaultSyncOne(pid, btn);
+      } else if (btn.classList.contains("cm-vault-finish")) {
+        this.handleVaultFinishLogin(pid, btn);
+      } else if (btn.classList.contains("cm-vault-relogin")) {
+        this.handleVaultLogin(pid);
+      } else if (btn.classList.contains("cm-vault-del")) {
+        this.handleVaultDelete(pid);
+      }
+    });
+  }
+
+  async handleVaultFinishLogin(pid, btnEl) {
+    const { lang } = store.getState();
+    if (btnEl) btnEl.disabled = true;
+    try {
+      await getApi().finishProfileLogin(pid);
+      store.notifyToast(t("vaultSyncedToast", lang, { id: pid }), "success");
+      await this.refreshProfiles(true);
+      window.dispatchEvent(new CustomEvent("refresh-request"));
+    } catch (err) {
+      store.notifyToast(`Error: ${err.message}`, "error");
+      await this.refreshProfiles(true);
+    } finally {
+      if (btnEl) btnEl.disabled = false;
+    }
+  }
+
+  async handleVaultLogin(explicitPid = "") {
+    const state = store.getState();
+    const { lang } = state;
+    const lane = this.getCurrentLane(state);
+    const laneId = lane.id || state.selectedLane || "default";
+    const slot = parseInt(this.slotSelect?.value || "0", 10);
+    const label = (this.labelInput?.value || "").trim();
+    const pid = (explicitPid || this.vaultPidInput?.value || "").trim();
+    if (!pid) {
+      this.vaultPidInput?.focus();
+      return;
+    }
+    try {
+      const existing = (this._profiles || []).find((p) => p.profile_id === pid);
+      const bindLane = explicitPid && existing?.lane_id ? existing.lane_id : laneId;
+      const bindSlot = explicitPid && existing?.slot !== null && existing?.slot !== undefined ? existing.slot : slot;
+      const bindLabel = label || existing?.label || "";
+      await getApi().loginProfile(pid, { laneId: bindLane, slot: bindSlot, label: bindLabel });
+      store.notifyToast(t("vaultLoginOpened", lang, { id: pid }), "info");
+      await this.refreshProfiles(true);
+    } catch (err) {
+      store.notifyToast(`Error: ${err.message}`, "error");
+    }
+  }
+
+  async handleVaultSyncOne(pid, btnEl) {
+    const { lang } = store.getState();
+    if (btnEl) btnEl.disabled = true;
+    try {
+      await getApi().syncProfile(pid);
+      store.notifyToast(t("vaultSyncedToast", lang, { id: pid }), "success");
+      await this.refreshProfiles(true);
+      window.dispatchEvent(new CustomEvent("refresh-request"));
+    } catch (err) {
+      store.notifyToast(`Error: ${err.message}`, "error");
+      await this.refreshProfiles(true);
+    } finally {
+      if (btnEl) btnEl.disabled = false;
+    }
+  }
+
+  async handleVaultSyncAll() {
+    const { lang } = store.getState();
+    if (this.vaultSyncAllBtn) this.vaultSyncAllBtn.disabled = true;
+    try {
+      const res = await getApi().syncAllProfiles();
+      store.notifyToast(
+        t("vaultSyncAllDone", lang, { synced: res.synced || 0, total: res.total || 0 }),
+        res.synced === res.total ? "success" : "warning"
+      );
+      await this.refreshProfiles(true);
+      window.dispatchEvent(new CustomEvent("refresh-request"));
+    } catch (err) {
+      store.notifyToast(`Error: ${err.message}`, "error");
+    } finally {
+      if (this.vaultSyncAllBtn) this.vaultSyncAllBtn.disabled = false;
+    }
+  }
+
+  async handleVaultDelete(pid) {
+    const { lang } = store.getState();
+    if (!confirm(t("vaultDeleteConfirm", lang, { id: pid }))) return;
+    try {
+      await getApi().deleteProfile(pid);
+      await this.refreshProfiles(true);
+    } catch (err) {
+      store.notifyToast(`Error: ${err.message}`, "error");
+    }
   }
 
   async handleSave() {

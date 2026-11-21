@@ -227,6 +227,11 @@ class TestEndToEndChatCompletions(unittest.TestCase):
                     app_main.session_manager,
                     "send_prepared_turn_stream",
                     new=_truncated_stream,
+                ), patch.object(
+                    app_main.session_manager,
+                    "send_prepared_turn",
+                    new_callable=AsyncMock,
+                    return_value='still broken <tool_call>{"name":"Inspect"',
                 ):
                     stream_resp = client.post(
                         "/v1/chat/completions",
@@ -305,8 +310,8 @@ class TestFailoverCapModelsAndConcurrency(unittest.IsolatedAsyncioTestCase):
             mgr.chat_session.metadata = [None] * 10
             mgr.chat_session.send_message = AsyncMock(side_effect=auth_exc)
 
-            async def _auth_boom_stream(_prompt):
-                raise auth_exc
+            async def _auth_boom_stream(_prompt, _exc=auth_exc):
+                raise _exc
                 yield
 
             mgr.chat_session.send_message_stream = _auth_boom_stream
@@ -334,24 +339,33 @@ class TestFailoverCapModelsAndConcurrency(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(model_name="gemini-carbon", display_name="Carbon", description="4 Carbon"),
         ]
         mgr.default_model = "unspecified"
+        mgr._active_slot_model = ""
+        mgr.fallback_model = ""
         models = mgr._refresh_available_models()
-        self.assertIn("gemini-4-neon", models)
-        self.assertIn("gemini-4-hydrogen", models)
-        self.assertIn("gemini-carbon", models)
-        self.assertNotIn("gemini-flash-lite", models)
+        # All real account models must remain visible for the user to choose
+        self.assertEqual(
+            models,
+            ["gemini-flash-lite", "gemini-4-hydrogen", "gemini-4-neon", "gemini-carbon"],
+        )
 
         mgr._ensure_default_model()
-        self.assertEqual(mgr.default_model, "gemini-4-neon")
-        self.assertEqual(mgr._select_fallback_model(), "gemini-4-hydrogen")
+        # No hardcoded forcing: picks first selectable when user did not configure DEFAULT_MODEL
+        self.assertEqual(mgr.default_model, "gemini-flash-lite")
+        # Default fallback_model="" -> no silent model switching
+        self.assertEqual(mgr._select_fallback_model(), "")
 
-        mgr.default_model = "gemini-4-hydrogen"
-        self.assertEqual(mgr._select_fallback_model(), "gemini-4-neon")
+        # When user explicitly configures a fallback model, it is honored
+        mgr.default_model = "gemini-4-neon"
+        mgr._active_slot_model = "gemini-4-neon"
+        mgr.fallback_model = "gemini-4-hydrogen"
+        self.assertEqual(mgr._select_fallback_model(), "gemini-4-hydrogen")
 
         with patch.object(app_main, "session_manager") as mock_mgr:
             mock_mgr.state = "on"
             mock_mgr.auth_ok = True
             mock_mgr.allow_guest = False
             mock_mgr.is_guest = False
+            mock_mgr.chain = []
             mock_mgr.available_models = ["gemini-4-hydrogen", "gemini-4-neon"]
             mock_mgr.model_details = [
                 {"name": "gemini-4-neon", "display_name": "Neon", "description": "Gemini 4 Neon"},
@@ -690,6 +704,8 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
     async def test_nonstream_inherits_soft_first_byte_fallback(self):
         mgr = self._make_pool_manager()
         mgr.default_model = "gemini-4-hydrogen"
+        mgr._active_slot_model = "gemini-4-hydrogen"
+        mgr.fallback_model = "unspecified"
         mgr.available_models = ["gemini-4-hydrogen", "unspecified"]
         mgr.chain = [{"label": "acc1", "psid": "p", "psidts": "t", "key": "k"}]
 
@@ -744,6 +760,8 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
                 mgr._active_psid = "p"
                 mgr._save_session = gs.SingleChatManager._save_session.__get__(mgr)
                 mgr.default_model = "gemini-neon"
+                mgr._active_slot_model = "gemini-neon"
+                mgr.fallback_model = "gemini-4-hydrogen"
                 mgr.available_models = ["gemini-neon", "gemini-4-hydrogen"]
                 mgr._create_new_chat_session()
                 mgr.session_initialized = True
@@ -919,6 +937,179 @@ class TestStickySessionPool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(res.tool_calls), 1)
         self.assertEqual(res.malformed_tags, [])
         self.assertEqual(json.loads(res.tool_calls[0]["function"]["arguments"])["content"], large_content)
+
+    async def test_interleaved_slots_with_different_models_never_corrupt_each_other_or_default_model(self):
+        """Regression test for Bug #3: 2 sessions using 2 different models on the SAME worker."""
+        import httpx
+
+        with tempfile.TemporaryDirectory() as td:
+            handoff_dir = Path(td)
+            mgr = self._make_pool_manager()
+            mgr.ensure_authenticated = AsyncMock(return_value=True)
+            mgr.default_model = "model-default"
+            mgr._active_slot_model = "model-default"
+            mgr.available_models = ["model-default", "model-alpha", "model-beta"]
+            mgr.fallback_model = ""
+            models_per_call = []
+
+            class _ModelTrackingChat:
+                def __init__(self, model_name, cid):
+                    self.model = model_name
+                    self.metadata = [cid, "r1", "rc1"] + [None] * 7
+
+                @property
+                def cid(self):
+                    return self.metadata[0]
+
+                async def send_message_stream(self, _prompt):
+                    models_per_call.append((self.cid, self.model))
+                    yield SimpleNamespace(text_delta=f"ok:{self.model}")
+
+            counter = {"n": 0}
+
+            def _start_chat(**kw):
+                meta = kw.get("metadata")
+                model_name = kw.get("model") or "unspecified"
+                if meta and meta[0]:
+                    return _ModelTrackingChat(model_name, meta[0])
+                counter["n"] += 1
+                return _ModelTrackingChat(model_name, f"cid_{counter['n']}")
+
+            mgr.client.start_chat = MagicMock(side_effect=_start_chat)
+
+            with patch.dict(gs.INSTANCE_PATHS, {"handoff_dir": handoff_dir}), \
+                 patch.object(gs, "MIN_REQUEST_INTERVAL", 0), \
+                 patch.object(app_main, "session_manager", mgr), \
+                 patch.object(app_main, "API_KEY", ""), \
+                 patch.object(app_main.activity, "write"):
+                mgr._lead_ledger = FactLedger(handoff_dir, filename="ledger.json", persist=True)
+                mgr.ledger = mgr._lead_ledger
+                transport = httpx.ASGITransport(app=app_main.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:10001") as ac:
+                    # 1. Agent A Turn 1 -> model-alpha
+                    r_a1 = await ac.post(
+                        "/v1/chat/completions",
+                        headers={"X-Session-Id": "agent-a"},
+                        json={"model": "model-alpha", "messages": [{"role": "user", "content": "task A1"}]},
+                    )
+                    # 2. Agent B Turn 1 -> model-beta
+                    r_b1 = await ac.post(
+                        "/v1/chat/completions",
+                        headers={"X-Session-Id": "agent-b"},
+                        json={"model": "model-beta", "messages": [{"role": "user", "content": "task B1"}]},
+                    )
+                    # 3. Agent A Turn 2 with model="default" -> must keep its own slot model (model-alpha), NOT model-beta!
+                    r_a2 = await ac.post(
+                        "/v1/chat/completions",
+                        headers={"X-Session-Id": "agent-a"},
+                        json={
+                            "model": "default",
+                            "messages": [
+                                {"role": "user", "content": "task A1"},
+                                {"role": "assistant", "content": "ok:model-alpha"},
+                                {"role": "user", "content": "task A2"},
+                            ],
+                        },
+                    )
+                    # 4. Agent B Turn 2 -> still model-beta and still same cid
+                    r_b2 = await ac.post(
+                        "/v1/chat/completions",
+                        headers={"X-Session-Id": "agent-b"},
+                        json={
+                            "model": "model-beta",
+                            "messages": [
+                                {"role": "user", "content": "task B1"},
+                                {"role": "assistant", "content": "ok:model-beta"},
+                                {"role": "user", "content": "task B2"},
+                            ],
+                        },
+                    )
+
+            self.assertEqual(r_a1.status_code, 200)
+            self.assertEqual(r_b1.status_code, 200)
+            self.assertEqual(r_a2.status_code, 200)
+            self.assertEqual(r_b2.status_code, 200)
+            # Worker global default_model was NEVER mutated by per-request slot models
+            self.assertEqual(mgr.default_model, "model-default")
+            # Each slot stayed strictly on its own model and cid
+            self.assertEqual(models_per_call[0][1], "model-alpha")
+            self.assertEqual(models_per_call[1][1], "model-beta")
+            self.assertEqual(models_per_call[2], models_per_call[0])
+            self.assertEqual(models_per_call[3], models_per_call[1])
+            self.assertEqual(mgr._session_pool["agent-a"].model, "model-alpha")
+            self.assertEqual(mgr._session_pool["agent-b"].model, "model-beta")
+
+    async def test_invalid_tool_call_self_corrects_internally_before_failing(self):
+        import httpx
+
+        with tempfile.TemporaryDirectory() as td:
+            handoff_dir = Path(td)
+            mgr = self._make_pool_manager()
+            mgr.ensure_authenticated = AsyncMock(return_value=True)
+            mgr.default_model = "gemini-4-hydrogen"
+            mgr._active_slot_model = "gemini-4-hydrogen"
+            mgr.available_models = ["gemini-4-hydrogen"]
+            mgr.fallback_model = ""
+            turn_calls = []
+
+            class _SelfCorrectChat:
+                def __init__(self):
+                    self.model = "gemini-4-hydrogen"
+                    self.metadata = ["cid_sc", "r1", "rc1"] + [None] * 7
+
+                @property
+                def cid(self):
+                    return self.metadata[0]
+
+                async def send_message_stream(self, prompt):
+                    turn_calls.append(prompt)
+                    if len(turn_calls) == 1:
+                        # First reply: truncated unclosed tool call
+                        yield SimpleNamespace(text_delta='<tool_call>{"name":"pwsh","arguments":{"command":"echo hi"')
+                    else:
+                        # Correction round: valid tool call
+                        yield SimpleNamespace(text_delta='<tool_call>{"name":"pwsh","arguments":{"command":"echo hi"}}</tool_call>')
+
+            chat = _SelfCorrectChat()
+            mgr.client.start_chat = MagicMock(return_value=chat)
+            mgr.chat_session = chat
+
+            tools_payload = [{
+                "type": "function",
+                "function": {
+                    "name": "pwsh",
+                    "description": "Run shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                },
+            }]
+
+            with patch.dict(gs.INSTANCE_PATHS, {"handoff_dir": handoff_dir}), \
+                 patch.object(gs, "MIN_REQUEST_INTERVAL", 0), \
+                 patch.object(app_main, "session_manager", mgr), \
+                 patch.object(app_main, "API_KEY", ""), \
+                 patch.object(app_main.activity, "write"):
+                mgr._lead_ledger = FactLedger(handoff_dir, filename="ledger.json", persist=True)
+                mgr.ledger = mgr._lead_ledger
+                transport = httpx.ASGITransport(app=app_main.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:10001") as ac:
+                    resp = await ac.post(
+                        "/v1/chat/completions",
+                        json={
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "run echo hi"}],
+                            "tools": tools_payload,
+                        },
+                    )
+
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(len(turn_calls), 2)
+            self.assertIn("[TOOL FORMAT CORRECTION]", turn_calls[1])
+            self.assertIn('"finish_reason": "tool_calls"', resp.text)
+            self.assertNotIn("invalid_tool_call", resp.text)
 
 
 if __name__ == "__main__":

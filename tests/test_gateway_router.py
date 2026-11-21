@@ -431,6 +431,149 @@ class TestGatewayRouter(unittest.IsolatedAsyncioTestCase):
             hold_event.set()
             await gw.close()
 
+    async def test_gateway_routes_to_worker_supporting_requested_model(self):
+        statuses = {
+            "acc1": {
+                "state": "on",
+                "auth_ok": True,
+                "account_status": "AVAILABLE",
+                "inflight": 0,
+                "available_models": ["model-alpha"],
+                "accounts": [{"label": "a1", "status": "active"}],
+            },
+            "acc2": {
+                "state": "on",
+                "auth_ok": True,
+                "account_status": "AVAILABLE",
+                "inflight": 0,
+                "available_models": ["model-beta"],
+                "accounts": [{"label": "a2", "status": "active"}],
+            },
+        }
+        gw, _, _, _ = self._build_env(
+            lane_statuses=statuses,
+            acc1_models=["model-alpha"],
+            acc2_models=["model-beta"],
+        )
+        try:
+            with patch.object(app_main, "is_frontend_gateway", True), \
+                 patch.object(app_main, "gateway_router", gw), \
+                 patch.object(app_main, "API_KEY", ""), \
+                 patch.object(app_main.activity, "write"):
+                gw_transport = httpx.ASGITransport(app=app_main.app)
+                async with httpx.AsyncClient(transport=gw_transport, base_url="http://127.0.0.1:10000") as ac:
+                    resp = await ac.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "model-beta",
+                            "stream": False,
+                            "messages": [{"role": "user", "content": "need model-beta specifically"}],
+                        },
+                    )
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.headers.get("X-Gateway-Lane"), "acc2")
+        finally:
+            await gw.close()
+
+    async def test_sse_failover_when_real_worker_turn_lock_is_busy(self):
+        """Real openai_adapter.py worker returns HTTP 429 before opening SSE 200 when busy -> Gateway fails over!"""
+        from unittest.mock import AsyncMock
+        from app import gemini_session as gs
+        from app.openai_adapter import chat_completions as real_chat_completions
+
+        # Worker 1 runs REAL chat_completions with its turn lock already held busy!
+        busy_mgr = gs.SingleChatManager.__new__(gs.SingleChatManager)
+        busy_mgr.state = "on"
+        busy_mgr.auth_ok = True
+        busy_mgr.is_guest = False
+        busy_mgr.allow_guest = False
+        busy_mgr.chain = [{"label": "a1", "psid": "p", "psidts": "t", "key": "k"}]
+        busy_mgr.default_model = "model-a"
+        busy_mgr._active_slot_model = "model-a"
+        busy_mgr.available_models = ["model-a"]
+        busy_mgr.model_details = []
+        busy_mgr.lock = asyncio.Lock()
+        busy_mgr._lock_owner_task = None
+        busy_mgr.total_errors = 0
+        busy_mgr.chat_session = None
+        busy_mgr.ensure_authenticated = AsyncMock(return_value=True)
+        await busy_mgr.lock.acquire()  # Simulate long in-flight turn holding lock
+
+        worker1_app = FastAPI()
+
+        @worker1_app.post("/v1/chat/completions")
+        async def _w1_real_chat(request: Request):
+            with patch.object(app_main, "is_frontend_gateway", False), \
+                 patch.object(app_main, "session_manager", busy_mgr), \
+                 patch("app.openai_adapter.LOCK_ACQUIRE_TIMEOUT", 0.05), \
+                 patch.object(app_main.activity, "write"):
+                return await real_chat_completions(request)
+
+        tracker = {
+            "calls": [],
+            "active": 0,
+            "max_active": 0,
+            "active_stream": 0,
+            "max_active_stream": 0,
+            "active_lanes": set(),
+            "max_concurrent_lanes": 0,
+            "force_status": {},
+            "delay": 0.0,
+            "hold_stream_event": None,
+            "stream_cancelled": [],
+            "stream_closed": [],
+        }
+        worker2_app = _make_worker_app("acc2", ["model-a"], tracker)
+        statuses = {
+            "acc1": {"state": "on", "auth_ok": True, "account_status": "AVAILABLE", "inflight": 0, "available_models": ["model-a"], "accounts": [{"label": "a1", "status": "active"}]},
+            "acc2": {"state": "on", "auth_ok": True, "account_status": "AVAILABLE", "inflight": 0, "available_models": ["model-a"], "accounts": [{"label": "a2", "status": "active"}]},
+        }
+
+        async def _fake_http(method, url, headers=None, body=None, timeout=2.0):
+            for lid, port in (("acc1", "10001"), ("acc2", "10002")):
+                if f":{port}" in url:
+                    return 200, dict(statuses[lid])
+            return 404, {"error": "not found"}
+
+        peers = {"acc1": "http://127.0.0.1:10001", "acc2": "http://127.0.0.1:10002"}
+        reg = LaneRegistry("frontend", peers, token="tok", http_call=_fake_http, cache_ttl=0.0, is_frontend_gateway=True)
+        transport = _MultiHostASGITransport(
+            {
+                "http://127.0.0.1:10001": httpx.ASGITransport(app=worker1_app),
+                "http://127.0.0.1:10002": httpx.ASGITransport(app=worker2_app),
+            }
+        )
+        gw = GatewayRouter(
+            lane_registry=reg,
+            api_key="",
+            client_factory=lambda: httpx.AsyncClient(transport=transport),
+        )
+        gw.active = True
+
+        try:
+            with patch.object(app_main, "is_frontend_gateway", True), \
+                 patch.object(app_main, "gateway_router", gw), \
+                 patch.object(app_main, "API_KEY", ""), \
+                 patch.object(app_main.activity, "write"):
+                gw_transport = httpx.ASGITransport(app=app_main.app)
+                async with httpx.AsyncClient(transport=gw_transport, base_url="http://127.0.0.1:10000") as ac:
+                    resp = await ac.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "model-a",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "lead streaming failover test"}],
+                        },
+                    )
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.headers.get("X-Gateway-Lane"), "acc2")
+            self.assertIn("hi-from-acc2:", resp.text)
+            self.assertIn("acc1", gw.get_stats()["cooldowns"])
+        finally:
+            if busy_mgr.lock.locked():
+                busy_mgr.lock.release()
+            await gw.close()
+
 
 if __name__ == "__main__":
     unittest.main()

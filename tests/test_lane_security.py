@@ -3,7 +3,6 @@ os.environ.pop("BRIDGE_INSTANCE", None)
 os.environ.setdefault("SECURE_1PSID", "mock_psid")
 os.environ.setdefault("SECURE_1PSIDTS", "mock_psidts")
 
-import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch

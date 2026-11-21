@@ -109,12 +109,21 @@ class GatewayRouter:
             oldest_key = min(self._sticky, key=lambda k: self._sticky[k].last_used_ts)
             self._sticky.pop(oldest_key, None)
 
+    @staticmethod
+    def _lane_supports_model(lane: dict, requested_model: str) -> bool:
+        avail = lane.get("available_models") or []
+        if not avail:
+            return False
+        req_low = requested_model.strip().lower()
+        return any(str(m).strip().lower() == req_low for m in avail)
+
     async def reserve_lane(
         self,
         conv_key: str,
         is_new_conv: bool,
         is_subagent: bool,
         exclude: Optional[set] = None,
+        requested_model: str = "",
     ) -> Tuple[Optional[dict], Optional[str]]:
         excluded = exclude or set()
         lanes = await self.lane_registry.list_lanes({}, force_refresh=False)
@@ -129,6 +138,14 @@ class GatewayRouter:
             candidates = healthy or [lane for lane in peer_lanes if self._is_lane_on(lane, now)]
             if not candidates:
                 return None, "Không có luồng worker nào đang BẬT và sẵn sàng (acc1/acc2)."
+
+            req_clean = str(requested_model or "").strip()
+            if req_clean and req_clean.lower() not in ("default", "auto", "none", "unspecified", "gemini"):
+                matching_model_lanes = [
+                    lane for lane in candidates if self._lane_supports_model(lane, req_clean)
+                ]
+                if matching_model_lanes:
+                    candidates = matching_model_lanes
 
             by_id = {str(lane["id"]): lane for lane in candidates}
             primary_lead_id = next(iter(self.lane_registry.peers.keys()), str(candidates[0]["id"]))
@@ -175,17 +192,19 @@ class GatewayRouter:
         async with self._route_lock:
             self._cooldown_until[lane_id] = time.time() + max(0.0, ttl)
 
-    def _build_forward_headers(self, request_headers: Any) -> Dict[str, str]:
+    def _build_forward_headers(self, request_headers: Any, failover_ready: bool = False) -> Dict[str, str]:
         out: Dict[str, str] = {"Content-Type": "application/json"}
         auth_val = request_headers.get("Authorization") or request_headers.get("authorization")
         if auth_val:
             out["Authorization"] = str(auth_val)
         elif self.api_key:
             out["Authorization"] = f"Bearer {self.api_key}"
-        for h_name in ("X-Session-Id", "X-DSH-Session-Id"):
+        for h_name in ("X-Session-Id", "X-DSH-Session-Id", "X-Workspace-Dir"):
             val = request_headers.get(h_name) or request_headers.get(h_name.lower())
             if val:
                 out[h_name] = str(val)
+        if failover_ready:
+            out["X-Gateway-Failover-Ready"] = "1"
         return out
 
     async def proxy_models(self):
@@ -264,15 +283,19 @@ class GatewayRouter:
         ).strip()
         conv_key, is_new_conv = compute_session_key(messages, explicit_sid)
         is_subagent = is_subagent_messages(messages)
-        fwd_headers = self._build_forward_headers(request.headers)
         client = self._get_client()
 
         excluded: set = set()
         last_error_resp: Optional[Tuple[int, bytes, str, str]] = None
+        max_attempts = max(2, len(self.lane_registry.peers))
 
-        for attempt in range(2):
+        for attempt in range(max_attempts):
             lane, err_msg = await self.reserve_lane(
-                conv_key, is_new_conv, is_subagent, exclude=excluded
+                conv_key,
+                is_new_conv,
+                is_subagent,
+                exclude=excluded,
+                requested_model=model_id,
             )
             if lane is None:
                 if last_error_resp is not None:
@@ -308,6 +331,12 @@ class GatewayRouter:
             lane_url = str(lane.get("url") or "").rstrip("/")
             target_url = f"{lane_url}{request.url.path}"
             role_tag = "subagent" if is_subagent else "lead"
+            has_alternative = any(
+                pid not in excluded and pid != lane_id for pid in self.lane_registry.peers
+            )
+            fwd_headers = self._build_forward_headers(
+                request.headers, failover_ready=(attempt + 1 < max_attempts and has_alternative)
+            )
             logger.info(
                 f"[GATEWAY] Route {conv_key[:8]} ({role_tag}) -> {lane_id} ({lane_url}) "
                 f"| inflight={self._gateway_inflight.get(lane_id, 0)}"
@@ -328,7 +357,7 @@ class GatewayRouter:
                     await self.mark_cooldown(lane_id)
                     excluded.add(lane_id)
                     has_other = any(pid not in excluded for pid in self.lane_registry.peers)
-                    if attempt == 0 and has_other:
+                    if attempt + 1 < max_attempts and has_other:
                         logger.warning(f"[GATEWAY] {lane_id} lỗi kết nối ({exc}); thử chuyển luồng khác.")
                         continue
                     self._record_activity(
@@ -370,7 +399,7 @@ class GatewayRouter:
                         excluded.add(lane_id)
                         last_error_resp = (status_code, raw_err, media, lane_id)
                         has_other = any(pid not in excluded for pid in self.lane_registry.peers)
-                        if attempt == 0 and has_other:
+                        if attempt + 1 < max_attempts and has_other:
                             logger.warning(f"[GATEWAY] {lane_id} trả HTTP {status_code}; thử chuyển luồng khác.")
                             continue
                     self._record_activity(
@@ -452,7 +481,7 @@ class GatewayRouter:
                 await self.mark_cooldown(lane_id)
                 excluded.add(lane_id)
                 has_other = any(pid not in excluded for pid in self.lane_registry.peers)
-                if attempt == 0 and has_other:
+                if attempt + 1 < max_attempts and has_other:
                     logger.warning(f"[GATEWAY] {lane_id} lỗi kết nối ({exc}); thử chuyển luồng khác.")
                     continue
                 self._record_activity(
@@ -487,7 +516,7 @@ class GatewayRouter:
                 excluded.add(lane_id)
                 last_error_resp = (resp.status_code, resp.content, media, lane_id)
                 has_other = any(pid not in excluded for pid in self.lane_registry.peers)
-                if attempt == 0 and has_other:
+                if attempt + 1 < max_attempts and has_other:
                     logger.warning(f"[GATEWAY] {lane_id} trả HTTP {resp.status_code}; thử chuyển luồng khác.")
                     continue
 

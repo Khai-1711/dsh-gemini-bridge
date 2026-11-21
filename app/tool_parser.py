@@ -1,17 +1,70 @@
 from dataclasses import dataclass, field
 import json
+import re
 import uuid
 from typing import Any, Dict, List, Tuple
 from app.config import FORBIDDEN_TOOLS, logger
 from app.security import (
-    is_path_within_project,
-    is_safe_path_no_c_drive,
+    is_safe_path,
     sanitize_shell_command_no_c_drive,
 )
 
 
 class InvalidToolArguments(ValueError):
     """Raised when a tool request violates its declared schema or path policy."""
+
+
+_GEMINI_IMAGE_TAG_RE = re.compile(
+    r"""<Image\b[^>]*\bsrc=["']image_agent_tag_[^"']*["'][^>]*/?>""",
+    re.IGNORECASE,
+)
+
+# Gemini Web auto-linkifies raw URLs outside code fences into `[url](url)` or `[url](url/)`.
+# Only unwrap links whose visible label is itself a URL matching the href target,
+# leaving genuine Markdown links such as `[Docs](https://example.com)` untouched.
+_GEMINI_AUTOLINK_RE = re.compile(
+    r"\[((?:https?|ftp)://[^\]\s]+)\]\(((?:https?|ftp)://[^\)\s]+)\)",
+    re.IGNORECASE,
+)
+
+
+def clean_gemini_web_artifacts(text: str) -> str:
+    """Loại bỏ các thẻ pseudo-image rác do Gemini Web tự chèn vào phản hồi."""
+    if not text or "image_agent_tag_" not in text:
+        return text
+    cleaned = _GEMINI_IMAGE_TAG_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
+
+
+def unlinkify_gemini_urls(text: str) -> str:
+    """Khử lỗi Gemini Web tự biến URL thành Markdown link `[http://x](http://x)` trong chuỗi."""
+    if not text or "](" not in text or "://" not in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        label = match.group(1)
+        href = match.group(2)
+        if label.rstrip("/") == href.rstrip("/"):
+            return label
+        return match.group(0)
+
+    out = text
+    for _ in range(3):
+        updated = _GEMINI_AUTOLINK_RE.sub(_replace, out)
+        if updated == out:
+            break
+        out = updated
+    return out
+
+
+def _sanitize_tool_argument_values(value: Any) -> Any:
+    if isinstance(value, str):
+        return unlinkify_gemini_urls(value)
+    if isinstance(value, list):
+        return [_sanitize_tool_argument_values(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _sanitize_tool_argument_values(v) for k, v in value.items()}
+    return value
 
 
 def _is_schema_type(value: Any, schema_type: str) -> bool:
@@ -31,15 +84,25 @@ def _is_schema_type(value: Any, schema_type: str) -> bool:
 
 
 def normalize_tool_arguments(
-    fn_name: str, args: Dict[str, Any], tool_schema: Dict[str, Any]
+    fn_name: str,
+    args: Dict[str, Any],
+    tool_schema: Dict[str, Any],
+    workspace_root: str = "",
 ) -> Dict[str, Any]:
-    """Normalize declared aliases and reject arguments outside the tool schema."""
+    """Normalize declared aliases, clean Gemini URL artifacts, and validate against tool schema."""
     if not isinstance(args, dict):
         raise InvalidToolArguments("Tool arguments must be a JSON object.")
 
     name_lower = fn_name.lower()
-    props = (tool_schema.get("parameters") or {}).get("properties") or {}
-    normalized = dict(args)
+    params = tool_schema.get("parameters") or {}
+    props = params.get("properties") or {}
+    required_keys = set(params.get("required") or [])
+    normalized = _sanitize_tool_argument_values(dict(args))
+
+    # Drop explicit null values for optional parameters (common LLM quirk)
+    for key in list(normalized.keys()):
+        if normalized[key] is None and key not in required_keys:
+            normalized.pop(key, None)
 
     aliases = {
         "file_path": ("path", "file", "filepath", "filename", "target_file", "filePath"),
@@ -56,7 +119,6 @@ def normalize_tool_arguments(
                 normalized[destination] = normalized.pop(source)
                 break
 
-    params = tool_schema.get("parameters") or {}
     if params.get("additionalProperties") is False:
         extras = set(normalized) - set(props)
         if extras:
@@ -79,8 +141,8 @@ def normalize_tool_arguments(
         if key in ("file_path", "path", "filePath", "filepath"):
             if not isinstance(value, str):
                 raise InvalidToolArguments("File path must be a string.")
-            if not is_safe_path_no_c_drive(value) or not is_path_within_project(value):
-                raise InvalidToolArguments("File path is outside the project directory.")
+            if not is_safe_path(value, workspace_root=workspace_root):
+                raise InvalidToolArguments("File path targets a protected OS directory or is outside workspace.")
 
     if name_lower in ("pwsh", "bash", "shell", "execute_command", "run_command"):
         command = normalized.get("command")
@@ -121,10 +183,21 @@ class ToolParseResult:
     has_unclosed_tag: bool = False
 
 
+def _is_prose_tool_tag_mention(text: str, open_pos: int, open_len: int) -> bool:
+    """Trả True nếu `<tool_call>` tại vị trí `open_pos` chỉ là trích dẫn trong văn bản (vd `` `<tool_call>` ``)."""
+    if open_pos > 0 and text[open_pos - 1] == "`":
+        return True
+    after_pos = open_pos + open_len
+    if after_pos < len(text) and text[after_pos] == "`":
+        return True
+    return False
+
+
 def _scan_tool_call_blocks(text: str) -> Tuple[List[str], bool]:
     """Tách các thẻ <tool_call>...</tool_call> nhận biết chuỗi JSON (" và \\).
 
-    Trả về ``(blocks, has_unclosed)``; nếu có thẻ mở nhưng tới EOF vẫn chưa
+    Bỏ qua các lần nhắc thẻ `<tool_call>` trong inline backtick hoặc văn bản giải thích.
+    Trả về ``(blocks, has_unclosed)``; nếu có thẻ mở thực sự nhưng tới EOF vẫn chưa
     đóng hợp lệ bên ngoài chuỗi -> ``has_unclosed=True`` (Gate 0 fail-closed).
     """
     open_tag = "<tool_call>"
@@ -137,6 +210,9 @@ def _scan_tool_call_blocks(text: str) -> Tuple[List[str], bool]:
         start = text.find(open_tag, pos)
         if start == -1:
             break
+        if _is_prose_tool_tag_mention(text, start, len(open_tag)):
+            pos = start + len(open_tag)
+            continue
         body_start = start + len(open_tag)
         i = body_start
         in_string = False
@@ -163,8 +239,14 @@ def _scan_tool_call_blocks(text: str) -> Tuple[List[str], bool]:
                     escaped = False
                 i += 1
         if not found_close:
-            has_unclosed = True
-            break
+            tail = text[body_start:]
+            tail_stripped = tail.lstrip()
+            # Genuinely truncated tool call starts with JSON object/array or ends immediately after tag.
+            # Plain prose mentions like "emit <tool_call> to run commands" should NOT trigger false fail-closed.
+            if not tail_stripped or tail_stripped[0] in ("{", "["):
+                has_unclosed = True
+                break
+            pos = body_start
     return results, has_unclosed
 
 
@@ -287,10 +369,11 @@ def _remove_trailing_commas(raw_json: str) -> str:
 
 
 def has_tool_call_intent(reply_text: str) -> bool:
-    """Identify explicit tool-call markup, including a labeled tool_call fence."""
+    """Identify explicit tool-call markup, ignoring inline-backtick prose mentions."""
     if not reply_text:
         return False
-    if "<tool_call>" in reply_text:
+    tagged_blocks, has_unclosed = _scan_tool_call_blocks(reply_text)
+    if tagged_blocks or has_unclosed:
         return True
     for block in _extract_tag_contents(reply_text, "```", "```"):
         lines = block.lstrip().splitlines()
@@ -303,27 +386,31 @@ def has_tool_call_intent(reply_text: str) -> bool:
             and ('"arguments"' in block or '"parameters"' in block)
         ):
             return True
+    if _has_unclosed_fenced_tool_block(reply_text):
+        return True
     return False
 
 
 def parse_tool_calls_detailed(
-    reply_text: str, tools_map: Dict[str, Dict[str, Any]]
+    reply_text: str,
+    tools_map: Dict[str, Dict[str, Any]],
+    workspace_root: str = "",
 ) -> ToolParseResult:
     """Bóc tách toàn bộ batch tool call theo nguyên tắc fail-closed tuyệt đối (4A)."""
-    if not reply_text or len(reply_text) > 100_000:
+    if not reply_text or len(reply_text) > 500_000:
         return ToolParseResult(tool_calls=[], malformed_tags=[], has_unclosed_tag=False)
 
     extracted_calls: List[Dict[str, Any]] = []
     malformed_tags: List[Dict[str, Any]] = []
     candidates: List[Tuple[str, bool]] = []
 
-    # 1. Quét thẻ <tool_call>...</tool_call> theo state machine nhận biết chuỗi JSON
+    # 1. Quét thẻ <tool_call>...</tool_call> theo state machine nhận biết chuỗi JSON & backtick prose
     tagged_blocks, has_unclosed = _scan_tool_call_blocks(reply_text)
     for tag_content in tagged_blocks:
         candidates.append((tag_content, True))
 
     # 2. Fallback: ```tool_call / ```json ... ```
-    if not candidates and not has_unclosed and len(reply_text) < 100_000:
+    if not candidates and not has_unclosed and len(reply_text) < 500_000:
         for block in _extract_tag_contents(reply_text, "```", "```"):
             clean_block = block.strip()
             first_line, separator, remainder = clean_block.partition("\n")
@@ -350,12 +437,12 @@ def parse_tool_calls_detailed(
         if not candidates and not malformed_tags and _has_unclosed_fenced_tool_block(reply_text):
             has_unclosed = True
 
-    # 3. Fallback: toàn bộ reply là JSON (mở rộng trần tới 64k khi mang cấu trúc tool call)
+    # 3. Fallback: toàn bộ reply là JSON (mở rộng trần tới 200k khi mang cấu trúc tool call)
     stripped = reply_text.strip()
     has_tool_shape = '"name"' in stripped and (
         '"arguments"' in stripped or '"parameters"' in stripped
     )
-    raw_limit = 64_000 if has_tool_shape else 4000
+    raw_limit = 200_000 if has_tool_shape else 4000
     if (
         not candidates
         and not malformed_tags
@@ -418,7 +505,9 @@ def parse_tool_calls_detailed(
                 raw_args = _loads_tool_json(raw_args)
 
             schema = tools_map[fn_name]
-            clean_args = normalize_tool_arguments(fn_name, raw_args, schema)
+            clean_args = normalize_tool_arguments(
+                fn_name, raw_args, schema, workspace_root=workspace_root
+            )
             extracted_calls.append(
                 {
                     "id": f"call_{uuid.uuid4().hex[:16]}",
@@ -454,7 +543,11 @@ def parse_tool_calls_detailed(
 
 
 def parse_tool_calls_from_reply(
-    reply_text: str, tools_map: Dict[str, Dict[str, Any]]
+    reply_text: str,
+    tools_map: Dict[str, Dict[str, Any]],
+    workspace_root: str = "",
 ) -> List[Dict[str, Any]]:
     """Bóc tách danh sách lệnh gọi công cụ từ phản hồi văn bản của Gemini."""
-    return parse_tool_calls_detailed(reply_text, tools_map).tool_calls
+    return parse_tool_calls_detailed(
+        reply_text, tools_map, workspace_root=workspace_root
+    ).tool_calls

@@ -5,15 +5,18 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from gemini_webapi.exceptions import UsageLimitExceededError
+from gemini_webapi.exceptions import AuthError, UsageLimitExceededError
 
-from app.account_pool import AccountPoolMixin, first_available_index, load_state
+from app.account_pool import AccountPoolMixin, _safe_init_client, first_available_index, load_state
 from app.accounts import account_key, find_chain_overlap, write_chain_file
 from app.config import (
     ACCOUNT_CHAIN,
     ALLOW_GUEST_MODE,
     BASE_DIR,
     BRIDGE_DEBUG_FAKE_QUOTA,
+    DEFAULT_MODEL,
+    EMPTY_REPLY_RETRIES,
+    FALLBACK_MODEL,
     INSTANCE_ID,
     LOCK_ACQUIRE_TIMEOUT,
     PORT,
@@ -138,7 +141,10 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         self._idle_event.set()
         self.available_models: List[str] = ["unspecified"]
         self.model_details: List[Dict[str, Any]] = []
-        self.default_model: str = "unspecified"
+        self.default_model: str = DEFAULT_MODEL or "unspecified"
+        self.fallback_model: str = FALLBACK_MODEL
+        self._active_slot_model: str = self.default_model
+        self._active_workspace_root: str = ""
         self.tool_header_sent = False
         self.chat_tool_header_hash = ""
         self.chat_session = None
@@ -216,6 +222,11 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         if acquired_here and self.lock.locked():
             self._lock_owner_task = None
             self.lock.release()
+
+    def transfer_turn_lock(self, new_owner_task: Optional[asyncio.Task] = None) -> None:
+        """Chuyển quyền sở hữu turn lock đã giữ sang task con (vd producer SSE)."""
+        if self.lock.locked():
+            self._lock_owner_task = new_owner_task or asyncio.current_task()
 
     def _emit(self, **fields) -> None:
         if self.on_event:
@@ -315,7 +326,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                 except Exception:
                     pass
                 self.state = "off"
-                raise BridgeUpstreamError("Không bật được: không kết nối được Gemini Web.")
+                raise BridgeUpstreamError("Không bật được: không kết nối được Gemini Web.") from exc
             self.state = "on"
             self.enabled_since = time.time()
             logger.info("[CONTROL] Bridge đã BẬT.")
@@ -332,13 +343,13 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
             logger.info("[CONTROL] Đang TẮT bridge, chờ request đang chạy...")
             try:
                 await asyncio.wait_for(self._idle_event.wait(), timeout=drain_timeout)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 self.state = "on"
                 logger.warning("[CONTROL] Còn request đang chạy; hủy việc tắt.")
                 raise BridgeControlError(
                     f"Còn request đang chạy quá {int(drain_timeout)}s nên chưa tắt được. "
                     "Hãy thử lại sau."
-                )
+                ) from exc
             self._save_session()
             try:
                 await self.client.close()
@@ -351,16 +362,28 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
 
     async def initialize(self) -> None:
         logger.info("Đang khởi tạo Gemini WebClient...")
-        await self.client.init(
-            timeout=90, auto_close=False, close_delay=300, auto_refresh=True
-        )
-        self._refresh_available_models()
-        self._ensure_default_model()
-        logger.info(f"Model khả dụng ({len(self.available_models)}): {self.available_models}")
+        init_exc: Optional[BaseException] = None
+        try:
+            await _safe_init_client(self.client, timeout=35.0)
+            self._refresh_available_models()
+            self._ensure_default_model()
+            logger.info(f"Model khả dụng ({len(self.available_models)}): {self.available_models}")
+        except Exception as exc:
+            logger.warning(f"[AUTH] Khởi tạo GeminiClient thất bại ở lần đầu: {exc}")
+            init_exc = exc
 
         self._consecutive_auth_errors = 0
-        if not self._evaluate_auth() and len(self.chain) > 1:
-            await self._try_failover_to_backup()
+        if init_exc is not None or not self._evaluate_auth():
+            synced = await self._try_auto_cookie_sync_locked()
+            if not synced and len(self.chain) > 1:
+                await self._try_failover_to_backup()
+            if init_exc is not None and not self.auth_ok:
+                if isinstance(init_exc, AuthError):
+                    self.account_status_name = "UNAUTHENTICATED"
+                    self.is_guest = True
+                    self.auth_ok = False
+                else:
+                    raise init_exc
 
         if not self.auth_ok:
             self._create_new_chat_session()
@@ -425,45 +448,53 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         if not details:
             _add("unspecified")
 
-        has_gen4 = any(
-            any(k in d["name"].lower() for k in ("4-", "neon", "hydrogen", "carbon"))
-            for d in details
-        )
-        if has_gen4:
-            details = [d for d in details if d["name"] not in ("gemini-flash-lite", "gemini-pro")]
-
         self.model_details = details
         self.available_models = [d["name"] for d in details]
         return self.available_models
 
     def _ensure_default_model(self) -> None:
         selectable = [m for m in self.available_models if m != "unspecified"]
-        current = str(self.default_model or "").strip()
-        if current and current not in ("unspecified", "gemini-flash-lite", "gemini-pro") and current in selectable:
-            return
-        for preferred in ("gemini-4-neon", "gemini-4-hydrogen", "gemini-carbon"):
-            if preferred in selectable:
-                self.default_model = preferred
+        configured = str(DEFAULT_MODEL or "").strip()
+        if configured:
+            matched_cfg = next(
+                (m for m in selectable if m.lower() == configured.lower()), None
+            )
+            if matched_cfg:
+                self.default_model = matched_cfg
+                if not getattr(self, "_active_slot_model", ""):
+                    self._active_slot_model = self.default_model
                 return
+        current = str(self.default_model or "").strip()
         if current and current != "unspecified" and current in selectable:
+            if not getattr(self, "_active_slot_model", ""):
+                self._active_slot_model = self.default_model
             return
         self.default_model = selectable[0] if selectable else "unspecified"
+        if not getattr(self, "_active_slot_model", ""):
+            self._active_slot_model = self.default_model
 
-    def _select_fallback_model(self) -> str:
-        current = str(self.default_model or "").strip()
+    def _select_fallback_model(self, current_model: Optional[str] = None) -> str:
+        """Chỉ trả model dự phòng khi người dùng chủ động cấu hình `FALLBACK_MODEL`.
+
+        Trả chuỗi rỗng nếu không cấu hình để tránh tự ý nhảy sang model khác sau lưng người dùng.
+        """
+        current = str(current_model or self._current_slot_model() or "").strip()
+        configured = str(getattr(self, "fallback_model", "") or "").strip()
+        if not configured:
+            return ""
+        if configured.lower() == current.lower():
+            return ""
+        if configured.lower() == "unspecified":
+            return "unspecified" if current.lower() != "unspecified" else ""
         available = self.available_models or []
-        for preferred in ("gemini-4-hydrogen", "gemini-4-neon"):
-            if preferred != current and preferred in available:
-                return preferred
-        if current != "unspecified":
-            return "unspecified"
         for candidate in available:
-            if candidate and candidate != current:
+            if candidate.lower() == configured.lower() and candidate.lower() != current.lower():
                 return candidate
-        return "unspecified"
+        return ""
 
     async def switch_model(self, new_model: str, keep_chat: bool = True) -> str:
-        async with self.lock:
+        acquired_here = await self.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
+        try:
             old_model = self.default_model
             target = str(new_model).strip()
             if target and target != "unspecified":
@@ -471,28 +502,32 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     resolved = self.client.resolve_model(target)
                     if target not in self.available_models:
                         target = str(getattr(resolved, "model_name", None) or target)
-                except Exception:
+                except Exception as exc:
                     if self.available_models and target not in self.available_models:
                         raise ValueError(
                             f"Model '{target}' không có trong tài khoản. "
                             f"Model khả dụng: {', '.join(self.available_models)}"
-                        )
+                        ) from exc
             if target == str(self.default_model or "").strip() and keep_chat and self.chat_session is not None:
+                self._active_slot_model = target
                 logger.info(f"[MODEL] [{target}] đã hoạt động; giữ nguyên ChatSession.")
                 return self.default_model
             self.default_model = target
+            self._active_slot_model = target
             saved_meta = (
                 list(self.chat_session.metadata)
                 if (keep_chat and self.chat_session and hasattr(self.chat_session, "metadata"))
                 else None
             )
-            self._create_new_chat_session(preserve_metadata=saved_meta)
+            self._create_new_chat_session(preserve_metadata=saved_meta, model_override=target)
             self.tool_header_sent = False
             self.chat_tool_header_hash = ""
             self._save_session()
             self._sync_active_session_slot()
             logger.info(f"==> CHUYỂN MODEL: [{old_model}] --> [{self.default_model}]")
             return self.default_model
+        finally:
+            self.release_turn_lock(acquired_here)
 
     async def close(self) -> None:
         self._save_session()
@@ -571,13 +606,15 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                 and await _await_with_deadline(self._try_failover_to_backup(), image_deadline)
             ):
                 return True, None, failover_attempts + 1
-            if not (self.allow_guest and self.is_guest):
+            if not self._guest_mode_permitted():
                 return False, {
                     "message": "Gemini chưa đăng nhập (guest/cookie hết hạn).",
                     "type": BridgeAuthError.err_type,
                     "code": BridgeAuthError.code,
                     "stage": stage,
                 }, failover_attempts
+        else:
+            self._refresh_available_models()
         return True, None, failover_attempts
 
     async def send_prepared_turn(
@@ -586,6 +623,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         image_files: Optional[List[str]] = None,
         include_tool_header: bool = True,
         turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
+        bootstrap_prompt: Optional[str] = None,
     ) -> str:
         """Gửi 1 lượt hội thoại vào Gemini Web (bọc trực tiếp trên luồng stream thống nhất)."""
         self.require_on()
@@ -593,7 +631,11 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         self._idle_event.clear()
         try:
             return await self._send_prepared_turn_inner(
-                prompt_to_send, list(image_files or []), include_tool_header, turn_preparer=turn_preparer
+                prompt_to_send,
+                list(image_files or []),
+                include_tool_header,
+                turn_preparer=turn_preparer,
+                bootstrap_prompt=bootstrap_prompt,
             )
         finally:
             self._inflight -= 1
@@ -607,11 +649,16 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         image_files: List[str],
         include_tool_header: bool = True,
         turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
+        bootstrap_prompt: Optional[str] = None,
     ) -> str:
         reply_text = ""
         async with contextlib.aclosing(
             self._send_prepared_turn_stream_inner(
-                prompt_to_send, image_files, include_tool_header, turn_preparer=turn_preparer
+                prompt_to_send,
+                image_files,
+                include_tool_header,
+                turn_preparer=turn_preparer,
+                bootstrap_prompt=bootstrap_prompt,
             )
         ) as stream:
             async for kind, payload in stream:
@@ -627,6 +674,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         image_files: Optional[List[str]] = None,
         include_tool_header: bool = True,
         turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
+        bootstrap_prompt: Optional[str] = None,
     ):
         self.require_on()
         self._inflight += 1
@@ -634,7 +682,11 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         try:
             async with contextlib.aclosing(
                 self._send_prepared_turn_stream_inner(
-                    prompt_to_send, list(image_files or []), include_tool_header, turn_preparer=turn_preparer
+                    prompt_to_send,
+                    list(image_files or []),
+                    include_tool_header,
+                    turn_preparer=turn_preparer,
+                    bootstrap_prompt=bootstrap_prompt,
                 )
             ) as stream:
                 async for item in stream:
@@ -651,6 +703,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         image_files: List[str],
         include_tool_header: bool = True,
         turn_preparer: Optional[Callable[["SingleChatManager"], Any]] = None,
+        bootstrap_prompt: Optional[str] = None,
     ):
         gs = _gs()
         img_timeout = gs.IMAGE_REQUEST_TIMEOUT
@@ -709,10 +762,10 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                 yield "error", {"message": "Gửi ảnh yêu cầu đăng nhập cookie Gemini (không hỗ trợ ở chế độ Guest).", "type": BridgeAuthError.err_type, "code": BridgeAuthError.code, "stage": "vision_upload"}
                 return
 
-            attempt, quota_switches, failover_attempts = 0, 0, 0
+            attempt, quota_switches, failover_attempts, empty_retries = 0, 0, 0, 0
             max_failover_attempts = max(len(self.chain), 1)
             yielded_any = False
-            requested_model = str(self.default_model or "unspecified").strip() or "unspecified"
+            requested_model = self._current_slot_model()
             fallback_from: Optional[str] = None
             self.last_turn_model = requested_model
             self.last_turn_fallback_from = None
@@ -735,9 +788,10 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     if image_deadline is not None
                     else min(stream_cap, now_ts + hard_timeout)
                 )
+                configured_fallback = self._select_fallback_model(requested_model)
                 soft_fallback_eligible = (
                     attempt == 0
-                    and str(self.default_model or "").strip() not in ("", "unspecified")
+                    and bool(configured_fallback)
                     and (initial_deadline - now_ts) > (first_byte_timeout + 10.0)
                 )
                 first_chunk_deadline = (now_ts + first_byte_timeout) if soft_fallback_eligible else None
@@ -746,7 +800,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         self._fake_quota_done = True
                         raise UsageLimitExceededError("DEBUG: giả lập hết quota (BRIDGE_DEBUG_FAKE_QUOTA)")
 
-                    logger.info(f"Stream vào ChatSession (Turn={self.turn_count + 1} | Chars={len(prompt_to_send)}{f' | Images={len(image_files)}' if image_files else ''})")
+                    logger.info(f"Stream vào ChatSession (Model={self._current_slot_model()} | Turn={self.turn_count + 1} | Chars={len(prompt_to_send)}{f' | Images={len(image_files)}' if image_files else ''})")
                     async for output in _iterate_stream_until(
                         self._open_chat_stream(prompt_to_send, image_files),
                         initial_deadline,
@@ -761,6 +815,33 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                             yield "delta", delta
                     self.last_request_ts = time.time()
                     reply = full_text.strip()
+                    if not reply:
+                        if empty_retries < EMPTY_REPLY_RETRIES and not yielded_any:
+                            empty_retries += 1
+                            logger.warning(
+                                "[EMPTY_REPLY] Gemini trả về phản hồi trống (chỉ thoughts hoặc rỗng); "
+                                "tự thử lại lần %d/%d với đúng model '%s'.",
+                                empty_retries,
+                                EMPTY_REPLY_RETRIES,
+                                self._current_slot_model(),
+                            )
+                            self._restore_chat_metadata_after_abort(
+                                saved_meta_before_send, model_override=self._current_slot_model()
+                            )
+                            full_text = ""
+                            continue
+                        self.total_errors += 1
+                        self._restore_chat_metadata_after_abort(
+                            saved_meta_before_send, model_override=requested_model
+                        )
+                        yield "error", {
+                            "message": "Gemini trả về phản hồi trống (không có nội dung). Hãy thử lại.",
+                            "type": BridgeUpstreamError.err_type,
+                            "code": BridgeUpstreamError.code,
+                            "stage": stage,
+                        }
+                        return
+
                     self.session_initialized = True
                     self._mark_tool_header_sent(include_tool_header)
                     self.turn_count += 1
@@ -768,39 +849,50 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     self._consecutive_transient_errors = 0
                     self._pending_handoff = None
                     if fallback_from is not None and hasattr(self.chat_session, "metadata"):
-                        self._create_new_chat_session(preserve_metadata=list(self.chat_session.metadata))
+                        self._create_new_chat_session(
+                            preserve_metadata=list(self.chat_session.metadata),
+                            model_override=requested_model,
+                        )
                     elif self.turn_count % 15 == 0 and hasattr(self.chat_session, "metadata"):
-                        self._create_new_chat_session(preserve_metadata=list(self.chat_session.metadata))
+                        self._create_new_chat_session(
+                            preserve_metadata=list(self.chat_session.metadata),
+                            model_override=requested_model,
+                        )
                     self._save_session()
                     self._sync_active_session_slot()
                     yield "done", reply
                     return
 
                 except (asyncio.CancelledError, GeneratorExit):
-                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                    self._restore_chat_metadata_after_abort(
+                        saved_meta_before_send, model_override=requested_model
+                    )
                     raise
 
                 except asyncio.TimeoutError:
                     retry_margin = min(5.0, max(0.05, stream_overall_timeout * 0.1))
                     if (
                         soft_fallback_eligible
+                        and configured_fallback
                         and not yielded_any
                         and asyncio.get_running_loop().time() < (stream_cap - retry_margin)
                     ):
-                        fallback_model = self._select_fallback_model()
+                        fallback_model = configured_fallback
                         fallback_from = requested_model
                         self.last_turn_model = fallback_model
                         self.last_turn_fallback_from = fallback_from
                         logger.warning(
                             f"[MODEL_FALLBACK] Model '{requested_model}' không phản hồi sau {first_byte_timeout:g}s "
-                            f"-> Tạm chuyển lượt này sang '{fallback_model}' và nạp lại tool header!"
+                            f"-> Tạm chuyển lượt này sang '{fallback_model}' (FALLBACK_MODEL do người dùng cấu hình) và nạp lại tool header!"
                         )
                         self.tool_header_sent = False
                         self.chat_tool_header_hash = ""
                         self._restore_chat_metadata_after_abort(saved_meta_before_send, model_override=fallback_model)
                         attempt += 1
                         continue
-                    self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                    self._restore_chat_metadata_after_abort(
+                        saved_meta_before_send, model_override=requested_model
+                    )
                     now_end = asyncio.get_running_loop().time()
                     if image_deadline is not None and image_deadline <= now_end:
                         timeout = img_timeout
@@ -846,30 +938,46 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         err_cls = BridgeAuthError if self._is_auth_error(exc) else BridgeUpstreamError
                         msg = "Gemini authentication failed after streaming began." if err_cls is BridgeAuthError else "Gemini stream failed after response began."
                         if fallback_from is not None:
-                            self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                            self._restore_chat_metadata_after_abort(
+                                saved_meta_before_send, model_override=requested_model
+                            )
                         yield "error", {"message": msg, "type": err_cls.err_type, "code": err_cls.code, "stage": stage}
                         return
 
                     logger.warning(f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {exc}")
-                    if "1097" in str(exc) or ("carbon" in str(self.default_model).lower() and not self._is_auth_error(exc)):
-                        old_model = str(self.default_model or "unspecified")
-                        fallback_target = self._select_fallback_model()
-                        logger.warning(f"[MODEL_FALLBACK] Model '{self.default_model}' bị lỗi ({exc}). Tự động fallback sang '{fallback_target}' và mở lại kết nối mới!")
+                    if attempt == 0 and "1097" in str(exc):
+                        retry_model = self._select_fallback_model(requested_model) or requested_model
+                        logger.warning(
+                            f"[RECOVERY_1097] Model '{requested_model}' gặp lỗi 1097 ({exc}). "
+                            f"Khởi tạo lại kết nối và mở phiên mới trên model '{retry_model}'!"
+                        )
                         try:
-                            ok, err_payload, failover_attempts = await self._recover_client_after_error(stage, stream_cap if image_deadline is None else image_deadline, failover_attempts, max_failover_attempts, raise_init_error=False)
+                            ok, err_payload, failover_attempts = await self._recover_client_after_error(
+                                stage,
+                                stream_cap if image_deadline is None else image_deadline,
+                                failover_attempts,
+                                max_failover_attempts,
+                                raise_init_error=False,
+                            )
                             if err_payload is not None:
                                 yield "error", err_payload
                                 return
                             if ok:
-                                self.default_model = fallback_target
-                                self.last_turn_model = fallback_target
-                                self.last_turn_fallback_from = old_model
-                                self._create_new_chat_session(preserve_metadata=None)
-                                self._save_session()
+                                if retry_model != requested_model:
+                                    fallback_from = requested_model
+                                    self.last_turn_fallback_from = requested_model
+                                self.last_turn_model = retry_model
+                                if bootstrap_prompt:
+                                    base_prompt = bootstrap_prompt
+                                self._create_new_chat_session(
+                                    preserve_metadata=None, model_override=retry_model
+                                )
+                                self._sync_active_session_slot()
+                                full_text = ""
                                 attempt += 1
                                 continue
                         except Exception as fb_exc:
-                            logger.error(f"[MODEL_FALLBACK] Lỗi khi fallback: {fb_exc}")
+                            logger.error(f"[RECOVERY_1097] Lỗi khi phục hồi sau 1097: {fb_exc}")
 
                     if self._consecutive_auth_errors >= 2 and not self.is_guest:
                         logger.critical("⚠️ COOKIE CÓ THỂ HẾT HẠN! Cập nhật cookie trong .env hoặc gọi POST /v1/update-cookies")
@@ -884,17 +992,24 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                             yield "error", err_payload
                             return
                         if ok:
-                            self._create_new_chat_session(preserve_metadata=saved_meta)
+                            self._create_new_chat_session(
+                                preserve_metadata=saved_meta, model_override=requested_model
+                            )
+                            self._sync_active_session_slot()
                             full_text = ""
                             attempt += 1
                     else:
                         if fallback_from is not None:
-                            self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                            self._restore_chat_metadata_after_abort(
+                                saved_meta_before_send, model_override=requested_model
+                            )
                         yield "error", {"message": f"Lỗi kết nối Gemini Web: {exc}", "type": BridgeUpstreamError.err_type, "code": BridgeUpstreamError.code, "stage": stage}
                         return
 
             if fallback_from is not None:
-                self._restore_chat_metadata_after_abort(saved_meta_before_send)
+                self._restore_chat_metadata_after_abort(
+                    saved_meta_before_send, model_override=requested_model
+                )
             yield "error", {"message": "Không nhận được phản hồi từ Gemini.", "type": BridgeUpstreamError.err_type, "code": BridgeUpstreamError.code, "stage": stage}
         except asyncio.TimeoutError:
             if image_deadline is None:

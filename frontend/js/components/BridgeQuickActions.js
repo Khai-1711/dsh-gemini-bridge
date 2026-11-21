@@ -119,9 +119,9 @@ export class BridgeQuickActions extends HTMLElement {
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
               ${t("resetSessionBtn", lang)}
             </button>
-            <button class="btn btn-secondary" id="qa-clear-cache-btn" style="flex: 1;" title="${laneReachable ? t("clearCacheTitle", lang) : unavailableTitle}" ${!laneReachable ? "disabled" : ""}>
-              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-              ${t("clearCacheBtn", lang)}
+            <button class="btn btn-secondary" id="qa-reauth-btn" style="flex: 1;" title="${laneReachable ? t("btnTryReauth", lang) : unavailableTitle}" ${!laneReachable ? "disabled" : ""}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/></svg>
+              ${t("btnTryReauth", lang)}
             </button>
           </div>
         </div>
@@ -132,7 +132,7 @@ export class BridgeQuickActions extends HTMLElement {
   setupEvents() {
     this.querySelector("#qa-power-btn")?.addEventListener("click", () => this.handlePowerToggle());
     this.querySelector("#qa-reset-btn")?.addEventListener("click", () => this.handleReset());
-    this.querySelector("#qa-clear-cache-btn")?.addEventListener("click", () => this.handleClearCache());
+    this.querySelector("#qa-reauth-btn")?.addEventListener("click", () => this.handleReauth());
   }
 
   async handlePowerToggle() {
@@ -194,7 +194,7 @@ export class BridgeQuickActions extends HTMLElement {
     const laneReachable = lane.reachable !== false;
     const buttons = [
       ["#qa-reset-btn", "resetSessionTitle"],
-      ["#qa-clear-cache-btn", "clearCacheTitle"],
+      ["#qa-reauth-btn", "btnTryReauth"],
     ];
 
     buttons.forEach(([selector, titleKey]) => {
@@ -235,7 +235,7 @@ export class BridgeQuickActions extends HTMLElement {
     }
   }
 
-  async handleClearCache() {
+  async handleReauth() {
     const state = store.getState();
     const { lang } = state;
     const lane = this.getCurrentLane(state);
@@ -245,9 +245,17 @@ export class BridgeQuickActions extends HTMLElement {
       return;
     }
 
+    store.notifyToast(t("verifyingCookies", lang), "info");
     try {
-      const data = await getApi().clearLaneCache(laneId);
-      store.notifyToast(t("cacheClearedSuccess", lang, { count: data.cleared_entries || 0 }), "success");
+      const res = await getApi().reauthLane(laneId);
+      if (res && res.auth_ok) {
+        store.notifyToast(t("cookiesUpdatedSuccess", lang), "success");
+      } else {
+        store.notifyToast(
+          lang === "vi" ? `Luồng ${laneId}: chưa đăng nhập (cookie hết hạn).` : `Lane ${laneId}: unauthenticated.`,
+          "warning"
+        );
+      }
       window.dispatchEvent(new CustomEvent("refresh-request"));
     } catch (err) {
       store.notifyToast(`Error: ${err.message}`, "error");

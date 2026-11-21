@@ -1,6 +1,11 @@
 import re
 from typing import Any, Dict, List, Tuple
-from app.config import FORBIDDEN_TOOLS, MAX_TOOL_RESULT_CHARS
+from app.config import (
+    FORBIDDEN_TOOLS,
+    MAX_TOOL_RESULT_CHARS,
+    MAX_TOTAL_TOOL_RESULTS_CHARS,
+    REPLAY_MAX_CHARS,
+)
 from app.security import sanitize_no_media_triggers
 from app.vision import extract_text_and_images
 
@@ -16,6 +21,34 @@ _DSH_TIME_CONTEXT_RE = re.compile(
     r"(?:\s*\n\s*Elapsed since the preceding model-visible message:[^\n]*)?",
     re.IGNORECASE,
 )
+
+_WORKSPACE_PATTERNS = (
+    re.compile(r"<cwd>\s*([^<\r\n]+?)\s*</cwd>", re.IGNORECASE),
+    re.compile(
+        r"(?:^|\n)\s*(?:Command Working Directory|Working [Dd]irectory|Workspace(?: [Rr]oot| [Pp]ath)?|Project [Dd]irectory|CWD)\s*:\s*[\"']?([A-Za-z]:[\\/][^\r\n\"'<>]+|/[^\r\n\"'<>]+)[\"']?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"Active Workspaces\s*:\s*(?:\r?\n)\s*-\s*[\"']?([A-Za-z]:[\\/][^\r\n\"'<>]+|/[^\r\n\"'<>]+)[\"']?",
+        re.IGNORECASE,
+    ),
+)
+
+_SYSTEM_CONTEXT_MAX_CHARS = 2400
+
+
+def _raw_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and (item.get("type") == "text" or "text" in item):
+                parts.append(str(item.get("text", "")))
+        return "\n".join(parts)
+    return str(content or "")
 
 
 def _strip_injected_boilerplate(content: str) -> str:
@@ -35,6 +68,128 @@ def extract_actual_user_text(content: str) -> str:
     return stripped if stripped else content.strip()
 
 
+def extract_workspace_root(messages: List[Dict[str, Any]]) -> str:
+    """Trích xuất đường dẫn thư mục dự án hiện tại từ thông điệp system/context của IDE."""
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role", "")).lower()
+        if role not in ("system", "developer", "user", "human"):
+            continue
+        raw = _raw_text_from_content(msg.get("content"))
+        if not raw:
+            continue
+        for pat in _WORKSPACE_PATTERNS:
+            m = pat.search(raw)
+            if m:
+                candidate = m.group(1).strip().rstrip(".,;)")
+                if candidate and (re.match(r"^[A-Za-z]:[\\/]", candidate) or candidate.startswith("/")):
+                    return candidate
+    return ""
+
+
+def extract_system_context(
+    messages: List[Dict[str, Any]], max_chars: int = _SYSTEM_CONTEXT_MAX_CHARS
+) -> str:
+    """Rút gọn phần chỉ dẫn hệ thống (role=system/developer) để truyền vào Turn 1 của Gemini."""
+    parts: List[str] = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("role", "")).lower() not in ("system", "developer"):
+            continue
+        raw = _raw_text_from_content(msg.get("content"))
+        if not raw:
+            continue
+        cleaned = _DSH_TIME_CONTEXT_RE.sub("", raw).strip()
+        if cleaned:
+            parts.append(cleaned)
+    if not parts:
+        return ""
+    combined = "\n\n".join(parts)
+    if len(combined) <= max_chars:
+        return combined
+    head = max_chars * 2 // 3
+    tail = max(0, max_chars - head - 30)
+    return combined[:head].rstrip() + "\n...[SYSTEM CONTEXT TRIMMED]...\n" + (combined[-tail:].lstrip() if tail else "")
+
+
+def build_context_bootstrap(
+    messages: List[Dict[str, Any]],
+    latest_turn_count: int,
+    max_chars: int = None,
+) -> str:
+    """Dựng bản tóm tắt gọn lịch sử hội thoại khi phải mở ChatSession mới giữa chừng (failover/1097/restart)."""
+    if max_chars is None:
+        max_chars = min(max(REPLAY_MAX_CHARS, 2000), 6000)
+
+    non_system = [
+        m for m in (messages or [])
+        if isinstance(m, dict) and str(m.get("role", "")).lower() not in ("system", "developer")
+    ]
+    if latest_turn_count <= 0 or len(non_system) <= latest_turn_count:
+        return ""
+
+    prior = non_system[:-latest_turn_count]
+    if not any(str(m.get("role", "")).lower() in ("assistant", "tool") for m in prior):
+        return ""
+
+    first_user_goal = ""
+    digest_lines: List[str] = []
+    for m in prior:
+        role = str(m.get("role", "user")).lower()
+        raw_text = _raw_text_from_content(m.get("content"))
+        if role in ("user", "human"):
+            cleaned = _strip_injected_boilerplate(raw_text)
+            if not cleaned:
+                continue
+            compact = " ".join(cleaned.split())
+            if not first_user_goal:
+                first_user_goal = compact[:500]
+            digest_lines.append(f"user: {compact[:400]}")
+        elif role == "assistant":
+            compact = " ".join(raw_text.split())[:350]
+            tc_names = []
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or "?"
+                    args_str = str(fn.get("arguments") or "")[:120]
+                    tc_names.append(f"{name}({args_str})")
+            if tc_names:
+                tc_summary = "; ".join(tc_names[:8])
+                line = f"assistant: {compact} [called: {tc_summary}]" if compact else f"assistant: [called: {tc_summary}]"
+            elif compact:
+                line = f"assistant: {compact}"
+            else:
+                continue
+            digest_lines.append(line[:500])
+        elif role == "tool":
+            tool_id = m.get("name") or m.get("tool_call_id") or "tool"
+            compact = " ".join(raw_text.split())[:260]
+            digest_lines.append(f"tool({tool_id}): {compact}")
+
+    if not first_user_goal and not digest_lines:
+        return ""
+
+    header = "=== CONVERSATION CONTEXT (resumed on fresh chat) ===\n"
+    footer = "\n=== END CONTEXT ==="
+    goal_block = f"[ORIGINAL REQUEST]: {first_user_goal}\n" if first_user_goal else ""
+    budget = max(max_chars - len(header) - len(footer) - len(goal_block) - 20, 200)
+
+    kept: List[str] = []
+    used = 0
+    for line in reversed(digest_lines):
+        cost = len(line) + 1
+        if used + cost > budget:
+            break
+        kept.insert(0, line)
+        used += cost
+
+    body = goal_block + ("[RECENT HISTORY]:\n" + "\n".join(kept) if kept else "")
+    return (header + body.strip() + footer)[:max_chars]
+
+
 def smart_truncate(text: str, max_chars: int = None) -> str:
     """
     Cắt ngắn thông minh: Giữ đầu + cuối + ưu tiên giữ các dòng chứa lỗi quan trọng ở giữa.
@@ -45,13 +200,11 @@ def smart_truncate(text: str, max_chars: int = None) -> str:
     if len(text) <= max_chars:
         return text
 
-    # Tính toán ước lượng vị trí phần giữa
     pre_remaining = max(0, max_chars - 100)
     pre_head = pre_remaining * 2 // 3
     pre_tail = pre_remaining - pre_head
     middle = text[pre_head : len(text) - pre_tail if pre_tail > 0 else len(text)]
 
-    # Thu thập các dòng chứa thông tin lỗi quan trọng chỉ từ PHẦN GIỮA
     error_keywords = [
         "error", "exception", "traceback",
         "typeerror", "syntaxerror", "valueerror", "keyerror",
@@ -67,15 +220,14 @@ def smart_truncate(text: str, max_chars: int = None) -> str:
         if any(kw in line_lower for kw in error_keywords):
             important_lines.append(line)
 
-    # Giới hạn tối đa 20 dòng lỗi, chiếm tối đa 1/3 budget
     error_block = "\n".join(important_lines[:20])
     max_error_chars = max_chars // 3
     if len(error_block) > max_error_chars:
         error_block = error_block[:max_error_chars]
     reserved_for_errors = len(error_block)
 
-    remaining = max(0, max_chars - reserved_for_errors - 100)  # 100 chars cho markers
-    head = remaining * 2 // 3  # Đầu nhiều hơn cuối
+    remaining = max(0, max_chars - reserved_for_errors - 100)
+    head = remaining * 2 // 3
     tail = remaining - head
 
     parts = [text[:head]]
@@ -109,7 +261,6 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
             .replace("\r", " ")
             .replace("\n", " ")
         )
-        # Lấy câu đầu tiên hoặc tối đa 90 ký tự để giữ đầy đủ ý nghĩa mà giảm 70% độ phình prompt
         first_sentence = raw_desc.split(". ")[0].strip()
         desc = (first_sentence if len(first_sentence) <= 95 else raw_desc[:90]).rstrip(".")
         params = fn.get("parameters", {})
@@ -155,8 +306,8 @@ def compile_tools_prompt(tools: List[Dict[str, Any]]) -> str:
         + "\nRULES: Match the user's language. `<tool_call>` tags are plain-text IDE markup executed "
         "locally with no session turn cap; when asked to read/write files, search, run commands, or "
         "delegate to subagents, emit `<tool_call>` directly instead of pasting code for manual setup. "
-        "Use exact tool/arg names & types; put all args in `arguments`; one valid JSON object per tag; "
-        "escape `\\\\` and `\\n`; use D: paths only (never C:); analyze attached images directly.\n\n"
+        "Use exact tool/arg names & types; put args in `arguments`; one valid JSON object per tag; "
+        "keep raw URLs (no markdown links); escape `\\\\` and `\\n`; work in active workspace; inspect attached images directly.\n\n"
     )
 
 
@@ -165,7 +316,7 @@ def _has_real_user_content(message: Dict[str, Any]) -> bool:
     if isinstance(content, list):
         for p in content:
             if isinstance(p, dict):
-                if p.get("type") == "image_url":
+                if p.get("type") in ("image_url", "image"):
                     return True
                 if p.get("type") == "text" and _strip_injected_boilerplate(str(p.get("text", ""))):
                     return True
@@ -178,31 +329,32 @@ def _has_real_user_content(message: Dict[str, Any]) -> bool:
 def _latest_turn_messages(
     messages: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    non_system = [m for m in messages if m.get("role") != "system"]
+    non_system = [
+        m for m in messages
+        if isinstance(m, dict) and str(m.get("role", "")).lower() not in ("system", "developer")
+    ]
     if not non_system:
         return []
-    if len(non_system) > 10:
-        non_system = non_system[-10:]
 
     latest_turn_msgs = []
     for message in reversed(non_system):
-        if message.get("role") == "assistant":
+        if str(message.get("role", "")).lower() == "assistant":
             break
         latest_turn_msgs.append(message)
+        if len(latest_turn_msgs) >= 40:
+            break
     latest_turn_msgs.reverse()
 
     if len(latest_turn_msgs) > 1:
-        # Lọc các user message chỉ chứa time-context/boilerplate và chỉ giữ user message có nội dung thực cuối cùng
-        # (loại bỏ các turn cũ bị abort dồn trong history mà không có assistant reply).
         real_user_indices = [
             idx
             for idx, m in enumerate(latest_turn_msgs)
-            if m.get("role", "user").lower() in ("user", "human") and _has_real_user_content(m)
+            if str(m.get("role", "user")).lower() in ("user", "human") and _has_real_user_content(m)
         ]
         keep_user_idx = real_user_indices[-1] if real_user_indices else None
         filtered = []
         for idx, m in enumerate(latest_turn_msgs):
-            role = m.get("role", "user").lower()
+            role = str(m.get("role", "user")).lower()
             if role == "tool":
                 filtered.append(m)
             elif role in ("user", "human"):
@@ -239,34 +391,47 @@ def is_plain_greeting_request(messages: List[Dict[str, Any]]) -> bool:
 
 
 def build_incremental_prompt_and_files(
-    messages: List[Dict[str, Any]], tools: List[Dict[str, Any]], is_first_turn: bool
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    is_first_turn: bool,
+    include_context_bootstrap: bool = None,
 ) -> Tuple[str, List[str]]:
-    """Trích xuất Delta tin nhắn mới nhất để gửi vào Single ChatSession."""
+    """Trích xuất Delta tin nhắn mới nhất để gửi vào ChatSession.
+
+    Khi `is_first_turn=True`:
+    - Kèm phần cốt lõi của `system`/`developer` prompt (workspace, OS/Shell, vai trò agent).
+    - Nếu cuộc hội thoại đã có lượt trước đó (failover sang worker mới / reset do lỗi 1097 / restart),
+      tự động gắn Context Bootstrap để Gemini không bị mất trí nhớ.
+    """
     latest_turn_msgs = _latest_turn_messages(messages)
     if not latest_turn_msgs:
         return "Hello", []
 
     blocks: List[str] = []
     all_images: List[str] = []
+    has_tool_results = False
+    is_greeting = is_plain_greeting_request(latest_turn_msgs)
+
+    tool_msg_count = sum(
+        1 for m in latest_turn_msgs if str(m.get("role", "user")).lower() == "tool"
+    )
+    per_tool_budget = MAX_TOOL_RESULT_CHARS
+    if tool_msg_count >= 2 and MAX_TOTAL_TOOL_RESULTS_CHARS > 0:
+        fair_share = MAX_TOTAL_TOOL_RESULTS_CHARS // tool_msg_count
+        per_tool_budget = min(MAX_TOOL_RESULT_CHARS, max(1500, fair_share))
 
     for m in latest_turn_msgs:
-        role = m.get("role", "user").lower()
+        role = str(m.get("role", "user")).lower()
         content_str, img_paths = extract_text_and_images(m.get("content"))
         all_images.extend(img_paths)
 
         if role == "tool":
-            # Smart truncation chỉ áp dụng cho kết quả công cụ
-            content_str = smart_truncate(content_str)
+            has_tool_results = True
+            content_str = smart_truncate(content_str, max_chars=per_tool_budget)
             tool_id = m.get("name") or m.get("tool_call_id") or "tool"
-            blocks.append(
-                f"[TOOL_RESULT ({tool_id})]:\n{content_str}\n\n"
-                "(Continue step-by-step. Emit plain-text "
-                '<tool_call>{"name": "...", "arguments": {...}}</tool_call> '
-                "tags for the next local IDE action (no turn cap); otherwise provide the final answer in the user's language.)"
-            )
+            blocks.append(f"[TOOL_RESULT ({tool_id})]:\n{content_str}")
         else:
             actual_text = extract_actual_user_text(content_str)
-            is_greeting = is_plain_greeting_request(latest_turn_msgs)
             if is_greeting:
                 clean_user_text = actual_text
             elif actual_text:
@@ -274,7 +439,6 @@ def build_incremental_prompt_and_files(
             else:
                 clean_user_text = sanitize_no_media_triggers(content_str).strip()
 
-            # Câu chào đơn thuần hoặc câu ngắn không có tools → gửi nguyên bản
             if (is_greeting or (len(clean_user_text) < 15 and not tools)) and not img_paths:
                 blocks.append(clean_user_text)
             else:
@@ -294,16 +458,29 @@ def build_incremental_prompt_and_files(
                     f"{tool_reminder}]"
                 )
 
-    # Gemini Web không có role "system": tool header phải đi kèm trong chính message
-    # người dùng. Header rất dài (~vài nghìn ký tự) nên nếu đặt lên đầu, UI Gemini Web
-    # sẽ thu gọn bong bóng và che mất tin nhắn thật (ví dụ "chào"). Vì vậy:
-    # tin nhắn của người dùng LUÔN đứng đầu, tool header xuống cuối.
-    if is_first_turn:
+    if has_tool_results:
+        blocks.append(
+            "(Continue step-by-step based on the tool result(s) above. Emit plain-text "
+            '<tool_call>{"name": "...", "arguments": {...}}</tool_call> '
+            "tags for the next local IDE action (no turn cap); otherwise provide the final answer in the user's language.)"
+        )
+
+    should_bootstrap = (
+        include_context_bootstrap
+        if include_context_bootstrap is not None
+        else (is_first_turn and not is_greeting)
+    )
+    if should_bootstrap:
+        bootstrap = build_context_bootstrap(messages, len(latest_turn_msgs))
+        if bootstrap:
+            blocks.insert(0, bootstrap)
+
+    if is_first_turn and not is_greeting:
+        sys_ctx = extract_system_context(messages)
+        if sys_ctx:
+            blocks.append("[SYSTEM & WORKSPACE CONTEXT]\n" + sys_ctx)
         tool_header = compile_tools_prompt(tools)
         if tool_header:
-            blocks.append(
-                "=== WORKSPACE TOOLS ===\n"
-                + tool_header
-            )
+            blocks.append("=== WORKSPACE TOOLS ===\n" + tool_header)
 
     return "\n\n".join(blocks), all_images

@@ -20,7 +20,7 @@ class FakeChat:
         return self.metadata[0] if self.metadata else None
 
 
-def _make_manager(default_model="gemini-4-hydrogen", available_models=None):
+def _make_manager(default_model="gemini-4-hydrogen", available_models=None, fallback_model=""):
     mgr = gs.SingleChatManager.__new__(gs.SingleChatManager)
     mgr.chain = [{"label": "acc1", "psid": "p1", "psidts": "t1", "key": "k1"}]
     mgr.account_state = {}
@@ -34,6 +34,7 @@ def _make_manager(default_model="gemini-4-hydrogen", available_models=None):
         )
     )
     mgr.lock = asyncio.Lock()
+    mgr._lock_owner_task = None
     mgr.state = "on"
     mgr.enabled_since = 0.0
     mgr._control_lock = asyncio.Lock()
@@ -43,6 +44,9 @@ def _make_manager(default_model="gemini-4-hydrogen", available_models=None):
     mgr.available_models = list(available_models or ["gemini-4-hydrogen"])
     mgr.model_details = []
     mgr.default_model = default_model
+    mgr.fallback_model = fallback_model
+    mgr._active_slot_model = default_model
+    mgr._active_workspace_root = ""
     mgr.tool_header_sent = False
     mgr.chat_tool_header_hash = ""
     mgr.chat_session = FakeChat(model=default_model)
@@ -76,15 +80,27 @@ def _make_manager(default_model="gemini-4-hydrogen", available_models=None):
 
 
 class TestFallbackAndMetadata(unittest.IsolatedAsyncioTestCase):
-    def test_select_fallback_model_never_self_loops(self):
+    def test_select_fallback_model_respects_user_choice_and_never_self_loops(self):
+        # Default (fallback_model=""): NEVER switches away from user's chosen model
         mgr = _make_manager(
             default_model="gemini-4-hydrogen",
-            available_models=["gemini-4-hydrogen"],
+            available_models=["gemini-4-hydrogen", "gemini-4-neon"],
+            fallback_model="",
         )
+        self.assertEqual(mgr._select_fallback_model(), "")
+
+        # Self-loop guard: fallback_model == active model -> ""
+        mgr.fallback_model = "gemini-4-hydrogen"
+        self.assertEqual(mgr._select_fallback_model(), "")
+
+        # Explicit user-configured fallback model
+        mgr.fallback_model = "unspecified"
         self.assertEqual(mgr._select_fallback_model(), "unspecified")
 
         mgr.default_model = "gemini-carbon"
+        mgr._active_slot_model = "gemini-carbon"
         mgr.available_models = ["gemini-4-hydrogen", "gemini-carbon"]
+        mgr.fallback_model = "gemini-4-hydrogen"
         self.assertEqual(mgr._select_fallback_model(), "gemini-4-hydrogen")
 
     def test_sanitize_clears_poisoned_metadata(self):
@@ -136,8 +152,11 @@ class TestFallbackAndMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0][0], "error")
         self.assertEqual(events[0][1]["code"], BridgeAuthError.code)
 
-    async def test_soft_first_byte_timeout_falls_back_to_unspecified(self):
-        mgr = _make_manager(default_model="gemini-4-hydrogen")
+    async def test_soft_first_byte_timeout_falls_back_to_user_configured_model(self):
+        mgr = _make_manager(
+            default_model="gemini-4-hydrogen",
+            fallback_model="unspecified",
+        )
         models_used = []
 
         async def _slow_stream(_prompt):
@@ -175,6 +194,7 @@ class TestFallbackAndMetadata(unittest.IsolatedAsyncioTestCase):
         mgr = _make_manager(
             default_model="gemini-neon",
             available_models=["gemini-neon", "gemini-4-hydrogen"],
+            fallback_model="gemini-4-hydrogen",
         )
         tool_spec = "[SOFTWARE-ENGINEERING WORKSPACE]\nTOOLS (! required, ? optional):\nwrite: write a file"
         mgr.last_tool_header = tool_spec
@@ -271,10 +291,11 @@ class TestFallbackAndMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("done", "done ok"), events)
 
     async def test_chunk_idle_timeout_after_thoughts_and_after_text(self):
-        # Case A: thought emitted, then stalls past chunk idle timeout -> falls back
+        # Case A: thought emitted, then stalls past chunk idle timeout -> falls back to user-configured FALLBACK_MODEL
         mgr_a = _make_manager(
             default_model="gemini-neon",
             available_models=["gemini-neon", "gemini-4-hydrogen"],
+            fallback_model="gemini-4-hydrogen",
         )
 
         async def _stalled_after_thought(_prompt):
@@ -355,6 +376,89 @@ class TestFallbackAndMetadata(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(errs), 1)
         self.assertEqual(errs[0]["code"], BridgeTimeoutError.code)
         self.assertIn("0.12s", errs[0]["message"])
+
+    async def test_empty_reply_retries_once_and_fails_cleanly_if_still_empty(self):
+        # Case 1: first attempt yields thoughts only (empty text), retry succeeds
+        mgr = _make_manager(default_model="gemini-neon", available_models=["gemini-neon"])
+        attempts = 0
+
+        async def _thoughts_then_ok(_prompt):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                yield SimpleNamespace(text_delta="", thoughts_delta="thinking only...")
+            else:
+                yield SimpleNamespace(text_delta="Real answer after retry")
+
+        mgr.chat_session.send_message_stream = _thoughts_then_ok
+        orig_start = mgr.client.start_chat
+
+        def _start_chat(**kw):
+            c = orig_start(**kw)
+            c.send_message_stream = _thoughts_then_ok
+            return c
+
+        mgr.client.start_chat = MagicMock(side_effect=_start_chat)
+        events = [ev async for ev in mgr._send_prepared_turn_stream_inner("go", [])]
+        self.assertEqual(attempts, 2)
+        self.assertIn(("done", "Real answer after retry"), events)
+
+        # Case 2: both attempts empty -> must emit upstream error (never fake stop with empty content)
+        mgr2 = _make_manager(default_model="gemini-neon", available_models=["gemini-neon"])
+
+        async def _always_empty(_prompt):
+            yield SimpleNamespace(text_delta="   ", thoughts_delta="...")
+
+        mgr2.chat_session.send_message_stream = _always_empty
+        mgr2.client.start_chat = MagicMock(
+            side_effect=lambda **kw: SimpleNamespace(
+                metadata=[None] * 10,
+                model=kw.get("model"),
+                send_message_stream=_always_empty,
+            )
+        )
+        events2 = [ev async for ev in mgr2._send_prepared_turn_stream_inner("go", [])]
+        errs = [p for k, p in events2 if k == "error"]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0]["code"], "gemini_upstream_error")
+
+    async def test_1097_recovery_preserves_user_model_and_injects_bootstrap_prompt(self):
+        mgr = _make_manager(
+            default_model="my-chosen-model",
+            available_models=["my-chosen-model", "other-model"],
+            fallback_model="",
+        )
+        seen = []
+
+        async def _boom_1097(prompt):
+            seen.append(("first", prompt))
+            raise RuntimeError("Unknown API error code: 1097")
+            yield
+
+        async def _ok_after_reset(prompt):
+            seen.append(("retry", prompt))
+            yield SimpleNamespace(text_delta="recovered with context")
+
+        mgr.chat_session.send_message_stream = _boom_1097
+        mgr.client.start_chat = MagicMock(
+            side_effect=lambda **kw: SimpleNamespace(
+                metadata=["c_new", "r1", "rc1"] + [None] * 7,
+                model=kw.get("model"),
+                send_message_stream=_ok_after_reset,
+            )
+        )
+        events = [
+            ev
+            async for ev in mgr._send_prepared_turn_stream_inner(
+                "[TOOL_RESULT (pwsh)]: exit 0",
+                [],
+                bootstrap_prompt="=== CONVERSATION CONTEXT ===\nBuild Xiangqi\n[TOOL_RESULT (pwsh)]: exit 0",
+            )
+        ]
+        self.assertIn(("done", "recovered with context"), events)
+        self.assertEqual(mgr.default_model, "my-chosen-model")
+        self.assertEqual(mgr.last_turn_model, "my-chosen-model")
+        self.assertIn("CONVERSATION CONTEXT", seen[1][1])
 
 
 if __name__ == "__main__":

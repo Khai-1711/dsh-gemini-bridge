@@ -71,10 +71,23 @@ except ImportError:
                 os.environ[k.strip()] = v.strip().strip('"').strip("'")
 
 # Thư viện gemini-webapi lưu cookie đã xoay (rotated) vào thư mục này và ưu
-# tiên dùng chúng. Đặt cố định trong dự án để không bị Windows dọn thư mục temp.
+# tiên dùng chúng. Đặt cố định theo từng instance (tránh thừa hưởng từ tiến trình Gateway cha).
 _COOKIE_CACHE_DIR = INSTANCE_PATHS["cookie_dir"]
 _COOKIE_CACHE_DIR.mkdir(exist_ok=True)
-os.environ.setdefault("GEMINI_COOKIE_PATH", str(_COOKIE_CACHE_DIR))
+_env_explicit_cookie_path = False
+if ENV_FILE.exists():
+    try:
+        for _ln in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            _s = _ln.strip()
+            if _s.startswith("GEMINI_COOKIE_PATH=") and _s.split("=", 1)[1].strip().strip('"').strip("'"):
+                _env_explicit_cookie_path = True
+                break
+    except OSError:
+        pass
+if not _env_explicit_cookie_path:
+    os.environ["GEMINI_COOKIE_PATH"] = str(_COOKIE_CACHE_DIR)
+else:
+    os.environ.setdefault("GEMINI_COOKIE_PATH", str(_COOKIE_CACHE_DIR))
 
 # =====================================================================
 # 2. THÔNG TIN XÁC THỰC GEMINI WEB (COOKIES)
@@ -100,27 +113,41 @@ from app.control import parse_start_state
 HOST = os.getenv("HOST", "127.0.0.1").strip()
 PORT = int(os.getenv("PORT", "10000").strip())
 INSTANCE_LABEL = os.getenv("INSTANCE_LABEL", "").strip()   # nhãn dễ đọc, vd "Frontend"
+GATEWAY_MODE = os.getenv("GATEWAY_MODE", "auto").strip().lower()
 BRIDGE_LOG_FILE = INSTANCE_PATHS["log_file"]
+
+# Model do người dùng chủ động chọn (rỗng = giữ lựa chọn Dashboard hoặc mặc định tài khoản)
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "").strip()
+# Model dự phòng khi timeout/lỗi (rỗng = KHÔNG tự ý đổi sang model khác sau lưng người dùng)
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", "").strip()
+
+# Tự sửa nội bộ tối đa 1 vòng khi Gemini trả tool call lỗi hoặc phản hồi trống
+TOOL_PARSE_SELF_CORRECTION = os.getenv("TOOL_PARSE_SELF_CORRECTION", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+EMPTY_REPLY_RETRIES = max(0, int(os.getenv("EMPTY_REPLY_RETRIES", "1")))
 
 API_START_ON = parse_start_state(os.getenv("API_START_STATE", "on"))
 DISABLE_DRAIN_TIMEOUT = float(os.getenv("DISABLE_DRAIN_TIMEOUT", "120"))
 
-# Giới hạn cứng 90s (< 120s của gemini_webapi)
-GEMINI_HARD_TIMEOUT = int(os.getenv("GEMINI_HARD_TIMEOUT", "90"))
+# Giới hạn chờ phản hồi đầu tiên (mặc định 180s = 3 phút cho các model thinking nặng)
+GEMINI_HARD_TIMEOUT = int(os.getenv("GEMINI_HARD_TIMEOUT", "180"))
 
 # Timeout chờ chunk đầu tiên (thoughts hoặc text) trước khi soft-fallback sang model khác (giây)
 MODEL_FIRST_BYTE_FALLBACK_TIMEOUT = float(
-    os.getenv("MODEL_FIRST_BYTE_FALLBACK_TIMEOUT", "50")
+    os.getenv("MODEL_FIRST_BYTE_FALLBACK_TIMEOUT", "90")
 )
 
 # Idle timeout giữa các chunk sau khi đã nhận thoughts_delta hoặc text_delta (giây)
 GEMINI_CHUNK_IDLE_TIMEOUT = float(
-    os.getenv("GEMINI_CHUNK_IDLE_TIMEOUT", "40")
+    os.getenv("GEMINI_CHUNK_IDLE_TIMEOUT", "120")
 )
 
-# Trần tổng thời gian cho 1 lượt stream sau khi model đã bắt đầu phản hồi (giây)
+# Trần tổng thời gian cho 1 lượt stream sau khi model đã bắt đầu phản hồi (giây, mặc định 7 phút)
 GEMINI_STREAM_OVERALL_TIMEOUT = float(
-    os.getenv("GEMINI_STREAM_OVERALL_TIMEOUT", str(max(180, GEMINI_HARD_TIMEOUT)))
+    os.getenv("GEMINI_STREAM_OVERALL_TIMEOUT", str(max(420, GEMINI_HARD_TIMEOUT)))
 )
 
 # Total deadline for direct image upload and the Gemini response.
@@ -134,8 +161,9 @@ MIN_REQUEST_INTERVAL = float(os.getenv("MIN_REQUEST_INTERVAL", "0.5"))
 # Chu kỳ keep-alive SSE (giây)
 SSE_HEARTBEAT_INTERVAL = float(os.getenv("SSE_HEARTBEAT_INTERVAL", "2.5"))
 
-# Giới hạn ký tự tool result (mặc định 12000)
+# Giới hạn ký tự tool result (mỗi kết quả 12000; tổng 1 lượt nhiều tool song song tối đa 36000)
 MAX_TOOL_RESULT_CHARS = int(os.getenv("MAX_TOOL_RESULT_CHARS", "12000"))
+MAX_TOTAL_TOOL_RESULTS_CHARS = int(os.getenv("MAX_TOTAL_TOOL_RESULTS_CHARS", "36000"))
 
 # Giới hạn ảnh mỗi lượt
 MAX_IMAGES_PER_TURN = int(os.getenv("MAX_IMAGES_PER_TURN", "4"))
@@ -173,9 +201,29 @@ BRIDGE_DEBUG_FAKE_QUOTA = os.getenv("BRIDGE_DEBUG_FAKE_QUOTA", "false").strip().
 )
 
 # =====================================================================
-# 4. CẤU HÌNH BẢO MẬT Ổ ĐĨA (SANDBOX JAIL)
+# 3c. CẤU HÌNH PROFILE VAULT & AUTO COOKIE SYNC (KHÔNG CẦN MỞ TAB)
 # =====================================================================
-DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", r"D:\ABC").strip()
+_RAW_PROFILES_DIR = os.getenv("COOKIE_PROFILES_DIR", "").strip()
+COOKIE_PROFILES_DIR = (
+    Path(_RAW_PROFILES_DIR) if _RAW_PROFILES_DIR else (BASE_DIR / ".cookie_profiles")
+)
+AUTO_COOKIE_SYNC = os.getenv("AUTO_COOKIE_SYNC", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+COOKIE_SYNC_BROWSER = os.getenv("COOKIE_SYNC_BROWSER", "auto").strip()
+COOKIE_SYNC_TIMEOUT = max(10.0, float(os.getenv("COOKIE_SYNC_TIMEOUT", "25")))
+COOKIE_SYNC_COOLDOWN = max(15.0, float(os.getenv("COOKIE_SYNC_COOLDOWN", "120")))
+
+# =====================================================================
+# 4. CẤU HÌNH WORKSPACE & AN TOÀN HỆ THỐNG
+# =====================================================================
+# Rỗng = mở tự do theo thư mục người dùng đang mở trên IDE (không khóa cứng ổ nào)
+DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", "").strip()
+# client = tin tưởng phạm vi thư mục của IDE/đoạn chat (chỉ chặn lệnh phá OS cực đoan)
+# workspace = khóa mềm đường dẫn file vào workspace nhận diện được từ đoạn chat / DEFAULT_PROJECT_DIR
+WORKSPACE_SANDBOX_MODE = os.getenv("WORKSPACE_SANDBOX_MODE", "client").strip().lower()
 FORBIDDEN_TOOLS = {"read_image", "generate_video", "generate_image"}
 
 # =====================================================================
@@ -206,14 +254,24 @@ logger.addHandler(_file_handler)
 from app.lane_security import parse_peer_lanes
 
 PEER_LANES = parse_peer_lanes(os.getenv("PEER_LANES", ""), INSTANCE_ID)
-if PEER_LANES and not INSTANCE_ID:
-    if PORT == 10000:
-        logger.info("[GATEWAY] Chạy chế độ Frontend Gateway trên port 10000. Các luồng worker: %s", list(PEER_LANES.keys()))
-    else:
-        logger.warning(
-            "[LANE] Đang chạy KHÔNG có BRIDGE_INSTANCE (ID 'default') nhưng có PEER_LANES. "
-            "Hai luồng cần ID acc1/acc2 (dùng run_acc1.bat / run_acc2.bat)."
-        )
+IS_GATEWAY_INSTANCE = bool(PEER_LANES) and (
+    GATEWAY_MODE in ("1", "true", "yes", "on")
+    or (
+        GATEWAY_MODE not in ("0", "false", "no", "off")
+        and (not INSTANCE_ID or INSTANCE_ID in ("default", "frontend", "gateway"))
+    )
+)
+if IS_GATEWAY_INSTANCE:
+    logger.info(
+        "[GATEWAY] Chạy chế độ Frontend Gateway trên port %s. Các luồng worker: %s",
+        PORT,
+        list(PEER_LANES.keys()),
+    )
+elif PEER_LANES and not INSTANCE_ID:
+    logger.warning(
+        "[LANE] Đang chạy KHÔNG có BRIDGE_INSTANCE (ID 'default') nhưng có PEER_LANES. "
+        "Hai luồng cần ID acc1/acc2 (dùng run_acc1.bat / run_acc2.bat)."
+    )
 if PEER_LANES and not LANE_ADMIN_TOKEN:
     logger.warning(
         "[LANE] Có PEER_LANES nhưng thiếu LANE_ADMIN_TOKEN: chỉ XEM được luồng kia, KHÔNG điều khiển được."
@@ -229,7 +287,7 @@ def validate_config():
         errors.append("SECURE_1PSID is empty!")
         if not SECURE_1PSIDTS:
             errors.append("SECURE_1PSIDTS is empty!")
-    elif not SECURE_1PSIDTS:
+    elif not any(acc.get("psidts") for acc in ACCOUNT_CHAIN):
         errors.append("SECURE_1PSIDTS is empty!")
     if errors:
         if ALLOW_GUEST_MODE:

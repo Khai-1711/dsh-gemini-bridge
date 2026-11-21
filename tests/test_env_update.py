@@ -1,10 +1,9 @@
-import asyncio
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 # Đảm bảo pop BRIDGE_INSTANCE trước khi import
 os.environ.pop("BRIDGE_INSTANCE", None)

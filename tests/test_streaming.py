@@ -48,6 +48,17 @@ class TestToolCallAwareStreamer(unittest.TestCase):
         self.assertEqual(full, "before <tool_call>json</tool_call> after")
         self.assertEqual(out, "before  after")
 
+    def test_inline_backtick_tool_call_in_prose_passes_through_without_swallowing(self):
+        deltas = [
+            "Use plain-text `",
+            "<tool_call>",
+            "` (for example `pwsh`) to run tests.",
+        ]
+        out, full = _run(deltas)
+        expected = "Use plain-text `<tool_call>` (for example `pwsh`) to run tests."
+        self.assertEqual(full, expected)
+        self.assertEqual(out, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

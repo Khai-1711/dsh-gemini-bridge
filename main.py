@@ -24,6 +24,7 @@ from app.config import (
     HOST,
     INSTANCE_ID,
     INSTANCE_PATHS,
+    IS_GATEWAY_INSTANCE,
     LANE_ADMIN_TOKEN,
     LOG_DIR,
     PEER_LANES,
@@ -44,11 +45,7 @@ FAILURE_TRACES_FILE = LOG_DIR / (
 )
 session_manager.on_event = lambda **kw: activity.write(**kw)
 
-is_frontend_gateway = (
-    PORT == 10000
-    and (not INSTANCE_ID or INSTANCE_ID in ("default", "frontend", "gateway"))
-    and bool(PEER_LANES)
-)
+is_frontend_gateway = IS_GATEWAY_INSTANCE
 lane_registry = LaneRegistry(
     self_id=INSTANCE_ID or ("frontend" if is_frontend_gateway else "default"),
     peers=PEER_LANES,
@@ -149,6 +146,7 @@ from app.routes_admin import (  # noqa: E402, F401
     _local_lane_models,
     _local_switch_model,
     _local_update_cookies,
+    _resolve_chat_model,
     _save_env_cookies,
     admin_router,
     clear_cache,

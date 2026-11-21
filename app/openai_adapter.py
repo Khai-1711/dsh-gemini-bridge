@@ -1,6 +1,7 @@
 """Lớp biên dịch chuẩn OpenAI (/v1/models, /v1/chat/completions, /v1/responses)."""
 import asyncio
 import contextlib
+import inspect
 import json
 import sys
 import time
@@ -11,19 +12,35 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.activity import record_failed_tool_trace, summarize_tool_calls
-from app.config import FORBIDDEN_TOOLS, LOCK_ACQUIRE_TIMEOUT, logger
+from app.config import (
+    FORBIDDEN_TOOLS,
+    LOCK_ACQUIRE_TIMEOUT,
+    TOOL_PARSE_SELF_CORRECTION,
+    logger,
+)
 from app.errors import BridgeBusyError, BridgeError
 from app.gemini_session import compute_session_key, is_subagent_messages
-from app.prompt_builder import compile_tools_prompt, is_plain_greeting_request
+from app.prompt_builder import (
+    _latest_turn_messages,
+    build_context_bootstrap,
+    compile_tools_prompt,
+    extract_system_context,
+    extract_workspace_root,
+    is_plain_greeting_request,
+)
 from app.streaming import ToolCallAwareStreamer
 from app.title_generation import extract_local_title_request
 from app.tool_parser import (
     ToolParseResult,
+    clean_gemini_web_artifacts,
     has_tool_call_intent,
     parse_tool_calls_detailed,
 )
+from app.vision import cleanup_temp_images
 
 openai_router = APIRouter()
+
+_MODEL_ALIAS_TOKENS = ("default", "auto", "none", "unspecified", "gemini")
 
 
 def _m():
@@ -60,6 +77,17 @@ def _actual_prompt_chars(mgr: Any, default_chars: int) -> int:
     return raw_chars if isinstance(raw_chars, int) and raw_chars > 0 else default_chars
 
 
+def _supports_kwarg(fn: Any, kwarg_name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD or param.name == kwarg_name:
+            return True
+    return False
+
+
 def _invalid_tool_batch_error(parse_res: ToolParseResult, reply_text: str) -> Optional[dict]:
     has_invalid = bool(
         parse_res.malformed_tags
@@ -79,6 +107,76 @@ def _invalid_tool_batch_error(parse_res: ToolParseResult, reply_text: str) -> Op
     else:
         msg = "Gemini trả về tool call không hợp lệ hoặc không khớp schema; chưa có tool nào được thực thi."
     return {"message": msg, "type": "upstream_error", "code": "invalid_tool_call"}
+
+
+async def _attempt_tool_self_correction(
+    mgr: Any,
+    parse_res: ToolParseResult,
+    reply_text: str,
+    tools_map: dict,
+    workspace_root: str,
+) -> Tuple[str, ToolParseResult, bool]:
+    """Thử tự sửa tối đa 1 vòng kín khi Gemini xuất `<tool_call>` lỗi cú pháp/schema."""
+    if (
+        not TOOL_PARSE_SELF_CORRECTION
+        or not tools_map
+        or getattr(mgr, "state", "") != "on"
+        or getattr(mgr, "chat_session", None) is None
+    ):
+        return reply_text, parse_res, False
+
+    if parse_res.malformed_tags:
+        reason = "; ".join(
+            f"tag #{item['index']}: {item['reason']}" for item in parse_res.malformed_tags[:3]
+        )
+    elif parse_res.has_unclosed_tag:
+        reason = "the <tool_call> block was truncated before </tool_call>"
+    else:
+        reason = "invalid JSON or schema mismatch"
+
+    allowed_names = ", ".join(list(tools_map.keys())[:25])
+    correction_prompt = (
+        f"[TOOL FORMAT CORRECTION] Your previous tool call could not be parsed ({reason}). "
+        f"No tool was executed. Re-emit ONLY the corrected <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> "
+        f"block(s) using valid JSON, exact parameter names/types, raw URLs (never markdown links), "
+        f"and properly escaped quotes/newlines. Allowed tools: {allowed_names}."
+    )
+    try:
+        logger.warning("[SELF-CORRECT] Thử tự sửa tool call 1 vòng kín (%s)...", reason)
+        fixed_reply = await mgr.send_prepared_turn(
+            correction_prompt, [], include_tool_header=False
+        )
+        fixed_reply = clean_gemini_web_artifacts(fixed_reply)
+        fixed_res = parse_tool_calls_detailed(
+            fixed_reply, tools_map, workspace_root=workspace_root
+        )
+        if _invalid_tool_batch_error(fixed_res, fixed_reply) is None and fixed_res.tool_calls:
+            logger.info(
+                "[SELF-CORRECT] Tự sửa thành công %d tool call(s)!",
+                len(fixed_res.tool_calls),
+            )
+            return fixed_reply, fixed_res, True
+    except Exception as exc:
+        logger.warning("[SELF-CORRECT] Tự sửa thất bại: %s", exc)
+    return reply_text, parse_res, False
+
+
+def _build_reset_bootstrap_prompt(
+    messages: list, base_prompt: str, tool_header: str
+) -> str:
+    """Dựng bản prompt đầy đủ ngữ cảnh để dự phòng nếu lỗi 1097 buộc mở ChatSession mới giữa lượt."""
+    latest = _latest_turn_messages(messages)
+    parts: List[str] = []
+    bootstrap = build_context_bootstrap(messages, len(latest))
+    if bootstrap:
+        parts.append(bootstrap)
+    parts.append(base_prompt)
+    sys_ctx = extract_system_context(messages)
+    if sys_ctx and "[SYSTEM & WORKSPACE CONTEXT]" not in base_prompt:
+        parts.append("[SYSTEM & WORKSPACE CONTEXT]\n" + sys_ctx)
+    if tool_header and "=== WORKSPACE TOOLS" not in base_prompt:
+        parts.append("=== WORKSPACE TOOLS ===\n" + tool_header)
+    return "\n\n".join(p for p in parts if p)
 
 
 def _handle_local_title_response(
@@ -162,14 +260,14 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": m,
+                "id": model_name,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "google",
-                "display_name": details.get(m, {}).get("display_name", m),
-                "description": details.get(m, {}).get("description", ""),
+                "display_name": details.get(model_name, {}).get("display_name", model_name),
+                "description": details.get(model_name, {}).get("description", ""),
             }
-            for m in mgr.available_models
+            for model_name in mgr.available_models
         ],
     }
 
@@ -190,10 +288,8 @@ async def chat_completions(request: Request):
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
 
-        requested_model = str(body.get("model") or "gemini-4-neon").strip()
-        model_id = requested_model or "gemini-4-neon"
-        if model_id.lower() in ("default", "auto", "none", "unspecified", "gemini"):
-            model_id = "gemini-4-neon"
+        requested_model = str(body.get("model") or "").strip()
+        model_id = requested_model or "default"
         is_stream = bool(body.get("stream", False))
         chat_id = f"chatcmpl-{uuid.uuid4().hex}"
         created_ts = int(t0)
@@ -226,11 +322,12 @@ async def chat_completions(request: Request):
         if t.get("function", t).get("name") and t.get("function", t).get("name").lower() not in FORBIDDEN_TOOLS
     }
 
-    requested_model = str(body.get("model") or mgr.default_model).strip()
-    model_id = requested_model or mgr.default_model
-    if model_id.lower() in ("default", "auto", "none", "unspecified", "gemini"):
-        model_id = mgr.default_model
-    is_stream = body.get("stream", False)
+    raw_requested_model = str(body.get("model") or "").strip()
+    is_explicit_model = bool(
+        raw_requested_model and raw_requested_model.lower() not in _MODEL_ALIAS_TOKENS
+    )
+    model_id = raw_requested_model if is_explicit_model else (mgr.default_model or "unspecified")
+    is_stream = bool(body.get("stream", False))
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_ts = int(t0)
     del body
@@ -245,27 +342,46 @@ async def chat_completions(request: Request):
             content={"error": {"message": "Gemini chưa đăng nhập (guest mode hoặc cookie hết hạn). Hãy cập nhật cookie ở /dashboard hoặc POST /v1/update-cookies.", "type": "auth_error", "code": "gemini_not_authenticated"}},
         )
 
-    if model_id not in ("unspecified", mgr.default_model):
-        model_status, model_data = await m._local_switch_model(model_id, keep_chat=True)
+    # Xác thực model ở chế độ CHỈ ĐỌC trước khi lấy lock / mở SSE (không sửa default_model hay slot khác)
+    requested_slot_model: Optional[str] = None
+    if is_explicit_model:
+        model_status, model_data = m._resolve_chat_model(raw_requested_model)
         if model_status != 200:
-            m.activity.write(request_id=chat_id, model=model_id, stream=is_stream, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage="model_selection", latency_ms=int((time.time() - t0) * 1000), outcome=f"error:{model_data.get('error', {}).get('code', 'model_not_available')}")
+            m.activity.write(request_id=chat_id, model=raw_requested_model, stream=is_stream, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage="model_selection", latency_ms=int((time.time() - t0) * 1000), outcome=f"error:{model_data.get('error', {}).get('code', 'model_not_available')}")
             return JSONResponse(status_code=model_status, content=model_data)
-        model_id = model_data["active_model"]
+        requested_slot_model = model_data["resolved_model"]
+        model_id = requested_slot_model
     else:
-        model_id = mgr.default_model
+        model_id = mgr.default_model or "unspecified"
 
     explicit_sid = (request.headers.get("X-Session-Id") or request.headers.get("X-DSH-Session-Id") or "").strip()
+    workspace_header = (request.headers.get("X-Workspace-Dir") or "").strip()
+    detected_workspace = workspace_header or extract_workspace_root(messages)
     conv_key, is_new_conv = compute_session_key(messages, explicit_sid)
     is_subagent = is_subagent_messages(messages)
 
-    async def _prepare_locked_turn() -> Tuple[str, List[str], bool, Any]:
+    failover_ready = request.headers.get("X-Gateway-Failover-Ready") == "1"
+    pre_lock_timeout = min(LOCK_ACQUIRE_TIMEOUT, 2.0) if failover_ready else LOCK_ACQUIRE_TIMEOUT
+
+    async def _prepare_locked_turn() -> Tuple[str, List[str], bool, Any, str, str]:
         if hasattr(mgr, "activate_session_slot"):
-            await mgr.activate_session_slot(conv_key, is_new_conversation=is_new_conv, is_subagent=is_subagent)
+            act_fn = mgr.activate_session_slot
+            if _supports_kwarg(act_fn, "requested_model"):
+                await act_fn(
+                    conv_key,
+                    is_new_conversation=is_new_conv,
+                    is_subagent=is_subagent,
+                    requested_model=requested_slot_model,
+                    workspace_root=detected_workspace,
+                )
+            else:
+                await act_fn(conv_key, is_new_conversation=is_new_conv, is_subagent=is_subagent)
         else:
             has_dirty = bool(getattr(mgr, "chat_session", None) and getattr(mgr.chat_session, "cid", None))
             if is_new_conv and (mgr.turn_count > 0 or has_dirty):
                 await mgr.reset_session()
 
+        active_workspace = str(getattr(mgr, "_active_workspace_root", "") or detected_workspace or "").strip()
         mgr.remember_transcript(messages)
         active_ledger = mgr.ledger
         if messages and messages[-1].get("role") == "user":
@@ -280,42 +396,78 @@ async def chat_completions(request: Request):
         mgr.remember_tool_header(tool_header)
         needs_header = mgr.needs_tool_header
         defer_header = needs_header and is_plain_greeting_request(messages)
-        prompt_text, img_files = m.build_incremental_prompt_and_files(messages, tools, is_first_turn=needs_header and not defer_header)
-        return prompt_text, img_files, defer_header, active_ledger
+        is_first = needs_header and not defer_header
+        prompt_text, img_files = m.build_incremental_prompt_and_files(
+            messages, tools, is_first_turn=is_first
+        )
+        bootstrap_prompt = (
+            ""
+            if is_first or defer_header
+            else _build_reset_bootstrap_prompt(messages, prompt_text, tool_header)
+        )
+        return prompt_text, img_files, defer_header, active_ledger, active_workspace, bootstrap_prompt
+
+    # Lấy turn lock TRƯỚC khi trả StreamingResponse(200) để Gateway có thể failover thật khi worker bận (HTTP 429)
+    acquired_lock = False
+    try:
+        acquired_lock = await mgr.acquire_turn_lock(pre_lock_timeout)
+    except asyncio.TimeoutError:
+        mgr.total_errors += 1
+        busy = BridgeBusyError("Bridge đang bận, thử lại sau vài giây.", stage="lock")
+        m.activity.write(
+            request_id=chat_id,
+            model=model_id,
+            stream=is_stream,
+            chat_key=mgr.current_chat_key(),
+            auth_ok=mgr.auth_ok,
+            stage=busy.stage,
+            latency_ms=int((time.time() - t0) * 1000),
+            outcome=f"error:{busy.code}",
+        )
+        return JSONResponse(
+            status_code=busy.status_code,
+            content={"error": {"message": busy.message, "type": busy.err_type, "code": busy.code}},
+        )
+
+    image_files: List[str] = []
+    try:
+        prompt_to_send, image_files, defer_tool_header, active_ledger, active_workspace, bootstrap_prompt = (
+            await _prepare_locked_turn()
+        )
+        _reset_turn_activity_fields(mgr)
+        if not requested_slot_model and hasattr(mgr, "_current_slot_model"):
+            model_id = mgr._current_slot_model() or model_id
+    except Exception:
+        cleanup_temp_images(image_files)
+        mgr.release_turn_lock(acquired_lock)
+        raise
 
     def _content_chunk(piece: str) -> dict:
         return {"id": chat_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_id, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]}
 
     if is_stream:
         async def sse_generator():
-            first_chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_id, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
-            yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
-
             queue: asyncio.Queue = asyncio.Queue()
             producer_done = asyncio.Event()
-            turn_state: dict = {"prompt_chars": 0, "prompt_tokens": 1, "ledger": mgr.ledger}
+            turn_state: dict = {
+                "prompt_chars": len(prompt_to_send),
+                "prompt_tokens": max(1, len(prompt_to_send) // 4),
+                "ledger": active_ledger,
+            }
 
             async def producer():
-                acquired_lock = False
                 try:
-                    try:
-                        acquired_lock = await mgr.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        mgr.total_errors += 1
-                        await queue.put(("error", {"message": "Bridge đang bận, thử lại sau vài giây.", "type": BridgeBusyError.err_type, "code": BridgeBusyError.code, "stage": "lock"}))
-                        return
+                    if hasattr(mgr, "transfer_turn_lock"):
+                        mgr.transfer_turn_lock()
 
-                    prompt_to_send, image_files, defer_tool_header, active_ledger = await _prepare_locked_turn()
-                    _reset_turn_activity_fields(mgr)
-                    turn_state["prompt_chars"] = len(prompt_to_send)
-                    turn_state["prompt_tokens"] = max(1, len(prompt_to_send) // 4)
-                    turn_state["ledger"] = active_ledger
+                    stream_fn = mgr.send_prepared_turn_stream
+                    kwargs: dict = {}
+                    if defer_tool_header:
+                        kwargs["include_tool_header"] = False
+                    if bootstrap_prompt and _supports_kwarg(stream_fn, "bootstrap_prompt"):
+                        kwargs["bootstrap_prompt"] = bootstrap_prompt
 
-                    turn_stream = (
-                        mgr.send_prepared_turn_stream(prompt_to_send, image_files, include_tool_header=False)
-                        if defer_tool_header
-                        else mgr.send_prepared_turn_stream(prompt_to_send, image_files)
-                    )
+                    turn_stream = stream_fn(prompt_to_send, image_files, **kwargs)
                     async with contextlib.aclosing(turn_stream) as stream:
                         async for item in stream:
                             await queue.put(item)
@@ -324,7 +476,6 @@ async def chat_completions(request: Request):
                     error = {"message": exc.message, "type": exc.err_type, "code": exc.code} if isinstance(exc, BridgeError) else {"message": "Streaming response failed before completion.", "type": "upstream_error", "code": "stream_producer_error"}
                     await queue.put(("error", error))
                 finally:
-                    mgr.release_turn_lock(acquired_lock)
                     producer_done.set()
 
             prod_task = asyncio.create_task(producer())
@@ -332,6 +483,9 @@ async def chat_completions(request: Request):
             done_text = None
 
             try:
+                first_chunk = {"id": chat_id, "object": "chat.completion.chunk", "created": created_ts, "model": model_id, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]}
+                yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+
                 while True:
                     if producer_done.is_set() and queue.empty():
                         break
@@ -354,19 +508,37 @@ async def chat_completions(request: Request):
                         return
                     elif kind == "delta":
                         for piece in splitter.feed(payload):
-                            yield f"data: {json.dumps(_content_chunk(piece), ensure_ascii=False)}\n\n"
+                            clean_piece = clean_gemini_web_artifacts(piece)
+                            if clean_piece:
+                                yield f"data: {json.dumps(_content_chunk(clean_piece), ensure_ascii=False)}\n\n"
                     elif kind == "text":
-                        yield f"data: {json.dumps(_content_chunk(payload), ensure_ascii=False)}\n\n"
+                        clean_piece = clean_gemini_web_artifacts(payload)
+                        if clean_piece:
+                            yield f"data: {json.dumps(_content_chunk(clean_piece), ensure_ascii=False)}\n\n"
                     elif kind == "done":
                         done_text = payload
 
                 for piece in splitter.flush():
-                    yield f"data: {json.dumps(_content_chunk(piece), ensure_ascii=False)}\n\n"
+                    clean_piece = clean_gemini_web_artifacts(piece)
+                    if clean_piece:
+                        yield f"data: {json.dumps(_content_chunk(clean_piece), ensure_ascii=False)}\n\n"
 
-                reply_text = done_text if done_text is not None else splitter.full_text
+                reply_text = clean_gemini_web_artifacts(
+                    done_text if done_text is not None else splitter.full_text
+                )
                 actual_model, fb_extra = _turn_activity_model_fields(mgr, model_id)
                 actual_prompt_chars = _actual_prompt_chars(mgr, turn_state["prompt_chars"])
-                parse_res = parse_tool_calls_detailed(reply_text, tools_map)
+                parse_res = parse_tool_calls_detailed(
+                    reply_text, tools_map, workspace_root=active_workspace
+                )
+                self_corrected = False
+                if _invalid_tool_batch_error(parse_res, reply_text) is not None:
+                    if hasattr(mgr, "transfer_turn_lock"):
+                        mgr.transfer_turn_lock()
+                    reply_text, parse_res, self_corrected = await _attempt_tool_self_correction(
+                        mgr, parse_res, reply_text, tools_map, active_workspace
+                    )
+
                 tool_calls = parse_res.tool_calls
                 if (invalid_err := _invalid_tool_batch_error(parse_res, reply_text)) is not None:
                     record_failed_tool_trace(m.FAILURE_TRACES_FILE, request_id=chat_id, model=actual_model, reply_text=reply_text, reason="invalid_tool_call")
@@ -375,9 +547,9 @@ async def chat_completions(request: Request):
                     yield "data: [DONE]\n\n"
                     return
 
-                active_ledger = turn_state["ledger"]
-                active_ledger.note_tool_calls(tool_calls)
-                active_ledger.note_assistant(reply_text)
+                active_ledger_obj = turn_state["ledger"]
+                active_ledger_obj.note_tool_calls(tool_calls)
+                active_ledger_obj.note_assistant(reply_text)
 
                 if tool_calls:
                     tc_deltas = [{"index": idx, "id": tc["id"], "type": "function", "function": tc["function"]} for idx, tc in enumerate(tool_calls)]
@@ -396,6 +568,8 @@ async def chat_completions(request: Request):
                     "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                     "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens},
                 }
+                if self_corrected:
+                    fb_extra["self_corrected"] = True
                 m.activity.write(request_id=chat_id, model=actual_model, stream=True, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage="complete", prompt_chars=actual_prompt_chars, reply_chars=len(reply_text), finish=finish_reason, tools=summarize_tool_calls(tool_calls), latency_ms=int((time.time() - t0) * 1000), outcome="ok", **fb_extra)
                 yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -403,27 +577,34 @@ async def chat_completions(request: Request):
                 if not prod_task.done():
                     prod_task.cancel()
                 await asyncio.gather(prod_task, return_exceptions=True)
+                mgr.release_turn_lock(acquired_lock)
 
         return StreamingResponse(sse_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
-    acquired_lock = False
+    # Non-streaming path (turn lock already acquired above)
     try:
-        try:
-            acquired_lock = await mgr.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
-        except asyncio.TimeoutError:
-            mgr.total_errors += 1
-            busy = BridgeBusyError("Bridge đang bận, thử lại sau vài giây.", stage="lock")
-            m.activity.write(request_id=chat_id, model=model_id, stream=False, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage=busy.stage, latency_ms=int((time.time() - t0) * 1000), outcome=f"error:{busy.code}")
-            return JSONResponse(status_code=busy.status_code, content={"error": {"message": busy.message, "type": busy.err_type, "code": busy.code}})
-
-        prompt_to_send, image_files, defer_tool_header, active_ledger = await _prepare_locked_turn()
-        _reset_turn_activity_fields(mgr)
         prompt_tokens = max(1, len(prompt_to_send) // 4)
-        reply_text = await (
-            mgr.send_prepared_turn(prompt_to_send, image_files, include_tool_header=False)
-            if defer_tool_header
-            else mgr.send_prepared_turn(prompt_to_send, image_files)
+        send_fn = mgr.send_prepared_turn
+        send_kwargs: dict = {}
+        if defer_tool_header:
+            send_kwargs["include_tool_header"] = False
+        if bootstrap_prompt and _supports_kwarg(send_fn, "bootstrap_prompt"):
+            send_kwargs["bootstrap_prompt"] = bootstrap_prompt
+
+        reply_text = clean_gemini_web_artifacts(
+            await send_fn(prompt_to_send, image_files, **send_kwargs)
         )
+        actual_model, fb_extra = _turn_activity_model_fields(mgr, model_id)
+        actual_prompt_chars = _actual_prompt_chars(mgr, len(prompt_to_send))
+        prompt_tokens = max(prompt_tokens, actual_prompt_chars // 4)
+        parse_res = parse_tool_calls_detailed(
+            reply_text, tools_map, workspace_root=active_workspace
+        )
+        self_corrected = False
+        if _invalid_tool_batch_error(parse_res, reply_text) is not None:
+            reply_text, parse_res, self_corrected = await _attempt_tool_self_correction(
+                mgr, parse_res, reply_text, tools_map, active_workspace
+            )
     except BridgeError as e:
         actual_model, fb_extra = _turn_activity_model_fields(mgr, model_id)
         m.activity.write(request_id=chat_id, model=actual_model, stream=False, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage=e.stage, latency_ms=int((time.time() - t0) * 1000), outcome=f"error:{e.code}", **fb_extra)
@@ -431,10 +612,6 @@ async def chat_completions(request: Request):
     finally:
         mgr.release_turn_lock(acquired_lock)
 
-    actual_model, fb_extra = _turn_activity_model_fields(mgr, model_id)
-    actual_prompt_chars = _actual_prompt_chars(mgr, len(prompt_to_send))
-    prompt_tokens = max(prompt_tokens, actual_prompt_chars // 4)
-    parse_res = parse_tool_calls_detailed(reply_text, tools_map)
     tool_calls = parse_res.tool_calls
     if (invalid_err := _invalid_tool_batch_error(parse_res, reply_text)) is not None:
         record_failed_tool_trace(m.FAILURE_TRACES_FILE, request_id=chat_id, model=actual_model, reply_text=reply_text, reason="invalid_tool_call")
@@ -446,6 +623,8 @@ async def chat_completions(request: Request):
     message_obj = {"role": "assistant", "content": None, "tool_calls": tool_calls} if tool_calls else {"role": "assistant", "content": reply_text}
     finish_reason = "tool_calls" if tool_calls else "stop"
 
+    if self_corrected:
+        fb_extra["self_corrected"] = True
     m.activity.write(request_id=chat_id, model=actual_model, stream=False, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage="complete", prompt_chars=actual_prompt_chars, reply_chars=len(reply_text), finish=finish_reason, tools=summarize_tool_calls(tool_calls), latency_ms=int((time.time() - t0) * 1000), outcome="ok", **fb_extra)
     completion_tokens = max(1, len(reply_text) // 4)
     return {

@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import unittest
@@ -12,7 +11,6 @@ os.environ.setdefault("SECURE_1PSIDTS", "canary_mock_psidts_secret_67890")
 from app.lanes import (
     LaneRegistry,
     build_local_lane_status,
-    _format_remote_status,
     check_env_file_id,
 )
 from starlette.requests import Request
@@ -32,6 +30,8 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         manager.active_index = 0
         manager.start_time = 1000.0
         manager.default_model = "gemini-pro"
+        manager.available_models = ["gemini-pro", "gemini-flash"]
+        manager.turn_count = 4
         manager.total_requests = 10
         manager.total_errors = 1
         manager.current_chat_key = MagicMock(return_value="abc12345")
@@ -56,7 +56,7 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
         expected_fields = {
             "id", "label", "url", "port", "is_self", "reachable", "control",
             "inflight", "auth_ok", "account_status", "active_account",
-            "accounts", "model", "requests", "errors", "uptime_s",
+            "accounts", "model", "available_models", "turn_count", "requests", "errors", "uptime_s",
             "chat_key", "last_activity_ts", "cache_enabled", "controllable",
             "has_env_id", "env_file", "id_status"
         }
@@ -279,7 +279,6 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
 
     async def test_main_lane_endpoints_and_activity(self):
         from main import (
-            app,
             lane_enable,
             lane_disable,
             list_lanes,
@@ -380,81 +379,109 @@ class TestLanes(unittest.IsolatedAsyncioTestCase):
     async def test_local_switch_model_validation(self):
         from main import _local_switch_model, session_manager
 
-        # Case 1: Luồng đang OFF -> 409 lane_not_ready
-        session_manager.state = "off"
-        session_manager.auth_ok = True
-        code, err = await _local_switch_model("gemini-pro")
-        self.assertEqual(code, 409)
-        self.assertEqual(err["error"]["code"], "lane_not_ready")
+        orig = (
+            session_manager.state,
+            session_manager.auth_ok,
+            list(session_manager.available_models),
+            session_manager.default_model,
+            session_manager.client,
+        )
+        try:
+            # Case 1: Luồng đang OFF -> 409 lane_not_ready
+            session_manager.state = "off"
+            session_manager.auth_ok = True
+            code, err = await _local_switch_model("gemini-pro")
+            self.assertEqual(code, 409)
+            self.assertEqual(err["error"]["code"], "lane_not_ready")
 
-        # Case 2: Luồng ON nhưng chưa đăng nhập (auth_ok=False) -> 409 lane_not_ready
-        session_manager.state = "on"
-        session_manager.auth_ok = False
-        code, err = await _local_switch_model("gemini-pro")
-        self.assertEqual(code, 409)
-        self.assertEqual(err["error"]["code"], "lane_not_ready")
+            # Case 2: Luồng ON nhưng chưa đăng nhập (auth_ok=False) -> 409 lane_not_ready
+            session_manager.state = "on"
+            session_manager.auth_ok = False
+            code, err = await _local_switch_model("gemini-pro")
+            self.assertEqual(code, 409)
+            self.assertEqual(err["error"]["code"], "lane_not_ready")
 
-        # Case 3: Luồng ON và auth_ok=True, nhưng gửi model không tồn tại -> 400 model_not_available
-        session_manager.state = "on"
-        session_manager.auth_ok = True
-        session_manager.available_models = ["unspecified", "gemini-pro", "gemini-flash"]
-        session_manager.default_model = "gemini-pro"
+            # Case 3: Luồng ON và auth_ok=True, nhưng gửi model không tồn tại -> 400 model_not_available
+            session_manager.state = "on"
+            session_manager.auth_ok = True
+            session_manager.available_models = ["unspecified", "gemini-pro", "gemini-flash"]
+            session_manager.default_model = "gemini-pro"
 
-        # Mock resolve_model ném exception
-        session_manager.client = MagicMock()
-        session_manager.client.resolve_model.side_effect = Exception("Not found")
+            # Mock resolve_model ném exception
+            session_manager.client = MagicMock()
+            session_manager.client.resolve_model.side_effect = Exception("Not found")
 
-        code, err = await _local_switch_model("nonexistent-model-xyz")
-        self.assertEqual(code, 400)
-        self.assertEqual(err["error"]["code"], "model_not_available")
-        self.assertIn("nonexistent-model-xyz", err["error"]["message"])
-        # Bridge KHÔNG đổi model
-        self.assertEqual(session_manager.default_model, "gemini-pro")
-
-        # Case 4: Đổi model hợp lệ -> 200 và default_model đổi
-        with patch.object(session_manager, "switch_model", new_callable=AsyncMock) as mock_sw:
-            mock_sw.return_value = "gemini-flash"
-            code, res = await _local_switch_model("gemini-flash")
-            self.assertEqual(code, 200)
-            self.assertEqual(res["active_model"], "gemini-flash")
-
-            # Case 5: Real default aliases + keyword matching; fake lane aliases rejected
-            mock_sw.return_value = "gemini-pro"
-            code, res = await _local_switch_model("default")
-            self.assertEqual(code, 200)
-
-            code, res = await _local_switch_model("auto")
-            self.assertEqual(code, 200)
-
-            code, err = await _local_switch_model("lane-1")
+            code, err = await _local_switch_model("nonexistent-model-xyz")
             self.assertEqual(code, 400)
             self.assertEqual(err["error"]["code"], "model_not_available")
+            self.assertIn("nonexistent-model-xyz", err["error"]["message"])
+            # Bridge KHÔNG đổi model
+            self.assertEqual(session_manager.default_model, "gemini-pro")
 
-            code, err = await _local_switch_model("acc1")
-            self.assertEqual(code, 400)
-            self.assertEqual(err["error"]["code"], "model_not_available")
+            # Case 4: Đổi model hợp lệ -> 200 và default_model đổi
+            with patch.object(session_manager, "switch_model", new_callable=AsyncMock) as mock_sw:
+                mock_sw.return_value = "gemini-flash"
+                code, res = await _local_switch_model("gemini-flash")
+                self.assertEqual(code, 200)
+                self.assertEqual(res["active_model"], "gemini-flash")
 
-            mock_sw.return_value = "gemini-flash"
-            code, res = await _local_switch_model("gemini-2.0-flash")
-            self.assertEqual(code, 200)
-            self.assertEqual(res["active_model"], "gemini-flash")
+                # Case 5: Real default aliases + keyword matching; fake lane aliases rejected
+                mock_sw.return_value = "gemini-pro"
+                code, res = await _local_switch_model("default")
+                self.assertEqual(code, 200)
+
+                code, res = await _local_switch_model("auto")
+                self.assertEqual(code, 200)
+
+                code, err = await _local_switch_model("lane-1")
+                self.assertEqual(code, 400)
+                self.assertEqual(err["error"]["code"], "model_not_available")
+
+                code, err = await _local_switch_model("acc1")
+                self.assertEqual(code, 400)
+                self.assertEqual(err["error"]["code"], "model_not_available")
+
+                mock_sw.return_value = "gemini-flash"
+                code, res = await _local_switch_model("gemini-2.0-flash")
+                self.assertEqual(code, 200)
+                self.assertEqual(res["active_model"], "gemini-flash")
+        finally:
+            (
+                session_manager.state,
+                session_manager.auth_ok,
+                session_manager.available_models,
+                session_manager.default_model,
+                session_manager.client,
+            ) = orig
 
     async def test_lane_models_format(self):
         from main import _local_lane_models, session_manager
 
-        session_manager.default_model = "gemini-flash"
-        session_manager.available_models = ["unspecified", "gemini-flash"]
-        session_manager.model_details = [
-            {"name": "gemini-flash", "display_name": "Gemini 1.5 Flash"}
-        ]
+        orig = (
+            session_manager.default_model,
+            list(session_manager.available_models),
+            list(session_manager.model_details),
+        )
+        try:
+            session_manager.default_model = "gemini-flash"
+            session_manager.available_models = ["unspecified", "gemini-flash"]
+            session_manager.model_details = [
+                {"name": "gemini-flash", "display_name": "Gemini 1.5 Flash"}
+            ]
 
-        models_data = _local_lane_models()
-        self.assertEqual(models_data["current"], "gemini-flash")
-        avail = models_data["available"]
-        self.assertEqual(len(avail), 2)
-        # unspecified phải có nhãn "Mặc định (unspecified)"
-        self.assertEqual(avail[0], {"id": "unspecified", "label": "Mặc định (unspecified)"})
-        self.assertEqual(avail[1], {"id": "gemini-flash", "label": "Gemini 1.5 Flash"})
+            models_data = _local_lane_models()
+            self.assertEqual(models_data["current"], "gemini-flash")
+            avail = models_data["available"]
+            self.assertEqual(len(avail), 2)
+            # unspecified phải có nhãn "Mặc định (unspecified)"
+            self.assertEqual(avail[0], {"id": "unspecified", "label": "Mặc định (unspecified)"})
+            self.assertEqual(avail[1], {"id": "gemini-flash", "label": "Gemini 1.5 Flash"})
+        finally:
+            (
+                session_manager.default_model,
+                session_manager.available_models,
+                session_manager.model_details,
+            ) = orig
 
     async def test_lane_proxy_endpoints(self):
         from main import (

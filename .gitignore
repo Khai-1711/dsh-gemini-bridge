@@ -13,9 +13,10 @@ logs/
 .bridge_session.json
 .bridge_session_*.json
 
-# Cookie cache của gemini-webapi (BÍ MẬT)
+# Cookie cache & Profile Vault (BÍ MẬT — KHÔNG BAO GIỜ COMMIT)
 .gemini_cookies/
 .gemini_cookies_*/
+.cookie_profiles/
 
 # Quota & Accounts
 .bridge_accounts*.json

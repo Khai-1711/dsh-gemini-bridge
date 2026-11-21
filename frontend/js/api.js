@@ -128,6 +128,12 @@ export async function authFetch(url, options = {}) {
   return res;
 }
 
+function extractErrorMessage(data, fallback) {
+  if (!data) return fallback;
+  if (typeof data.error === "string" && data.error.trim()) return data.error;
+  return data.error?.message || data.detail || data.message || fallback;
+}
+
 export const api = {
   /**
    * Lấy tình trạng sức khỏe tối thiểu công khai (/health)
@@ -172,7 +178,7 @@ export const api = {
       body: JSON.stringify({ model: modelName, keep_chat: keepChat }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Không thể chuyển model");
+    if (!res.ok) throw new Error(extractErrorMessage(data, "Không thể chuyển model"));
     return data;
   },
 
@@ -186,7 +192,7 @@ export const api = {
       body: JSON.stringify({ SECURE_1PSID: psid, SECURE_1PSIDTS: psidts }),
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Cập nhật cookie thất bại");
+    if (!res.ok) throw new Error(extractErrorMessage(data, "Cập nhật cookie thất bại"));
     return data;
   },
 
@@ -196,7 +202,7 @@ export const api = {
   async resetSession() {
     const res = await authFetch(`${API_BASE}/v1/reset`, { method: "POST" });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Reset session thất bại");
+    if (!res.ok) throw new Error(extractErrorMessage(data, "Reset session thất bại"));
     return data;
   },
 
@@ -206,7 +212,7 @@ export const api = {
   async clearCache() {
     const res = await authFetch(`${API_BASE}/v1/cache/clear`, { method: "POST" });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "Xóa cache thất bại");
+    if (!res.ok) throw new Error(extractErrorMessage(data, "Xóa cache thất bại"));
     return data;
   },
 
@@ -374,11 +380,14 @@ export const api = {
    * Thử bật lại Cổng 10000 thông qua các luồng worker
    */
   async spawnGateway() {
+    const headers = { "Content-Type": "application/json" };
+    const key = getStoredApiKey();
+    if (key) headers["Authorization"] = `Bearer ${key}`;
     for (const port of [10001, 10002]) {
       try {
         const res = await fetch(`http://127.0.0.1:${port}/v1/gateway/spawn`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
         });
         if (res.ok) {
           return await res.json();
@@ -388,6 +397,73 @@ export const api = {
       }
     }
     throw new Error("Không thể kết nối tới các luồng để khởi chạy lại Cổng 10000.");
+  },
+
+  /**
+   * Profile Vault & Auto Cookie Sync (loopback-only)
+   */
+  async listProfiles() {
+    const res = await authFetch(`${API_BASE}/v1/profiles`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
+    return data;
+  },
+
+  async loginProfile(profileId, { laneId = "", slot = 0, label = "" } = {}) {
+    const res = await authFetch(`${API_BASE}/v1/profiles/${encodeURIComponent(profileId)}/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lane_id: laneId, slot, label }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
+    return data;
+  },
+
+  async finishProfileLogin(profileId) {
+    const res = await authFetch(`${API_BASE}/v1/profiles/${encodeURIComponent(profileId)}/finish-login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
+    return data;
+  },
+
+  async syncProfile(profileId, { laneId, slot, label } = {}) {
+    const body = {};
+    if (laneId !== undefined) body.lane_id = laneId;
+    if (slot !== undefined) body.slot = slot;
+    if (label !== undefined) body.label = label;
+    const res = await authFetch(`${API_BASE}/v1/profiles/${encodeURIComponent(profileId)}/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
+    return data;
+  },
+
+  async syncAllProfiles(laneId = "") {
+    const res = await authFetch(`${API_BASE}/v1/profiles/sync-all`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(laneId ? { lane_id: laneId } : {}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
+    return data;
+  },
+
+  async deleteProfile(profileId) {
+    const res = await authFetch(`${API_BASE}/v1/profiles/${encodeURIComponent(profileId)}`, {
+      method: "DELETE",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(extractErrorMessage(data, `HTTP ${res.status}`));
+    return data;
   },
 };
 

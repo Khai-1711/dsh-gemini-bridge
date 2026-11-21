@@ -83,6 +83,29 @@ def spawn_local_lane(lane_id: str) -> bool:
             return False
 
         env = os.environ.copy()
+        # Không truyền rò rỉ biến cấu hình/cookie của tiến trình Gateway cha sang worker con
+        for leak_key in (
+            "GEMINI_COOKIE_PATH",
+            "SECURE_1PSID",
+            "SECURE_1PSIDTS",
+            "BACKUP_1PSID",
+            "BACKUP_1PSIDTS",
+            "BACKUP_1_LABEL",
+            "BACKUP_2PSID",
+            "BACKUP_2PSIDTS",
+            "BACKUP_2_LABEL",
+            "BACKUP_3PSID",
+            "BACKUP_3PSIDTS",
+            "BACKUP_3_LABEL",
+            "BACKUP_4PSID",
+            "BACKUP_4PSIDTS",
+            "BACKUP_4_LABEL",
+            "INSTANCE_LABEL",
+            "PORT",
+            "PEER_LANES",
+            "GATEWAY_MODE",
+        ):
+            env.pop(leak_key, None)
         if not is_gw:
             env["BRIDGE_INSTANCE"] = lane_id
         else:
@@ -184,6 +207,8 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
         },
         "accounts": accs,
         "model": getattr(manager, "default_model", "unspecified") or "unspecified",
+        "available_models": list(getattr(manager, "available_models", []) or []),
+        "turn_count": int(getattr(manager, "turn_count", 0) or 0),
         "requests": getattr(manager, "total_requests", 0),
         "errors": getattr(manager, "total_errors", 0),
         "uptime_s": max(0, uptime_s),
@@ -261,6 +286,8 @@ def _format_remote_status(lane_id: str, base_url: str, data: dict, controllable:
         },
         "accounts": accs,
         "model": data.get("model", "unspecified") or "unspecified",
+        "available_models": list(data.get("available_models") or []),
+        "turn_count": int(data.get("turn_count", 0) or 0),
         "requests": data.get("total_requests", 0),
         "errors": data.get("total_errors", 0),
         "uptime_s": int(uptime_s),
@@ -349,9 +376,19 @@ class LaneRegistry:
                 cached = self._peer_status_cache.get(peer_id)
                 cached_ts = self._peer_cache_ts.get(peer_id, 0.0)
             cached_age = now - cached_ts
-            if not force_refresh and cached and (cached_age < self.cache_ttl) and (
-                cached.get("reachable") is False or cached.get("control") == "off"
-            ):
+            is_down_or_off = bool(
+                cached and (cached.get("reachable") is False or cached.get("control") == "off")
+            )
+            online_ttl = min(1.5, self.cache_ttl) if self.cache_ttl > 0 else 0.0
+            cache_valid = bool(
+                not force_refresh
+                and cached
+                and (
+                    (is_down_or_off and cached_age < self.cache_ttl)
+                    or (not is_down_or_off and online_ttl > 0 and cached_age < online_ttl)
+                )
+            )
+            if cache_valid:
                 cached_lane = dict(cached)
                 chk_has, chk_file = check_env_file_id(peer_id)
                 cached_lane.update({
@@ -375,7 +412,7 @@ class LaneRegistry:
 
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for (p_id, p_url), res in zip(peer_ids, results):
+            for (p_id, p_url), res in zip(peer_ids, results, strict=False):
                 chk_has, chk_file = check_env_file_id(p_id)
                 if isinstance(res, Exception) or not isinstance(res, tuple) or res[0] == 0:
                     err_msg = res[1].get("error", "unreachable") if (isinstance(res, tuple) and len(res) > 1 and isinstance(res[1], dict)) else str(res)

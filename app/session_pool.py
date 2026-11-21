@@ -21,7 +21,7 @@ def _gs():
 
 @dataclass
 class SessionSlot:
-    """Ngăn phiên chat độc lập cho từng hội thoại/subagent (cô lập cid/rid/rcid)."""
+    """Ngăn phiên chat độc lập cho từng hội thoại/subagent (cô lập cid/rid/rcid và model)."""
 
     session_key: str
     chat_session: Any = None
@@ -33,6 +33,7 @@ class SessionSlot:
     model: str = "unspecified"
     ledger: Any = None
     is_subagent: bool = False
+    workspace_root: str = ""
 
 
 def _message_text_for_session_key(content: Any) -> Tuple[str, bool]:
@@ -46,7 +47,7 @@ def _message_text_for_session_key(content: Any) -> Tuple[str, bool]:
                 continue
             if part.get("type") == "text":
                 texts.append(str(part.get("text", "")))
-            elif part.get("type") == "image_url":
+            elif part.get("type") in ("image_url", "image"):
                 has_image = True
         return "\n".join(texts), has_image
     return str(content or ""), False
@@ -160,7 +161,13 @@ def _tool_header_fingerprint(header: str) -> str:
 
 
 class SessionPoolMixin:
-    """Mixin quản lý Sticky Session Pool, metadata và lưu/khôi phục ChatSession."""
+    """Mixin quản lý Sticky Session Pool, model độc lập theo slot, metadata và lưu/khôi phục ChatSession."""
+
+    def _current_slot_model(self) -> str:
+        slot_model = str(getattr(self, "_active_slot_model", "") or "").strip()
+        if slot_model:
+            return slot_model
+        return str(getattr(self, "default_model", "unspecified") or "unspecified").strip() or "unspecified"
 
     def _create_new_chat_session(
         self,
@@ -168,13 +175,20 @@ class SessionPoolMixin:
         model_override: Optional[str] = None,
     ) -> None:
         kwargs = {}
-        target_model = self.default_model if model_override is None else model_override
-        if target_model and target_model != "unspecified":
-            kwargs["model"] = str(target_model)
+        target_model = (
+            str(model_override).strip()
+            if model_override is not None
+            else self._current_slot_model()
+        )
+        if not target_model:
+            target_model = "unspecified"
+        if target_model != "unspecified":
+            kwargs["model"] = target_model
         if preserve_metadata:
             kwargs["metadata"] = preserve_metadata
 
         self.chat_session = self.client.start_chat(**kwargs)
+        self._active_slot_model = target_model
         if not preserve_metadata:
             self.session_initialized = False
             self.turn_count = 0
@@ -199,9 +213,10 @@ class SessionPoolMixin:
             tool_header_sent=bool(self.tool_header_sent),
             chat_tool_header_hash=str(getattr(self, "chat_tool_header_hash", "") or ""),
             last_used_ts=time.time(),
-            model=str(self.default_model or "unspecified"),
+            model=self._current_slot_model(),
             ledger=getattr(self, "ledger", None),
             is_subagent=bool(getattr(self, "_active_is_subagent", False)),
+            workspace_root=str(getattr(self, "_active_workspace_root", "") or ""),
         )
 
     def _ensure_slot_ledger(self, session_key: str, is_subagent: bool) -> FactLedger:
@@ -245,8 +260,59 @@ class SessionPoolMixin:
             _, oldest_key = min(candidates)
             pool.pop(oldest_key, None)
 
+    def ensure_slot_model_locked(
+        self, target_model: Optional[str], keep_chat: bool = True
+    ) -> str:
+        """Đảm bảo CHỈ slot đang active dùng đúng `target_model` (không sửa `default_model` hay slot khác)."""
+        desired = str(target_model or "").strip()
+        if not desired or desired.lower() in ("default", "auto", "none", "gemini"):
+            desired = self._current_slot_model()
+        if not desired:
+            desired = "unspecified"
+
+        current_model = self._current_slot_model()
+        chat_model_attr = getattr(self.chat_session, "model", None) if self.chat_session is not None else None
+        if isinstance(chat_model_attr, str) and chat_model_attr.strip():
+            current_chat_model = chat_model_attr.strip()
+        elif self.chat_session is not None and current_model == "unspecified":
+            current_chat_model = "unspecified"
+        else:
+            current_chat_model = current_model
+
+        if (
+            self.chat_session is not None
+            and keep_chat
+            and desired == current_model
+            and desired == current_chat_model
+        ):
+            self._active_slot_model = desired
+            pool = self._ensure_session_pool()
+            if self._active_session_key in pool:
+                pool[self._active_session_key].model = desired
+            return desired
+
+        saved_meta = (
+            list(self.chat_session.metadata)
+            if (keep_chat and self.chat_session is not None and hasattr(self.chat_session, "metadata"))
+            else None
+        )
+        self._create_new_chat_session(preserve_metadata=saved_meta, model_override=desired)
+        if saved_meta:
+            self.tool_header_sent = False
+            self.chat_tool_header_hash = ""
+        self._sync_active_session_slot()
+        logger.info(
+            f"[SLOT-MODEL] Slot '{self._active_session_key[:12]}': [{current_model}] --> [{desired}]"
+        )
+        return desired
+
     def _activate_session_slot_locked(
-        self, session_key: str, is_new_conversation: bool, is_subagent: bool = False
+        self,
+        session_key: str,
+        is_new_conversation: bool,
+        is_subagent: bool = False,
+        requested_model: Optional[str] = None,
+        workspace_root: str = "",
     ) -> SessionSlot:
         target_key = str(session_key or "default").strip() or "default"
         pool = self._ensure_session_pool()
@@ -254,10 +320,16 @@ class SessionPoolMixin:
         has_dirty_chat = bool(
             self.chat_session is not None and getattr(self.chat_session, "cid", None)
         )
-        if active_key and (self.turn_count > 0 or has_dirty_chat):
+        if active_key and (self.turn_count > 0 or has_dirty_chat or active_key in pool):
             pool[active_key] = self._snapshot_current_slot(active_key)
 
         self._evict_session_pool_locked({target_key, active_key})
+
+        desired_new_model = (
+            str(requested_model or "").strip()
+            if requested_model and str(requested_model).strip().lower() not in ("default", "auto", "none", "gemini")
+            else str(getattr(self, "default_model", "unspecified") or "unspecified").strip() or "unspecified"
+        )
 
         if is_new_conversation:
             existing_target = pool.get(target_key)
@@ -279,9 +351,19 @@ class SessionPoolMixin:
                 )
                 for key, slot in pool.items()
             )
-            if target_was_used or self.turn_count > 0 or has_dirty_chat or other_active_slots:
-                self._create_new_chat_session(preserve_metadata=None)
+            if (
+                target_was_used
+                or self.turn_count > 0
+                or has_dirty_chat
+                or other_active_slots
+                or self.chat_session is None
+                or self._current_slot_model() != desired_new_model
+            ):
+                self._create_new_chat_session(preserve_metadata=None, model_override=desired_new_model)
+            else:
+                self._active_slot_model = desired_new_model
             self._active_is_subagent = bool(is_subagent)
+            self._active_workspace_root = str(workspace_root or "").strip()
             self.ledger = self._ensure_slot_ledger(target_key, self._active_is_subagent)
             pool[target_key] = self._snapshot_current_slot(target_key)
         elif target_key == active_key:
@@ -295,6 +377,10 @@ class SessionPoolMixin:
                 )
             )
             self._active_is_subagent = slot_is_subagent
+            if workspace_root:
+                self._active_workspace_root = str(workspace_root).strip()
+            elif existing_slot and existing_slot.workspace_root:
+                self._active_workspace_root = existing_slot.workspace_root
             self.ledger = (
                 existing_slot.ledger
                 if existing_slot and existing_slot.ledger is not None
@@ -303,6 +389,7 @@ class SessionPoolMixin:
             if target_key in pool:
                 pool[target_key].ledger = self.ledger
                 pool[target_key].is_subagent = self._active_is_subagent
+                pool[target_key].workspace_root = getattr(self, "_active_workspace_root", "")
                 pool[target_key].last_used_ts = time.time()
             else:
                 pool[target_key] = self._snapshot_current_slot(target_key)
@@ -313,6 +400,9 @@ class SessionPoolMixin:
             self.turn_count = slot.turn_count
             self.tool_header_sent = slot.tool_header_sent
             self.chat_tool_header_hash = slot.chat_tool_header_hash
+            self._active_slot_model = slot.model or self.default_model or "unspecified"
+            self._active_workspace_root = str(workspace_root or slot.workspace_root or "").strip()
+            slot.workspace_root = self._active_workspace_root
             slot.is_subagent = bool(is_subagent or slot.is_subagent)
             if slot.ledger is None:
                 slot.ledger = self._ensure_slot_ledger(target_key, slot.is_subagent)
@@ -320,23 +410,42 @@ class SessionPoolMixin:
             self.ledger = slot.ledger
             slot.last_used_ts = time.time()
         else:
-            if self.turn_count > 0 or has_dirty_chat:
-                self._create_new_chat_session(preserve_metadata=None)
+            if (
+                self.turn_count > 0
+                or has_dirty_chat
+                or self.chat_session is None
+                or self._current_slot_model() != desired_new_model
+            ):
+                self._create_new_chat_session(preserve_metadata=None, model_override=desired_new_model)
+            else:
+                self._active_slot_model = desired_new_model
             self._active_is_subagent = bool(is_subagent)
+            self._active_workspace_root = str(workspace_root or "").strip()
             self.ledger = self._ensure_slot_ledger(target_key, self._active_is_subagent)
             pool[target_key] = self._snapshot_current_slot(target_key)
 
         self._active_session_key = target_key
+        if requested_model:
+            self.ensure_slot_model_locked(requested_model, keep_chat=True)
         self._evict_session_pool_locked({target_key})
         return pool[target_key]
 
     async def activate_session_slot(
-        self, session_key: str, is_new_conversation: bool, is_subagent: bool = False
+        self,
+        session_key: str,
+        is_new_conversation: bool,
+        is_subagent: bool = False,
+        requested_model: Optional[str] = None,
+        workspace_root: str = "",
     ) -> SessionSlot:
         acquired_here = await self.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
         try:
             return self._activate_session_slot_locked(
-                session_key, is_new_conversation, is_subagent=is_subagent
+                session_key,
+                is_new_conversation,
+                is_subagent=is_subagent,
+                requested_model=requested_model,
+                workspace_root=workspace_root,
             )
         finally:
             self.release_turn_lock(acquired_here)
@@ -396,7 +505,8 @@ class SessionPoolMixin:
             if saved_model and saved_model != "unspecified":
                 self.default_model = str(saved_model)
             self._ensure_default_model()
-            self._create_new_chat_session(preserve_metadata=list(meta))
+            self._active_slot_model = self.default_model
+            self._create_new_chat_session(preserve_metadata=list(meta), model_override=self.default_model)
             saved_header_hash = saved.get("tool_header_hash")
             self.chat_tool_header_hash = (
                 saved_header_hash if isinstance(saved_header_hash, str) else ""
@@ -404,6 +514,7 @@ class SessionPoolMixin:
             self.session_initialized = True
             self.tool_header_sent = bool(self.chat_tool_header_hash)
             self.turn_count = 0
+            self._sync_active_session_slot()
             logger.info(f"Đã khôi phục phiên chat cũ (cid={meta[0]}).")
             return True
         except Exception as e:
@@ -430,11 +541,14 @@ class SessionPoolMixin:
     async def reset_session(self) -> None:
         acquired_here = await self.acquire_turn_lock(LOCK_ACQUIRE_TIMEOUT)
         try:
-            self._create_new_chat_session()
+            self._active_slot_model = self.default_model
+            self._active_workspace_root = ""
+            self._create_new_chat_session(model_override=self.default_model)
             self._ensure_session_pool().clear()
             self._active_session_key = "default"
             self._active_is_subagent = False
             self.ledger = self._ensure_slot_ledger("default", False)
+            self._sync_active_session_slot()
             clear_saved_session()
             logger.info(f"Đã làm mới phiên ChatSession (Model: {self.default_model}).")
         finally:
