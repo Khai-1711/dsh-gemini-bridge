@@ -19,6 +19,47 @@
 
 ---
 
+## 핵심 기술 보고서 (요약)
+
+### 1. 해결 과제 및 주요 개선 사항 (v1 → v3.2)
+
+| 영역 | 기존 웹 래퍼의 한계 | DSH Bridge v3.2의 핵심 개선 |
+|---|---|---|
+| **세션 및 인증** | DevTools 수동 복사 필요; `osid=1` 리다이렉트로 `1PSID+1PSIDTS` 단독 전송 거부; `gemini-webapi` HTTP 400 재귀 `_lock` 데드락 | **Profile Vault + 헤드리스 CDP 동기화** (`app/cookie_sync.py`): 1회 실브라우저 로그인, 2~4초 헤드리스 전체 쿠키(`OSID`, `SID`, `1PSID`, `1PSIDTS`, `1PSIDCC`, `NID`) 자동 추출, 열린 탭 0개, `25s` 데드락 방지 `_safe_init_client` |
+| **모델 및 세션 격리** | 하드코딩된 모델 우선순위; 병렬 에이전트 간 모델·세션 오염 | **100% 사용자 선택 모델 & `SessionSlot` 풀** (`app/session_pool.py`): 대화별 `(cid/rid/rcid, model, workspace, FactLedger)` 완전 격리; `FALLBACK_MODEL` 명시적 선택(Opt-in) |
+| **도구 호출 신뢰성** | Gemini Web의 URL 자동 링크 변환(`[http://...](http://...)`), 손상된 JSON 및 `<tool_call>` 잘림 | **Fail-Closed 게이트 + 자가 수정** (`app/streaming.py`, `app/tool_parser.py`): 백틱 안전 $O(N)$ FSM 스트리머, 재귀적 URL 복원, `json-repair`, 1회 내부 자가 수정 및 빈 응답 1회 재시도 |
+| **멀티 에이전트 동시성** | 락 획득 전 SSE `200` 응답(페일오버 불가); 병렬 도구 대량 결과 시 추론 타임아웃 | **사전 SSE 턴 락(`429` 실제 페일오버)** + **Sticky/Least-Inflight 게이트웨이** (`app/gateway_router.py`) + **36k 공정 도구 예산** + **180s/120s/420s** 완주 우선 타임아웃 |
+| **워크스페이스 보안** | 특정 드라이브(`D:\ABC`) 고정으로 일반 프로젝트 차단 | **동적 워크스페이스 개방** (`app/security.py`): 모든 드라이브의 IDE 작업 폴더를 자동 추적하며 OS 파괴 명령/경로만 차단 |
+
+### 2. 적용된 핵심 알고리즘
+- **단일 패스 SSE 억제 FSM (`app/streaming.py`):** $O(N)$ 유한 상태 기계 + 접두사 룩어헤드 + 인라인 백틱 추적으로 일반 텍스트 내 `` `<tool_call>` `` 언급은 유지하고 실제 호출 태그만 분리.
+- **결정적 파싱 및 제한된 자가 수정 (`app/tool_parser.py`, `app/openai_adapter.py`):** 문자열 인식 괄호 스캐너, 외부 후행 쉼표 제거, `json-repair`, JSON Schema 검증, 1회 진단 피드백 재시도.
+- **중요도 보존 절단 (`app/prompt_builder.py`):** 앞(2/3) + 뒤(1/3) + 중간 오류/스택트레이스 추출 + 병렬 도구 결과 공정 예산 분할 + 세션 복구용 `Context Bootstrap`.
+- **Sticky Least-Inflight 라우팅 및 서킷 브레이커 (`app/gateway_router.py`):** 대화 고정(`3600s`), 최소 부하 워커 선택, 모델 지원 필터링, `15s` 장애 쿨다운.
+- **무의존성 RFC 6455 CDP 클라이언트 (`app/cookie_sync.py`):** 순수 Python `asyncio` WebSocket 프레이밍(7/16/64비트, 분할 프레임 재조립, Ping/Pong)과 `asyncio.Semaphore(1)` 순차 실행.
+
+### 3. 참고 연구 논문 및 기술 표준
+- **ReAct** — Yao et al. (ICLR 2023), *Synergizing Reasoning and Acting in Language Models*.
+- **Toolformer** — Schick et al. (NeurIPS 2023), *Language Models Can Teach Themselves to Use Tools*.
+- **Reflexion & Self-Refine** — Shinn et al. (NeurIPS 2023) & Madaan et al. (NeurIPS 2023).
+- **Lost in the Middle** — Liu et al. (TACL 2024), *How Language Models Use Long Contexts*.
+- **Load Balancing & Resilience** — Mitzenmacher (2001), *The Power of Two Choices*; Nygard (2018), *Release It!* (Circuit Breaker & Bulkhead).
+- **표준 프로토콜:** RFC 6455 (WebSocket), RFC 8259 & JSON Schema Draft 2020-12, Chrome DevTools Protocol (CDP), WHATWG SSE.
+
+### 4. 활용 오픈소스 저장소 및 개선 기여
+
+| 오픈소스 저장소 | 프로젝트 내 역할 | 본 프로젝트의 고도화·확장 내역 |
+|---|---|---|
+| [`HanaokaYuzu/Gemini-API`](https://github.com/HanaokaYuzu/Gemini-API) (`gemini-webapi`) | Gemini Web `ChatSession`, `batchexecute`, `RotateCookies` | HTTP 400 데드락 방지 `_safe_init_client`, Chrome CDP 전체 쿠키 주입(`osid=1` 해결), 워커별 `GEMINI_COOKIE_PATH` 격리 |
+| [`mangiucugna/json_repair`](https://github.com/mangiucugna/json_repair) | 비정상 JSON 복구 | 문자열 인식 스캐너, URL 언링크, 인자 별칭 정규화 및 엄격한 JSON Schema Fail-Closed 게이트 결합 |
+| [`fastapi/fastapi`](https://github.com/fastapi/fastapi) · [`encode/uvicorn`](https://github.com/encode/uvicorn) · [`encode/httpx`](https://github.com/encode/httpx) | 비동기 OpenAI 호환 서버 및 게이트웨이 프록시 | 사전 SSE 턴 락, 제로 버퍼 스트리밍(`read=None`), `2.5s` 하트비트, 루프백·Origin 보안 미들웨어 |
+| [`lexiforest/curl_cffi`](https://github.com/lexiforest/curl_cffi) | 브라우저 TLS/HTTP2 모방 (`gemini-webapi` 내부) | 장시간 추론 모델을 위한 `420s` 스트림 / `180s` 워치독 타임아웃 최적화 |
+| **DeepSeek Harness (`pi-ai`) & OpenAI SDK 클라이언트** | 대상 코딩 에이전트 생태계 | `/v1/chat/completions`·`/v1/responses` 완전 호환, `<5ms` 로컬 제목 생성, 다중 서브에이전트 병렬 분산 |
+
+> 📄 상세 아키텍처 다이어그램 및 복잡도 분석: [docs/ARCHITECTURE.ko.md](ARCHITECTURE.ko.md)
+
+---
+
 ## 디렉터리 구조
 
 ```text

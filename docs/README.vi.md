@@ -19,6 +19,47 @@
 
 ---
 
+## Báo Cáo Kỹ Thuật Tóm Tắt
+
+### 1. Bài Toán & Các Cải Tiến Cốt Lõi (v1 → v3.2)
+
+| Hạng mục | Hạn chế của wrapper web thuần | Cải tiến thực tế trong DSH Bridge v3.2 |
+|---|---|---|
+| **Phiên & Xác thực** | Phải copy cookie F12 thủ công; Google `osid=1` từ chối nếu chỉ gửi `1PSID+1PSIDTS`; deadlock `_lock` trong `gemini-webapi` khi gặp HTTP 400 | **Profile Vault + Headless CDP Sync** (`app/cookie_sync.py`): đăng nhập thật 1 lần, sync ngầm 2–4 giây lấy đủ bộ cookie (`OSID`, `SID`, `1PSID`, `1PSIDTS`, `1PSIDCC`, `NID`), **0 tab mở**, kèm chốt phá deadlock `25s` `_safe_init_client` |
+| **Model & Cô lập phiên** | Hardcode model ưu tiên; đổi model làm trộn phiên giữa các agent song song | **100% Model do người dùng chọn & `SessionSlot` Pool** (`app/session_pool.py`): tách biệt `(cid/rid/rcid, model, workspace, FactLedger)` theo từng hội thoại; `FALLBACK_MODEL` chỉ bật khi người dùng chọn |
+| **Độ tin cậy gọi Tool** | Gemini Web tự biến URL thành link Markdown (`[http://...](http://...)`), xuất JSON lỗi hoặc cắt cụt `<tool_call>` | **Cổng Fail-Closed + Tự sửa nội bộ** (`app/streaming.py`, `app/tool_parser.py`): Streamer FSM $O(N)$ chống nuốt backtick, đệ quy gỡ URL auto-link, `json-repair`, tự sửa kín 1 vòng và thử lại 1 lần khi trả rỗng |
+| **Đa luồng & Model Thinking** | Mở SSE `200` trước khi lấy khóa (mất failover); đọc nhiều file song song làm model thinking bị cắt timeout sớm | **Lấy Turn Lock trước SSE (`429` failover thật)** + **Gateway Sticky/Least-Inflight** (`app/gateway_router.py`) + **ngân sách tool 36k** + **timeout 180s/120s/420s** ưu tiên làm xong trọn vẹn |
+| **An toàn Workspace** | Khóa cứng ổ `D:\ABC`, chặn nhầm dự án trên ổ `C:`/`E:` | **Mở khóa Workspace động** (`app/security.py`): bám theo thư mục IDE trên mọi ổ đĩa, chỉ chặn đường dẫn/lệnh phá hệ điều hành |
+
+### 2. Các Thuật Toán Chính Đã Áp Dụng
+- **Streamer FSM 1 lượt duyệt (`app/streaming.py`):** Độ phức tạp $O(N)$ với bộ đệm nhìn trước tiền tố và theo dõi dấu `` ` `` để ẩn `<tool_call>` trong SSE mà không nuốt văn bản thường.
+- **Phân tích Tool Call & Tự sửa có trần (`app/tool_parser.py`, `app/openai_adapter.py`):** Bộ quét ngoặc nhận biết chuỗi, xóa dấu phẩy thừa ngoài chuỗi, `json-repair`, kiểm định JSON Schema và tự sửa tối đa 1 vòng phản hồi lỗi.
+- **Smart Truncate giữ vùng trọng yếu (`app/prompt_builder.py`):** Giữ Đầu (2/3) + Đuôi (1/3) + kéo các dòng lỗi/traceback ở giữa, chia ngân sách công bằng cho nhiều `tool_result` song song và tự bơm `Context Bootstrap` khi đổi phiên giữa chừng.
+- **Cân bằng tải Sticky + Least-Inflight + Circuit Breaker (`app/gateway_router.py`):** Ghim phiên (`3600s`), chọn worker ít tải nhất, lọc theo model khả dụng và nghỉ `15s` khi lỗi.
+- **Client CDP RFC 6455 thuần Python (`app/cookie_sync.py`):** Đóng/mở khung WebSocket chuẩn (7/16/64-bit, ghép frame phân mảnh, Ping/Pong) không cần thư viện ngoài, chạy tuần tự qua `asyncio.Semaphore(1)`.
+
+### 3. Bài Nghiên Cứu & Tiêu Chuẩn Tham Khảo
+- **ReAct** — Yao et al. (ICLR 2023), *Synergizing Reasoning and Acting in Language Models*.
+- **Toolformer** — Schick et al. (NeurIPS 2023), *Language Models Can Teach Themselves to Use Tools*.
+- **Reflexion & Self-Refine** — Shinn et al. (NeurIPS 2023) & Madaan et al. (NeurIPS 2023).
+- **Lost in the Middle** — Liu et al. (TACL 2024), *How Language Models Use Long Contexts*.
+- **Load Balancing & Resilience** — Mitzenmacher (2001), *The Power of Two Choices*; Nygard (2018), *Release It!* (Circuit Breaker & Bulkhead).
+- **Tiêu chuẩn kỹ thuật:** RFC 6455 (WebSocket), RFC 8259 & JSON Schema Draft 2020-12, Chrome DevTools Protocol (CDP), WHATWG SSE.
+
+### 4. Các Repo Mã Nguồn Mở Tham Gia & Điểm Đã Cải Tiến
+
+| Repo / Dự án nguồn | Vai trò trong hệ thống | Cải tiến & mở rộng tại DSH Bridge |
+|---|---|---|
+| [`HanaokaYuzu/Gemini-API`](https://github.com/HanaokaYuzu/Gemini-API) (`gemini-webapi`) | Lõi kết nối Gemini Web (`ChatSession`, `batchexecute`, `RotateCookies`) | Bọc `_safe_init_client` phá deadlock HTTP 400, bơm đủ bộ cookie qua CDP (sửa lỗi `osid=1`), cô lập `GEMINI_COOKIE_PATH` theo từng worker |
+| [`mangiucugna/json_repair`](https://github.com/mangiucugna/json_repair) | Phục hồi JSON bị lỗi cú pháp | Kết hợp bộ quét chuỗi $O(N)$, gỡ auto-link URL, chuẩn hóa alias tham số và kiểm định fail-closed theo JSON Schema |
+| [`fastapi/fastapi`](https://github.com/fastapi/fastapi) · [`encode/uvicorn`](https://github.com/encode/uvicorn) · [`encode/httpx`](https://github.com/encode/httpx) | Máy chủ ASGI chuẩn OpenAI & proxy Gateway | Lấy turn lock trước SSE, pass-through không đệm (`read=None`), heartbeat `2.5s`, khóa bảo mật loopback/Origin |
+| [`lexiforest/curl_cffi`](https://github.com/lexiforest/curl_cffi) | Giả lập TLS/HTTP2 trình duyệt (qua `gemini-webapi`) | Tinh chỉnh trần stream `420s` / watchdog `180s` cho các lượt thinking kéo dài |
+| **DeepSeek Harness (`pi-ai`) & OpenAI SDK Clients** | Hệ sinh thái Coding Agent đích | Tương thích trọn vẹn `/v1/chat/completions` & `/v1/responses`, đặt tiêu đề cục bộ `<5ms`, điều phối song song nhiều subagent |
+
+> 📄 Xem sơ đồ kiến trúc chi tiết và bảng độ phức tạp đầy đủ: [docs/ARCHITECTURE.vi.md](ARCHITECTURE.vi.md)
+
+---
+
 ## Cấu trúc thư mục
 
 ```text
