@@ -34,7 +34,12 @@ from app.config import (
 )
 from app.gemini_session import session_manager
 from app.gateway_router import GatewayRouter
-from app.lane_security import check_bind_safety, is_host_header_allowed, lane_token_ok
+from app.lane_security import (
+    check_bind_safety,
+    is_cross_site_browser_request,
+    is_host_header_allowed,
+    lane_token_ok,
+)
 from app.lanes import LaneRegistry, spawn_local_lane
 from app.prompt_builder import build_incremental_prompt_and_files  # noqa: F401
 
@@ -108,6 +113,18 @@ async def security_middleware(request: Request, call_next):
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "Host không được phép", "code": "host_not_allowed"}},
+        )
+
+    origin = request.headers.get("origin", "")
+    sec_fetch_site = request.headers.get("sec-fetch-site", "")
+    if is_cross_site_browser_request(request.method, origin, sec_fetch_site, ALLOWED_HOSTS):
+        safe_origin = origin.replace("\r", "").replace("\n", "")[:200]
+        logger.warning(
+            f"[SECURITY] Chặn cross-site request: method={request.method} path={request.url.path} origin={safe_origin}"
+        )
+        return JSONResponse(
+            status_code=403,
+            content={"error": {"message": "Cross-site request bị chặn", "code": "cross_site_blocked"}},
         )
 
     path = request.url.path

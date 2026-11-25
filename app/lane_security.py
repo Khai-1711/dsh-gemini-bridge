@@ -3,6 +3,7 @@ import hmac
 import ipaddress
 import re
 from typing import Dict, Iterable, Tuple
+from urllib.parse import urlsplit
 
 _RFC1918 = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,16}")
@@ -59,6 +60,50 @@ def is_host_header_allowed(host_header: str, extra_allowed: Iterable[str] = ()) 
     if is_loopback_host(host) or is_rfc1918_host(host):
         return True
     return host in {h.strip().lower() for h in extra_allowed if h and h.strip()}
+
+
+def is_cross_site_browser_request(
+    method: str,
+    origin: str,
+    sec_fetch_site: str,
+    extra_allowed: Iterable[str] = (),
+) -> bool:
+    """Chặn CSRF từ trang web lạ trong trình duyệt gọi vào bridge."""
+    if (method or "").strip().upper() in ("GET", "HEAD", "OPTIONS"):
+        return False
+    if (sec_fetch_site or "").strip().lower() == "cross-site":
+        return True
+    orig = (origin or "").strip()
+    if not orig:
+        return False
+    if orig.lower() == "null":
+        return True
+    if any(ch.isspace() or ch == "\\" for ch in orig):
+        return True
+    try:
+        parsed = urlsplit(orig)
+        port = parsed.port
+    except ValueError:
+        return True
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or parsed.netloc.endswith(":")
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is not None and port <= 0)
+    ):
+        return True
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return True
+    if ":" in hostname and not parsed.netloc.startswith("["):
+        return True
+    host_for_check = f"[{hostname}]" if ":" in hostname else hostname
+    return not is_host_header_allowed(host_for_check, extra_allowed)
 
 
 def parse_peer_lanes(raw: str, self_id: str) -> Dict[str, str]:
