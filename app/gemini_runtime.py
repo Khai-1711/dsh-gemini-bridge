@@ -1,6 +1,8 @@
 """Lõi điều phối hội thoại Gemini Web (transport, retry, model switch, streaming)."""
 import asyncio
 import contextlib
+import random
+import re
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -22,7 +24,14 @@ from app.config import (
     INSTANCE_ID,
     IS_GATEWAY_INSTANCE,
     LOCK_ACQUIRE_TIMEOUT,
+    MID_STREAM_RETRIES,
+    MID_STREAM_RETRY_DELAY,
+    NEW_CHAT_MIN_INTERVAL,
+    TURN_JITTER_MAX,
+    TURN_JITTER_MIN,
     PORT,
+    RATE_LIMIT_REST_AFTER,
+    RATE_LIMIT_REST_MINUTES,
     SECURE_1PSID,
     SECURE_1PSIDTS,
     TOOL_PROFILE,
@@ -46,7 +55,22 @@ from app.session_pool import (
     load_saved_session,
 )
 from app.status_view import build_manager_status
+from app.streaming import ToolCallAwareStreamer
 from app.vision import cleanup_temp_images
+
+_SECRET_IN_TEXT_RE = re.compile(r"(?i)(__Secure-[\w-]+|SECURE_1PSID\w*|SAPISID\w*|cookie)\s*[=:]\s*\S+")
+
+
+def _is_rate_limit_1213(exc: BaseException) -> bool:
+    """Mã 1213 của Gemini Web: Google cắt stream giữa chừng vì tài khoản đang bị bóp."""
+    return "error code: 1213" in str(exc) or "(1213)" in str(exc)
+
+
+def _exc_summary(exc: BaseException, limit: int = 300) -> str:
+    """Tên + thông điệp lỗi, gọn một dòng, che mọi thứ trông giống cookie."""
+    text = " ".join(f"{type(exc).__name__}: {exc}".split())
+    text = _SECRET_IN_TEXT_RE.sub(r"\1=***", text)
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _gs():
@@ -163,6 +187,8 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         self.start_time = time.time()
         self._consecutive_auth_errors = 0
         self._consecutive_transient_errors = 0
+        self._consecutive_rate_limits = 0
+        self.rest_until: float = 0.0
         self._using_backup = self.active_index > 0
         self.allow_guest: bool = ALLOW_GUEST_MODE
         self.is_guest: bool = False
@@ -234,6 +260,27 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         if acquired_here and self.lock.locked():
             self._lock_owner_task = None
             self.lock.release()
+
+    def is_resting(self) -> bool:
+        return time.time() < float(getattr(self, "rest_until", 0.0) or 0.0)
+
+    def _note_rate_limit(self, exc: BaseException) -> bool:
+        """Đếm 1213 liên tiếp; đủ ngưỡng thì cho luồng nghỉ. Trả True nếu VỪA bắt đầu nghỉ."""
+        if not _is_rate_limit_1213(exc):
+            return False
+        self._consecutive_rate_limits = getattr(self, "_consecutive_rate_limits", 0) + 1
+        if self._consecutive_rate_limits < RATE_LIMIT_REST_AFTER or RATE_LIMIT_REST_MINUTES <= 0:
+            return False
+        self.rest_until = time.time() + RATE_LIMIT_REST_MINUTES * 60
+        self._consecutive_rate_limits = 0
+        logger.warning(
+            "[REST] Google trả 1213 %d lần liên tiếp -> luồng này NGHỈ %.0f phút (tới %s); "
+            "gateway sẽ chuyển hội thoại mới sang luồng khác.",
+            RATE_LIMIT_REST_AFTER,
+            RATE_LIMIT_REST_MINUTES,
+            time.strftime("%H:%M:%S", time.localtime(self.rest_until)),
+        )
+        return True
 
     def force_release_stuck_turn_lock(self, acquired_here: bool = True) -> None:
         """Cưỡng chế nhả turn lock khi producer bị kẹt lúc hủy:
@@ -795,16 +842,26 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     image_deadline = _request_deadline(img_timeout)
 
             stage = "throttle"
+            if self.chat_session is None:
+                self._create_new_chat_session()
+            opens_new_chat = not getattr(self.chat_session, "cid", None)
+            gap = max(min_interval, NEW_CHAT_MIN_INTERVAL) if opens_new_chat else min_interval
+            if TURN_JITTER_MAX > 0 and self.last_request_ts > 0:
+                # Nhịp ngẫu nhiên giữa các lượt (chế độ chạy nền bền) — không đều tăm tắp như bot.
+                gap += random.uniform(TURN_JITTER_MIN, TURN_JITTER_MAX)
             elapsed = time.time() - self.last_request_ts
-            if elapsed < min_interval:
-                delay = min_interval - elapsed
+            if elapsed < gap:
+                delay = gap - elapsed
+                if opens_new_chat and delay > min_interval:
+                    logger.info(
+                        "[PACING] Mở chat mới trên tài khoản này: chờ %.1fs (cách request trước >= %.0fs).",
+                        delay,
+                        gap,
+                    )
                 if image_deadline is not None:
                     await asyncio.wait_for(asyncio.sleep(delay), timeout=_remaining_timeout(image_deadline))
                 else:
                     await asyncio.sleep(delay)
-
-            if self.chat_session is None:
-                self._create_new_chat_session()
 
             base_prompt = prompt_to_send
             if image_files and not self.vision_upload_available:
@@ -812,6 +869,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                 return
 
             attempt, quota_switches, failover_attempts, empty_retries = 0, 0, 0, 0
+            mid_stream_retries = 0
             max_failover_attempts = max(len(self.chain), 1)
             yielded_any = False
             requested_model = self._current_slot_model()
@@ -848,6 +906,10 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     and (initial_deadline - now_ts) > (first_byte_timeout + 10.0)
                 )
                 first_chunk_deadline = (now_ts + first_byte_timeout) if soft_fallback_eligible else None
+                # Bản sao bộ tách của adapter: biết client đã thấy chữ hiển thị nào chưa
+                # (<tool_call> bị giữ lại không tính) để quyết định có được thử lại giữa stream.
+                visible_probe = ToolCallAwareStreamer()
+                visible_emitted = False
                 try:
                     if BRIDGE_DEBUG_FAKE_QUOTA and not self._fake_quota_done:
                         self._fake_quota_done = True
@@ -869,6 +931,8 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         if delta:
                             yielded_any = True
                             full_text += delta
+                            if not visible_emitted and any(p.strip() for p in visible_probe.feed(delta)):
+                                visible_emitted = True
                             yield "delta", delta
                     self.last_request_ts = time.time()
                     reply = full_text.strip()
@@ -906,6 +970,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     self.turn_count += 1
                     self._consecutive_auth_errors = 0
                     self._consecutive_transient_errors = 0
+                    self._consecutive_rate_limits = 0
                     self._pending_handoff = None
                     if fallback_from is not None and hasattr(self.chat_session, "metadata"):
                         self._create_new_chat_session(
@@ -997,8 +1062,50 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         self._consecutive_auth_errors += 1
                     else:
                         self._consecutive_transient_errors += 1
+                    just_rested = self._note_rate_limit(exc)
                     if yielded_any:
-                        logger.warning("Stream failed after response began (%s).", type(exc).__name__)
+                        logger.warning(
+                            "Stream failed after response began (%s) | đã nhận %d ký tự, client %s chữ hiển thị.",
+                            _exc_summary(exc),
+                            len(full_text),
+                            "ĐÃ thấy" if visible_emitted else "chưa thấy",
+                        )
+                        if (
+                            not just_rested
+                            and not self.is_resting()
+                            and not visible_emitted
+                            and mid_stream_retries < MID_STREAM_RETRIES
+                            and fallback_from is None
+                            and image_deadline is None
+                            and not self._is_auth_error(exc)
+                            and self.client is not None
+                            and getattr(self, "auth_ok", False)
+                            and asyncio.get_running_loop().time()
+                            + MID_STREAM_RETRY_DELAY * (mid_stream_retries + 1)
+                            < stream_cap - 30.0
+                        ):
+                            mid_stream_retries += 1
+                            retry_wait = MID_STREAM_RETRY_DELAY * mid_stream_retries
+                            logger.warning(
+                                "[MID_STREAM_RETRY] Client chưa thấy chữ nào -> chờ %.1fs, khôi phục metadata "
+                                "trước lượt và thử lại (lần %d/%d).",
+                                retry_wait,
+                                mid_stream_retries,
+                                MID_STREAM_RETRIES,
+                            )
+                            if retry_wait > 0:
+                                await asyncio.sleep(retry_wait)
+                            if getattr(self, "_turn_epoch", 0) != my_epoch:
+                                return
+                            self._create_new_chat_session(
+                                preserve_metadata=saved_meta_before_send, model_override=requested_model
+                            )
+                            self._sync_active_session_slot()
+                            full_text = ""
+                            yielded_any = False
+                            # Adapter phải bỏ phần đã đệm của lần hỏng (vd. <tool_call> dở dang).
+                            yield "reset", None
+                            continue
                         err_cls = BridgeAuthError if self._is_auth_error(exc) else BridgeUpstreamError
                         msg = "Gemini authentication failed after streaming began." if err_cls is BridgeAuthError else "Gemini stream failed after response began."
                         if fallback_from is not None:
@@ -1008,7 +1115,11 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         yield "error", {"message": msg, "type": err_cls.err_type, "code": err_cls.code, "stage": stage}
                         return
 
-                    logger.warning(f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {exc}")
+                    logger.warning(f"Lỗi ChatSession stream (Lần {attempt + 1}/2): {_exc_summary(exc)}")
+                    if self.is_resting():
+                        # Tài khoản đang bị Google bóp: đừng gõ thêm, trả lỗi để client gửi lại -> gateway đổi luồng.
+                        yield "error", {"message": "Tài khoản Gemini của luồng này đang tạm nghỉ (Google giới hạn, mã 1213).", "type": BridgeUpstreamError.err_type, "code": "lane_resting", "stage": stage}
+                        return
                     if attempt == 0 and "1097" in str(exc):
                         retry_model = self._select_fallback_model(requested_model) or requested_model
                         logger.warning(

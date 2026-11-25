@@ -219,6 +219,7 @@ def build_local_lane_status(manager, port: int = 10000, instance_id: str = "", i
         "has_env_id": bool(has_env_id),
         "env_file": str(env_file),
         "id_status": str(id_status),
+        "lane_resting_until": status.get("lane_resting_until"),
     }
 
 
@@ -298,6 +299,7 @@ def _format_remote_status(lane_id: str, base_url: str, data: dict, controllable:
         "has_env_id": bool(has_env_id),
         "env_file": str(env_file),
         "id_status": str(id_status),
+        "lane_resting_until": data.get("lane_resting_until"),
     }
 
 

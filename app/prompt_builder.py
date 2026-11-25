@@ -723,7 +723,15 @@ def build_incremental_prompt_and_files(
                     if tool_stats.get("has_subagent_tools")
                     else "file, command, or search action"
                 )
-                if active_tools and tool_header:
+                is_work_request = bool(_WORKSPACE_TASK_INDICATORS_RE.search(clean_user_text))
+                if active_tools and is_work_request:
+                    # Recency zone: việc workspace -> nhắc GỌI TOOL trước, không để "chat thường" đứng cuối.
+                    tool_reminder = (
+                        f" This is a workspace task and you HAVE the listed tools: do the {action_scope} now by "
+                        'emitting plain-text <tool_call>{"name": "...", "arguments": {...}}</tool_call> tags '
+                        "(the local IDE executes them, no turn cap) instead of pasting whole files as chat text."
+                    )
+                elif active_tools and tool_header:
                     tool_reminder = (
                         " Answer directly in plain text for normal chat/questions; "
                         "invoke listed `<tool_call>` tags directly when workspace action is needed (no turn cap)."

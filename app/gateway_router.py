@@ -9,7 +9,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 
-from app.config import GEMINI_STREAM_OVERALL_TIMEOUT
+from app.config import GEMINI_STREAM_OVERALL_TIMEOUT, LEAD_STICKY_LOCK_WAIT
 from app.gemini_session import compute_session_key, is_subagent_messages
 
 logger = logging.getLogger("DSH-Bridge")
@@ -18,6 +18,7 @@ STICKY_TTL = 3600.0
 MAX_STICKY_SESSIONS = 128
 LANE_COOLDOWN_SECONDS = 15.0
 FAILOVER_STATUS_CODES = {429, 503}
+LEAD_ACTIVE_WINDOW = 900.0  # lead dùng luồng trong 15 phút gần nhất = coi như đang hoạt động ở luồng đó
 
 
 @dataclass
@@ -79,6 +80,11 @@ class GatewayRouter:
         except Exception:
             pass
 
+    @staticmethod
+    def _is_busy_reply(status_code: int, raw: Optional[bytes]) -> bool:
+        """429 `bridge_busy` = luồng chỉ đang chạy dở một lượt, KHÔNG phải luồng hỏng -> không cooldown."""
+        return status_code == 429 and b"bridge_busy" in (raw or b"")
+
     def _is_lane_healthy(self, lane: dict, now: float) -> bool:
         lane_id = str(lane.get("id") or "")
         if lane.get("reachable") is not True or lane.get("control") != "on":
@@ -91,6 +97,9 @@ class GatewayRouter:
             return False
         accounts = lane.get("accounts") or []
         if accounts and all(a.get("status") == "resting" for a in accounts):
+            return False
+        if lane.get("lane_resting_until"):
+            # Luồng tự nghỉ vì Google trả 1213 liên tiếp: không nhận hội thoại (kể cả lead đang dính) tới khi hết nghỉ.
             return False
         return True
 
@@ -159,8 +168,11 @@ class GatewayRouter:
 
             if chosen is None:
                 sticky_counts: Dict[str, int] = {}
+                active_lead_lanes: set = set()
                 for binding in self._sticky.values():
                     sticky_counts[binding.lane_id] = sticky_counts.get(binding.lane_id, 0) + 1
+                    if not binding.is_subagent and (now - binding.last_used_ts) <= LEAD_ACTIVE_WINDOW:
+                        active_lead_lanes.add(binding.lane_id)
 
                 def _rank(item: Tuple[int, dict]) -> Tuple[int, int, int, int]:
                     idx, lane = item
@@ -170,7 +182,9 @@ class GatewayRouter:
                         self._gateway_inflight.get(lid, 0),
                     )
                     if is_subagent and len(candidates) > 1:
-                        role_penalty = 0 if lid != primary_lead_id else 1
+                        # Né luồng đang giữ lead (động); chưa biết lead ở đâu thì né luồng chính như cũ.
+                        lead_lanes = active_lead_lanes or {primary_lead_id}
+                        role_penalty = 1 if lid in lead_lanes else 0
                     else:
                         role_penalty = 0 if lid == primary_lead_id else 1
                     return (effective_load, role_penalty, sticky_counts.get(lid, 0), idx)
@@ -193,7 +207,9 @@ class GatewayRouter:
         async with self._route_lock:
             self._cooldown_until[lane_id] = time.time() + max(0.0, ttl)
 
-    def _build_forward_headers(self, request_headers: Any, failover_ready: bool = False) -> Dict[str, str]:
+    def _build_forward_headers(
+        self, request_headers: Any, failover_ready: bool = False, lock_wait: Optional[float] = None
+    ) -> Dict[str, str]:
         out: Dict[str, str] = {"Content-Type": "application/json"}
         auth_val = request_headers.get("Authorization") or request_headers.get("authorization")
         if auth_val:
@@ -206,6 +222,8 @@ class GatewayRouter:
                 out[h_name] = str(val)
         if failover_ready:
             out["X-Gateway-Failover-Ready"] = "1"
+        elif lock_wait is not None:
+            out["X-Gateway-Lock-Wait"] = f"{float(lock_wait):g}"
         return out
 
     async def proxy_models(self):
@@ -291,6 +309,8 @@ class GatewayRouter:
         max_attempts = max(2, len(self.lane_registry.peers))
 
         for attempt in range(max_attempts):
+            pinned = None if is_new_conv else self._sticky.get(conv_key)
+            pinned_lane = pinned.lane_id if pinned is not None else None
             lane, err_msg = await self.reserve_lane(
                 conv_key,
                 is_new_conv,
@@ -335,8 +355,15 @@ class GatewayRouter:
             has_alternative = any(
                 pid not in excluded and pid != lane_id for pid in self.lane_registry.peers
             )
+            # Hội thoại cũ quay về đúng luồng đang giữ ChatSession của nó: để worker chờ khóa đủ
+            # LOCK_ACQUIRE_TIMEOUT (thay vì 2s rồi 429) -> giữ ngữ cảnh, khỏi dựng lại từ tóm tắt.
+            stay_sticky = pinned_lane is not None and pinned_lane == lane_id
+            # Lead (ở bất kỳ luồng nào nó đang dính) chờ lâu hơn hẳn: worker xong lượt là lead vào lại đúng
+            # ChatSession của mình, không bị đẩy sang luồng khác giữa chừng.
             fwd_headers = self._build_forward_headers(
-                request.headers, failover_ready=(attempt + 1 < max_attempts and has_alternative)
+                request.headers,
+                failover_ready=(attempt + 1 < max_attempts and has_alternative and not stay_sticky),
+                lock_wait=(LEAD_STICKY_LOCK_WAIT if stay_sticky and not is_subagent else None),
             )
             logger.info(
                 f"[GATEWAY] Route {conv_key[:8]} ({role_tag}) -> {lane_id} ({lane_url}) "
@@ -396,7 +423,8 @@ class GatewayRouter:
                     media = upstream_resp.headers.get("content-type", "application/json")
                     status_code = upstream_resp.status_code
                     if status_code in FAILOVER_STATUS_CODES:
-                        await self.mark_cooldown(lane_id)
+                        if not self._is_busy_reply(status_code, raw_err):
+                            await self.mark_cooldown(lane_id)
                         excluded.add(lane_id)
                         last_error_resp = (status_code, raw_err, media, lane_id)
                         has_other = any(pid not in excluded for pid in self.lane_registry.peers)
@@ -516,7 +544,8 @@ class GatewayRouter:
 
             media = resp.headers.get("content-type", "application/json")
             if resp.status_code in FAILOVER_STATUS_CODES:
-                await self.mark_cooldown(lane_id)
+                if not self._is_busy_reply(resp.status_code, resp.content):
+                    await self.mark_cooldown(lane_id)
                 excluded.add(lane_id)
                 last_error_resp = (resp.status_code, resp.content, media, lane_id)
                 has_other = any(pid not in excluded for pid in self.lane_registry.peers)

@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import re
 import sys
 import time
 from typing import Any, List, Optional, Tuple
@@ -13,6 +14,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.activity import record_failed_tool_trace, summarize_tool_calls
 from app.config import (
+    CODE_DUMP_MIN_LINES,
+    CODE_DUMP_NUDGE,
     LOCK_ACQUIRE_TIMEOUT,
     TOOL_PARSE_SELF_CORRECTION,
     TOOL_PROFILE,
@@ -170,6 +173,90 @@ async def _attempt_tool_self_correction(
             return fixed_reply, fixed_res, True
     except Exception as exc:
         logger.warning("[SELF-CORRECT] Tự sửa thất bại: %s", exc)
+    return reply_text, parse_res, False
+
+
+def _fenced_code_lines(text: str) -> int:
+    """Đếm số dòng nằm trong các khối ``` của câu trả lời."""
+    total, inside = 0, False
+    for line in (text or "").splitlines():
+        if line.lstrip().startswith("```"):
+            inside = not inside
+            continue
+        if inside:
+            total += 1
+    return total
+
+
+_NO_TOOL_ACCESS_RE = re.compile(
+    r"(không (có|được) (quyền )?(truy cập|sử dụng|dùng|gọi)[^.\n]{0,40}(tool|công cụ|lệnh|hệ thống tệp)"
+    r"|không có (sẵn )?(các )?(công cụ|tool)"
+    r"|không thể (truy cập|thực thi|chạy|gọi|tạo file|ghi file)"
+    r"|(do not|don't|cannot|can't) (have )?(access|execute|run|call|use)[^.\n]{0,30}(tool|command|file|subagent)"
+    r"|no access to[^.\n]{0,30}(tool|file|command))",
+    re.IGNORECASE,
+)
+
+
+def _claims_no_tool_access(reply_text: str) -> bool:
+    return bool(_NO_TOOL_ACCESS_RE.search(reply_text or ""))
+
+
+def _should_nudge_code_dump(
+    messages: list, tools_map: dict, is_chat_turn: bool, parse_res: ToolParseResult, reply_text: str
+) -> bool:
+    """Lượt mở đầu một việc workspace mà Gemini in code ra chat (hoặc tự nhận không có tool), không gọi tool nào."""
+    if not CODE_DUMP_NUDGE or not tools_map or is_chat_turn or parse_res.tool_calls:
+        return False
+    if _invalid_tool_batch_error(parse_res, reply_text) is not None:
+        return False  # đã có nhánh tự sửa riêng
+    if not messages or str(messages[-1].get("role", "")).lower() not in ("user", "human"):
+        return False  # sau tool result thường là lời tổng kết hợp lệ
+    return _fenced_code_lines(reply_text) >= CODE_DUMP_MIN_LINES or _claims_no_tool_access(reply_text)
+
+
+async def _attempt_code_dump_nudge(
+    mgr: Any,
+    reply_text: str,
+    parse_res: ToolParseResult,
+    tools_map: dict,
+    workspace_root: str,
+) -> Tuple[str, ToolParseResult, bool]:
+    """Nhắc 1 lượt kín: Gemini vừa in code thay vì gọi tool -> yêu cầu phát `<tool_call>` thật."""
+    if getattr(mgr, "state", "") != "on" or getattr(mgr, "chat_session", None) is None:
+        return reply_text, parse_res, False
+    allowed_names = ", ".join(list(tools_map.keys())[:25])
+    problem = (
+        "You said you have no access to tools — that is wrong: you DO have every tool listed below, and writing "
+        "<tool_call> tags in your reply is exactly how you use them (the local IDE executes them)."
+        if _claims_no_tool_access(reply_text)
+        else "You printed code/file contents as chat text, but nothing was created or executed: "
+        "this IDE only acts on <tool_call> tags. Do NOT repeat the code as prose."
+    )
+    nudge_prompt = (
+        f"[TOOL USE REQUIRED] {problem} Perform the task NOW by emitting "
+        '<tool_call>{"name": "...", "arguments": {...}}</tool_call> blocks (write/edit files, run commands, or '
+        "delegate to subagents if available). Split very large files into a short write followed by edits. "
+        f"Allowed tools: {allowed_names}."
+    )
+    try:
+        logger.warning(
+            "[CODE-DUMP-NUDGE] Gemini không gọi tool (%d dòng code in ra chat, tự nhận không có tool=%s) "
+            "-> nhắc 1 lượt kín.",
+            _fenced_code_lines(reply_text),
+            _claims_no_tool_access(reply_text),
+        )
+        new_reply = clean_gemini_web_artifacts(
+            await mgr.send_prepared_turn(nudge_prompt, [], include_tool_header=False)
+        )
+        new_res = parse_tool_calls_detailed(new_reply, tools_map, workspace_root=workspace_root)
+        if new_res.tool_calls or _invalid_tool_batch_error(new_res, new_reply) is not None:
+            # Có tool call (kể cả lỗi cú pháp -> nhánh tự sửa phía sau sẽ xử lý tiếp).
+            logger.info("[CODE-DUMP-NUDGE] Sau khi nhắc: %d tool call(s).", len(new_res.tool_calls))
+            return new_reply, new_res, True
+        logger.warning("[CODE-DUMP-NUDGE] Nhắc xong vẫn không có tool call; giữ câu trả lời gốc.")
+    except Exception as exc:
+        logger.warning("[CODE-DUMP-NUDGE] Nhắc thất bại: %s", exc)
     return reply_text, parse_res, False
 
 
@@ -413,6 +500,14 @@ async def chat_completions(request: Request):
 
     failover_ready = request.headers.get("X-Gateway-Failover-Ready") == "1"
     pre_lock_timeout = min(LOCK_ACQUIRE_TIMEOUT, 2.0) if failover_ready else LOCK_ACQUIRE_TIMEOUT
+    if not failover_ready:
+        # Gateway báo đây là LEAD quay về đúng luồng của nó -> chờ khóa lâu hơn thay vì 429 rồi bị chuyển luồng.
+        try:
+            lead_wait = float(request.headers.get("X-Gateway-Lock-Wait") or 0)
+        except ValueError:
+            lead_wait = 0.0
+        if lead_wait > pre_lock_timeout:
+            pre_lock_timeout = min(lead_wait, 600.0)
 
     async def _prepare_locked_turn() -> Tuple[str, List[str], bool, Any, str, str]:
         if hasattr(mgr, "activate_session_slot"):
@@ -585,6 +680,9 @@ async def chat_completions(request: Request):
                         yield f"data: {json.dumps({'error': payload}, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
+                    elif kind == "reset":
+                        # Runtime thử lại giữa stream khi client chưa thấy chữ nào: bỏ phần đệm cũ.
+                        splitter = ToolCallAwareStreamer()
                     elif kind == "delta":
                         for piece in splitter.feed(payload):
                             clean_piece = clean_gemini_web_artifacts(piece)
@@ -611,6 +709,13 @@ async def chat_completions(request: Request):
                     reply_text, tools_map, workspace_root=active_workspace
                 )
                 self_corrected = False
+                code_dump_nudged = False
+                if _should_nudge_code_dump(messages, tools_map, is_chat_turn, parse_res, reply_text):
+                    if hasattr(mgr, "transfer_turn_lock"):
+                        mgr.transfer_turn_lock()
+                    reply_text, parse_res, code_dump_nudged = await _attempt_code_dump_nudge(
+                        mgr, reply_text, parse_res, tools_map, active_workspace
+                    )
                 if _invalid_tool_batch_error(parse_res, reply_text) is not None:
                     if hasattr(mgr, "transfer_turn_lock"):
                         mgr.transfer_turn_lock()
@@ -649,6 +754,8 @@ async def chat_completions(request: Request):
                 }
                 if self_corrected:
                     fb_extra["self_corrected"] = True
+                if code_dump_nudged:
+                    fb_extra["code_dump_nudged"] = True
                 m.activity.write(request_id=chat_id, model=actual_model, stream=True, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage="complete", prompt_chars=actual_prompt_chars, reply_chars=len(reply_text), finish=finish_reason, tools=summarize_tool_calls(tool_calls), latency_ms=int((time.time() - t0) * 1000), outcome="ok", **fb_extra)
                 yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -698,6 +805,11 @@ async def chat_completions(request: Request):
             reply_text, tools_map, workspace_root=active_workspace
         )
         self_corrected = False
+        code_dump_nudged = False
+        if _should_nudge_code_dump(messages, tools_map, is_chat_turn, parse_res, reply_text):
+            reply_text, parse_res, code_dump_nudged = await _attempt_code_dump_nudge(
+                mgr, reply_text, parse_res, tools_map, active_workspace
+            )
         if _invalid_tool_batch_error(parse_res, reply_text) is not None:
             reply_text, parse_res, self_corrected = await _attempt_tool_self_correction(
                 mgr, parse_res, reply_text, tools_map, active_workspace
@@ -722,6 +834,8 @@ async def chat_completions(request: Request):
 
     if self_corrected:
         fb_extra["self_corrected"] = True
+    if code_dump_nudged:
+        fb_extra["code_dump_nudged"] = True
     m.activity.write(request_id=chat_id, model=actual_model, stream=False, chat_key=mgr.current_chat_key(), auth_ok=mgr.auth_ok, stage="complete", prompt_chars=actual_prompt_chars, reply_chars=len(reply_text), finish=finish_reason, tools=summarize_tool_calls(tool_calls), latency_ms=int((time.time() - t0) * 1000), outcome="ok", **fb_extra)
     completion_tokens = max(1, len(reply_text) // 4)
     return {

@@ -145,4 +145,9 @@ def build_manager_status(manager) -> Dict[str, Any]:
         "env_file": env_file_name,
         "id_status": id_status,
         "tool_profile": getattr(manager, "tool_profile", TOOL_PROFILE),
+        "lane_resting_until": (
+            datetime.fromtimestamp(manager.rest_until).astimezone().isoformat()
+            if getattr(manager, "is_resting", None) and manager.is_resting()
+            else None
+        ),
     }

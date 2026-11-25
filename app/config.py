@@ -129,6 +129,30 @@ TOOL_PARSE_SELF_CORRECTION = os.getenv("TOOL_PARSE_SELF_CORRECTION", "true").str
     "yes",
 )
 EMPTY_REPLY_RETRIES = max(0, int(os.getenv("EMPTY_REPLY_RETRIES", "1")))
+# Stream bị Google cắt giữa chừng nhưng client CHƯA thấy chữ hiển thị nào (vd. đang sinh <tool_call>
+# bị giữ lại) -> chờ một chút rồi thử lại trên metadata an toàn trước lượt.
+# Thực tế (2026-11-25): Google trả mã 1213 khi một tài khoản mở chat mới ~1s sau lượt trước; thử lại sau 4s
+# vẫn dính -> mặc định 2 lần, giãn dần (20s, 40s). Chế độ chạy nền bền: ưu tiên khỏe tài khoản hơn tốc độ.
+MID_STREAM_RETRIES = max(0, int(os.getenv("MID_STREAM_RETRIES", "2")))
+MID_STREAM_RETRY_DELAY = max(0.0, float(os.getenv("MID_STREAM_RETRY_DELAY", "20")))
+# Việc workspace mà Gemini in code ra chat (khối code >= N dòng) và không gọi tool nào
+# -> tự nhắc 1 lượt kín bắt phát <tool_call> (giống người dùng nhắc tay).
+# Mở chat MỚI trên cùng một tài khoản phải cách request trước ít nhất N giây (lượt tiếp trong chat cũ vẫn
+# dùng MIN_REQUEST_INTERVAL). Mở chat dồn dập ~1s là lúc Google trả 1213 / dễ bị coi là bot.
+NEW_CHAT_MIN_INTERVAL = max(0.0, float(os.getenv("NEW_CHAT_MIN_INTERVAL", "25")))
+# Gateway: hội thoại LEAD đang dính một luồng thì chờ luồng đó rảnh tối đa N giây thay vì chuyển luồng
+# (chuyển luồng = mất ChatSession, phải dựng lại từ tóm tắt). Lead nằm ở luồng nào là động, không cố định acc1.
+LEAD_STICKY_LOCK_WAIT = max(1.0, float(os.getenv("LEAD_STICKY_LOCK_WAIT", "240")))
+# Google trả mã 1213 liên tiếp = tài khoản đang bị bóp (thực tế 25/11: acc1 bị 12 lần, acc2 0 lần).
+# Sau N lần liên tiếp -> luồng tự NGHỈ M phút; gateway né luồng đó cho tới khi hết nghỉ.
+RATE_LIMIT_REST_AFTER = max(1, int(os.getenv("RATE_LIMIT_REST_AFTER", "1")))
+RATE_LIMIT_REST_MINUTES = max(0.0, float(os.getenv("RATE_LIMIT_REST_MINUTES", "45")))
+# Chế độ chạy nền bền: mỗi lượt cách lượt trước thêm một khoảng ngẫu nhiên [MIN, MAX] giây
+# (nhịp giống người, tránh đều tăm tắp như bot). Đặt MAX=0 để tắt.
+TURN_JITTER_MIN = max(0.0, float(os.getenv("TURN_JITTER_MIN", "3")))
+TURN_JITTER_MAX = max(TURN_JITTER_MIN, float(os.getenv("TURN_JITTER_MAX", "8")))
+CODE_DUMP_NUDGE = os.getenv("CODE_DUMP_NUDGE", "true").strip().lower() in ("1", "true", "yes")
+CODE_DUMP_MIN_LINES = max(1, int(os.getenv("CODE_DUMP_MIN_LINES", "20")))
 
 API_START_ON = parse_start_state(os.getenv("API_START_STATE", "on"))
 DISABLE_DRAIN_TIMEOUT = float(os.getenv("DISABLE_DRAIN_TIMEOUT", "120"))
