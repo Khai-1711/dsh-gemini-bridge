@@ -10,6 +10,7 @@ __pycache__/
 
 # Runtime artifacts
 logs/
+.bridge_state/
 .bridge_session.json
 .bridge_session_*.json
 

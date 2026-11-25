@@ -67,6 +67,7 @@ def save_state(path, state: Dict[str, dict]) -> None:
     p = Path(path)
     tmp = p.with_suffix(p.suffix + ".tmp")
     try:
+        p.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(
             json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -156,16 +157,24 @@ def find_chain_overlap(
     out: List[dict] = []
     own = Path(own_chain_file).resolve()
     mine = set(own_keys)
+    search_dirs = []
+    for d in (own.parent, Path(base_dir).resolve()):
+        if d not in search_dirs and d.exists():
+            search_dirs.append(d)
+    seen_files = set()
     try:
-        for f in Path(base_dir).glob(".bridge_chain*.json"):
-            if f.resolve() == own:
-                continue
-            data = load_state(f)
-            for k in data.get("keys", []):
-                if k in mine:
-                    out.append(
-                        {"key": k, "other_instance": data.get("instance", "?")}
-                    )
+        for d in search_dirs:
+            for f in d.glob(".bridge_chain*.json"):
+                rf = f.resolve()
+                if rf == own or rf in seen_files:
+                    continue
+                seen_files.add(rf)
+                data = load_state(f)
+                for k in data.get("keys", []):
+                    if k in mine:
+                        out.append(
+                            {"key": k, "other_instance": data.get("instance", "?")}
+                        )
     except Exception:
         pass
     return out

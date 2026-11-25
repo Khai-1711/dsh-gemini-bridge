@@ -1,3 +1,4 @@
+from collections import Counter
 from dataclasses import dataclass, field
 import json
 import re
@@ -57,13 +58,193 @@ def unlinkify_gemini_urls(text: str) -> str:
     return out
 
 
-def _sanitize_tool_argument_values(value: Any) -> Any:
+_MUTATION_OR_EXEC_TOOLS = frozenset(
+    {
+        "write",
+        "write_file",
+        "write_to_file",
+        "create_file",
+        "edit",
+        "edit_file",
+        "multi_edit",
+        "notebook_edit",
+        "str_replace",
+        "str_replace_editor",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "apply_patch",
+        "apply_diff",
+        "patch",
+        "patch_file",
+        "insert_edit",
+        "delete_file",
+        "remove_file",
+        "move_file",
+        "rename_file",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "bash",
+        "sh",
+        "shell",
+        "terminal",
+        "execute_command",
+        "exec_command",
+        "run_command",
+        "run_terminal_cmd",
+        "run_shell_command",
+        "run_in_terminal",
+    }
+)
+
+_SHELL_EXEC_TOOLS = frozenset(
+    {
+        "pwsh",
+        "powershell",
+        "cmd",
+        "bash",
+        "sh",
+        "shell",
+        "terminal",
+        "execute_command",
+        "exec_command",
+        "run_command",
+        "run_terminal_cmd",
+        "run_shell_command",
+        "run_in_terminal",
+    }
+)
+
+_MARKDOWN_DOC_EXTS = (".md", ".mdx", ".markdown", ".rst")
+_RAW_BODY_KEYS_IN_MARKDOWN = frozenset(
+    {
+        "content",
+        "Content",
+        "old_string",
+        "new_string",
+        "old_str",
+        "new_str",
+        "Target",
+        "Replacement",
+        "diff",
+        "patch",
+        "edits",
+    }
+)
+_PROSE_FENCE_LANGS = frozenset(
+    {
+        "python",
+        "py",
+        "javascript",
+        "js",
+        "typescript",
+        "ts",
+        "tsx",
+        "jsx",
+        "markdown",
+        "md",
+        "xml",
+        "html",
+        "diff",
+        "patch",
+        "bash",
+        "sh",
+        "powershell",
+        "pwsh",
+        "cmd",
+        "text",
+        "txt",
+        "yaml",
+        "yml",
+        "toml",
+        "sql",
+        "rust",
+        "go",
+        "java",
+        "c",
+        "cpp",
+    }
+)
+
+
+_KNOWN_ALIAS_KEYS = frozenset(
+    {
+        "file_path", "path", "file", "filepath", "filename", "target_file",
+        "filePath", "Path", "TargetFile",
+        "command", "cmd", "CommandLine", "command_line", "script", "shell", "code", "input",
+        "pattern", "query", "glob", "search", "file_pattern",
+    }
+)
+_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _verify_lossless_heuristic_repair(
+    raw_json: str,
+    data: Dict[str, Any],
+    raw_args: Any,
+    props: Dict[str, Any],
+) -> None:
+    """Đảm bảo `json_repair` KHÔNG âm thầm cắt cụt code hoặc bịa thêm key rác khi sửa dấu ngoặc kép."""
+    allowed_top = {"name", "arguments", "parameters", "type", "id"} | set(props.keys()) | _KNOWN_ALIAS_KEYS
+    extra_top = set(data.keys()) - allowed_top
+    if extra_top:
+        raise InvalidToolArguments(
+            f"Heuristic JSON repair invented unexpected top-level keys {sorted(extra_top)}; rejecting to prevent silent truncation."
+        )
+
+    if isinstance(raw_args, dict) and props:
+        allowed_arg_keys = set(props.keys()) | _KNOWN_ALIAS_KEYS
+        extra_args = set(raw_args.keys()) - allowed_arg_keys
+        if extra_args:
+            raise InvalidToolArguments(
+                f"Heuristic JSON repair split string into bogus argument keys {sorted(extra_args)}; rejecting to prevent file corruption."
+            )
+
+    # Bảo toàn từ khóa/định danh: mọi token chữ-số trong raw_json (sau khi đổi escape \n/\t/\r thành khoảng trắng)
+    # vẫn phải còn mặt trong JSON sau khi repair (ngăn việc json_repair nuốt mất phần đuôi `return x` của code).
+    raw_unescaped = re.sub(r"\\[nrtbf\"\\/]", " ", raw_json)
+    repaired_dump = json.dumps(data, ensure_ascii=False)
+    rep_unescaped = re.sub(r"\\[nrtbf\"\\/]", " ", repaired_dump)
+    raw_counts = Counter(_WORD_TOKEN_RE.findall(raw_unescaped))
+    rep_counts = Counter(_WORD_TOKEN_RE.findall(rep_unescaped))
+    missing = [tok for tok, cnt in raw_counts.items() if rep_counts[tok] < cnt]
+    if missing:
+        raise InvalidToolArguments(
+            f"Heuristic JSON repair dropped code tokens {missing[:5]}; rejecting to protect file integrity."
+        )
+
+
+def is_mutation_or_exec_tool(fn_name: str) -> bool:
+    """Trả True nếu công cụ ghi/sửa/xóa file hoặc chạy lệnh shell (cấm dùng json_repair đoán mò)."""
+    low = str(fn_name or "").strip().lower()
+    if not low:
+        return False
+    if low in _MUTATION_OR_EXEC_TOOLS:
+        return True
+    return any(
+        tok in low
+        for tok in ("write_file", "edit_file", "apply_patch", "apply_diff", "replace_file", "delete_file", "run_command", "exec_command")
+    )
+
+
+def _sanitize_tool_argument_values(value: Any, *, preserve_markdown_links: bool = False) -> Any:
     if isinstance(value, str):
-        return unlinkify_gemini_urls(value)
+        return value if preserve_markdown_links else unlinkify_gemini_urls(value)
     if isinstance(value, list):
-        return [_sanitize_tool_argument_values(item) for item in value]
+        return [
+            _sanitize_tool_argument_values(item, preserve_markdown_links=preserve_markdown_links)
+            for item in value
+        ]
     if isinstance(value, dict):
-        return {k: _sanitize_tool_argument_values(v) for k, v in value.items()}
+        return {
+            k: _sanitize_tool_argument_values(
+                v,
+                preserve_markdown_links=(preserve_markdown_links or k in _RAW_BODY_KEYS_IN_MARKDOWN)
+                if preserve_markdown_links
+                else False,
+            )
+            for k, v in value.items()
+        }
     return value
 
 
@@ -97,7 +278,22 @@ def normalize_tool_arguments(
     params = tool_schema.get("parameters") or {}
     props = params.get("properties") or {}
     required_keys = set(params.get("required") or [])
-    normalized = _sanitize_tool_argument_values(dict(args))
+
+    target_path_hint = ""
+    for pkey in ("file_path", "path", "filePath", "filepath", "Path", "TargetFile", "target_file"):
+        pval = args.get(pkey)
+        if isinstance(pval, str) and pval.strip():
+            target_path_hint = pval.strip().lower()
+            break
+    is_markdown_target = target_path_hint.endswith(_MARKDOWN_DOC_EXTS)
+
+    normalized = {
+        k: _sanitize_tool_argument_values(
+            v,
+            preserve_markdown_links=(is_markdown_target and k in _RAW_BODY_KEYS_IN_MARKDOWN),
+        )
+        for k, v in args.items()
+    }
 
     # Drop explicit null values for optional parameters (common LLM quirk)
     for key in list(normalized.keys()):
@@ -108,7 +304,9 @@ def normalize_tool_arguments(
         "file_path": ("path", "file", "filepath", "filename", "target_file", "filePath"),
         "filePath": ("path", "file", "file_path", "filepath", "filename", "target_file"),
         "path": ("file_path", "filePath", "file", "filepath", "filename", "target_file"),
-        "command": ("cmd", "script", "shell", "code", "input"),
+        "Path": ("file_path", "path", "filePath", "filepath", "target_file"),
+        "command": ("cmd", "CommandLine", "command_line", "script", "shell", "code", "input"),
+        "CommandLine": ("command", "cmd", "command_line", "script"),
         "pattern": ("query", "path", "glob", "search", "file_pattern"),
     }
     for destination, sources in aliases.items():
@@ -138,21 +336,22 @@ def normalize_tool_arguments(
         if "enum" in property_schema and value not in property_schema["enum"]:
             raise InvalidToolArguments("Tool argument is not an allowed enum value.")
 
-        if key in ("file_path", "path", "filePath", "filepath"):
+        if key in ("file_path", "path", "filePath", "filepath", "Path", "TargetFile", "target_file"):
             if not isinstance(value, str):
                 raise InvalidToolArguments("File path must be a string.")
             if not is_safe_path(value, workspace_root=workspace_root):
                 raise InvalidToolArguments("File path targets a protected OS directory or is outside workspace.")
 
-    if name_lower in ("pwsh", "bash", "shell", "execute_command", "run_command"):
-        command = normalized.get("command")
-        if command is not None:
-            if not isinstance(command, str) or not command.strip():
-                raise InvalidToolArguments("Command must be a non-empty string.")
-            sanitized = sanitize_shell_command_no_c_drive(command)
-            if sanitized != command:
-                raise InvalidToolArguments("Command was rejected by the safety policy.")
-            normalized["command"] = sanitized
+    if name_lower in _SHELL_EXEC_TOOLS:
+        for cmd_key in ("command", "CommandLine", "cmd", "script"):
+            command = normalized.get(cmd_key)
+            if command is not None:
+                if not isinstance(command, str) or not command.strip():
+                    raise InvalidToolArguments("Command must be a non-empty string.")
+                sanitized = sanitize_shell_command_no_c_drive(command)
+                if sanitized != command:
+                    raise InvalidToolArguments("Command was rejected by the safety policy.")
+                normalized[cmd_key] = sanitized
 
     return normalized
 
@@ -183,6 +382,42 @@ class ToolParseResult:
     has_unclosed_tag: bool = False
 
 
+def _find_prose_code_fence_ranges(text: str) -> List[Tuple[int, int]]:
+    """Tìm các vùng code fence minh họa (```python, ```xml, ```markdown...) để không bắt nhầm <tool_call> mẫu."""
+    if "```" not in text:
+        return []
+    ranges: List[Tuple[int, int]] = []
+    idx = 0
+    n = len(text)
+    while idx < n:
+        open_idx = text.find("```", idx)
+        if open_idx == -1:
+            break
+        # Chỉ tính fence mở ở đầu chuỗi hoặc đầu dòng
+        if open_idx > 0 and text[open_idx - 1] not in ("\n", "\r"):
+            idx = open_idx + 3
+            continue
+        line_end = text.find("\n", open_idx + 3)
+        if line_end == -1:
+            break
+        lang = text[open_idx + 3 : line_end].strip().split()[0].lower() if text[open_idx + 3 : line_end].strip() else ""
+        close_idx = text.find("\n```", line_end)
+        if close_idx == -1:
+            break
+        after_close = close_idx + 4
+        if lang in _PROSE_FENCE_LANGS:
+            ranges.append((open_idx, after_close))
+        idx = after_close
+    return ranges
+
+
+def _in_ranges(pos: int, ranges: List[Tuple[int, int]]) -> bool:
+    for lo, hi in ranges:
+        if lo <= pos < hi:
+            return True
+    return False
+
+
 def _is_prose_tool_tag_mention(text: str, open_pos: int, open_len: int) -> bool:
     """Trả True nếu `<tool_call>` tại vị trí `open_pos` chỉ là trích dẫn trong văn bản (vd `` `<tool_call>` ``)."""
     if open_pos > 0 and text[open_pos - 1] == "`":
@@ -196,7 +431,8 @@ def _is_prose_tool_tag_mention(text: str, open_pos: int, open_len: int) -> bool:
 def _scan_tool_call_blocks(text: str) -> Tuple[List[str], bool]:
     """Tách các thẻ <tool_call>...</tool_call> nhận biết chuỗi JSON (" và \\).
 
-    Bỏ qua các lần nhắc thẻ `<tool_call>` trong inline backtick hoặc văn bản giải thích.
+    Bỏ qua các lần nhắc thẻ `<tool_call>` trong inline backtick, code fence minh họa
+    (```python/```xml/```markdown...) hoặc văn bản giải thích.
     Trả về ``(blocks, has_unclosed)``; nếu có thẻ mở thực sự nhưng tới EOF vẫn chưa
     đóng hợp lệ bên ngoài chuỗi -> ``has_unclosed=True`` (Gate 0 fail-closed).
     """
@@ -204,13 +440,14 @@ def _scan_tool_call_blocks(text: str) -> Tuple[List[str], bool]:
     close_tag = "</tool_call>"
     results: List[str] = []
     has_unclosed = False
+    prose_fences = _find_prose_code_fence_ranges(text)
     pos = 0
     n = len(text)
     while pos < n:
         start = text.find(open_tag, pos)
         if start == -1:
             break
-        if _is_prose_tool_tag_mention(text, start, len(open_tag)):
+        if _is_prose_tool_tag_mention(text, start, len(open_tag)) or _in_ranges(start, prose_fences):
             pos = start + len(open_tag)
             continue
         body_start = start + len(open_tag)
@@ -455,12 +692,14 @@ def parse_tool_calls_detailed(
 
     for tag_idx, (raw_json, is_tagged) in enumerate(candidates, 1):
         try:
+            used_heuristic_repair = False
             try:
                 data = _loads_tool_json(raw_json)
             except (json.JSONDecodeError, TypeError, ValueError):
                 data = _repair_tool_json_deterministic(raw_json) if is_tagged else None
                 if data is None:
                     raise
+                used_heuristic_repair = True
             if not isinstance(data, dict) or "name" not in data:
                 if is_tagged:
                     malformed_tags.append(
@@ -505,6 +744,9 @@ def parse_tool_calls_detailed(
                 raw_args = _loads_tool_json(raw_args)
 
             schema = tools_map[fn_name]
+            if used_heuristic_repair and is_mutation_or_exec_tool(fn_name):
+                props = (schema.get("parameters") or {}).get("properties") or {}
+                _verify_lossless_heuristic_repair(raw_json, data, raw_args, props)
             clean_args = normalize_tool_arguments(
                 fn_name, raw_args, schema, workspace_root=workspace_root
             )

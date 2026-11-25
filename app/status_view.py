@@ -3,7 +3,7 @@ from datetime import datetime
 import time
 from typing import Any, Dict
 
-from app.config import INSTANCE_ID, INSTANCE_LABEL, INSTANCE_PATHS, PORT
+from app.config import INSTANCE_ID, INSTANCE_LABEL, INSTANCE_PATHS, PORT, TOOL_PROFILE
 
 
 def build_manager_status(manager) -> Dict[str, Any]:
@@ -144,4 +144,5 @@ def build_manager_status(manager) -> Dict[str, Any]:
         "has_env_id": has_env_id,
         "env_file": env_file_name,
         "id_status": id_status,
+        "tool_profile": getattr(manager, "tool_profile", TOOL_PROFILE),
     }

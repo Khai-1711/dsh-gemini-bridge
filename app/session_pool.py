@@ -2,9 +2,11 @@
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 import re
 import sys
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import LOCK_ACQUIRE_TIMEOUT, logger
@@ -13,6 +15,12 @@ from app.handoff import FactLedger
 SESSION_POOL_MAX_SIZE = 16
 SESSION_POOL_TTL = 3600.0
 _AGENT_NAME_RE = re.compile(r'Your name is\s+"([^"]+)"', re.IGNORECASE)
+_COMPACTION_SUMMARY_RE = re.compile(
+    r"(?:<conversation_summary>|<context_summary>|\[conversation summary\]|"
+    r"this session is being continued from a previous conversation|"
+    r"summary of (?:the )?(?:prior|previous|earlier) conversation)",
+    re.IGNORECASE,
+)
 
 
 def _gs():
@@ -75,28 +83,31 @@ def compute_session_key(
     from app.prompt_builder import _strip_injected_boilerplate
 
     msg_list = [m for m in (messages or []) if isinstance(m, dict)]
-    is_new_conversation = not any(
-        m.get("role") in ("assistant", "tool") for m in msg_list
-    )
-
-    clean_explicit = str(explicit_session_id or "").strip()
-    if clean_explicit:
-        return clean_explicit[:64], is_new_conversation
+    has_prior_turns = any(m.get("role") in ("assistant", "tool") for m in msg_list)
 
     agent_name = ""
     first_user = ""
+    has_compaction_marker = False
     for msg in msg_list:
         raw_text, has_image = _message_text_for_session_key(msg.get("content"))
         if raw_text:
             match = _AGENT_NAME_RE.search(raw_text)
             if match:
                 agent_name = match.group(1).strip().lower()
+            if not has_compaction_marker and _COMPACTION_SUMMARY_RE.search(raw_text):
+                has_compaction_marker = True
         if not first_user and str(msg.get("role", "")).lower() in ("user", "human"):
             cleaned = _strip_injected_boilerplate(raw_text)
             if cleaned:
                 first_user = " ".join(cleaned.split())[:240]
             elif has_image:
                 first_user = "[image]"
+
+    is_new_conversation = (not has_prior_turns) and (not has_compaction_marker)
+
+    clean_explicit = str(explicit_session_id or "").strip()
+    if clean_explicit:
+        return clean_explicit[:64], is_new_conversation
 
     if not agent_name and not first_user:
         return "default", is_new_conversation
@@ -123,23 +134,28 @@ def save_session_state(
     model: str,
     account_key: str = "",
     tool_header_hash: str = "",
+    session_key: str = "",
 ) -> None:
     """Lưu metadata phiên chat để resume sau khi restart."""
     state_file = _gs().SESSION_STATE_FILE
+    payload = {
+        "metadata": list(metadata),
+        "model": model,
+        "account_key": account_key,
+        "tool_header_hash": tool_header_hash,
+        "saved_at": time.time(),
+    }
+    clean_sk = str(session_key or "").strip()
+    if clean_sk:
+        payload["session_key"] = clean_sk
     try:
-        state_file.write_text(
-            json.dumps(
-                {
-                    "metadata": list(metadata),
-                    "model": model,
-                    "account_key": account_key,
-                    "tool_header_hash": tool_header_hash,
-                    "saved_at": time.time(),
-                },
-                ensure_ascii=False,
-            ),
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = state_file.parent / f".tmp_{state_file.name}_{uuid.uuid4().hex}"
+        tmp_file.write_text(
+            json.dumps(payload, ensure_ascii=False),
             encoding="utf-8",
         )
+        os.replace(tmp_file, state_file)
     except Exception as e:
         logger.warning(f"Không lưu được session state: {e}")
 
@@ -297,7 +313,7 @@ class SessionPoolMixin:
             else None
         )
         self._create_new_chat_session(preserve_metadata=saved_meta, model_override=desired)
-        if saved_meta:
+        if not (saved_meta and saved_meta[0]):
             self.tool_header_sent = False
             self.chat_tool_header_hash = ""
         self._sync_active_session_slot()
@@ -410,19 +426,56 @@ class SessionPoolMixin:
             self.ledger = slot.ledger
             slot.last_used_ts = time.time()
         else:
-            if (
-                self.turn_count > 0
-                or has_dirty_chat
-                or self.chat_session is None
-                or self._current_slot_model() != desired_new_model
-            ):
-                self._create_new_chat_session(preserve_metadata=None, model_override=desired_new_model)
-            else:
-                self._active_slot_model = desired_new_model
-            self._active_is_subagent = bool(is_subagent)
-            self._active_workspace_root = str(workspace_root or "").strip()
-            self.ledger = self._ensure_slot_ledger(target_key, self._active_is_subagent)
-            pool[target_key] = self._snapshot_current_slot(target_key)
+            # Nếu hội thoại đang tiếp diễn (hoặc IDE vừa chạy context compaction làm đổi messages[0]),
+            # ưu tiên nối lại vào lead slot duy nhất cùng workspace thay vì đẻ chat web mới oan.
+            norm_ws = str(workspace_root or "").strip()
+            adopt_key = None
+            if not is_subagent and norm_ws:
+                lead_matches = [
+                    (k, s)
+                    for k, s in pool.items()
+                    if not s.is_subagent
+                    and s.workspace_root
+                    and os.path.normcase(s.workspace_root) == os.path.normcase(norm_ws)
+                    and (s.turn_count > 0 or s.session_initialized)
+                ]
+                if len(lead_matches) == 1:
+                    adopt_key, adopt_slot = lead_matches[0]
+                    pool.pop(adopt_key, None)
+                    adopt_slot.session_key = target_key
+                    adopt_slot.last_used_ts = time.time()
+                    pool[target_key] = adopt_slot
+                    self.chat_session = adopt_slot.chat_session
+                    self.session_initialized = adopt_slot.session_initialized
+                    self.turn_count = adopt_slot.turn_count
+                    self.tool_header_sent = adopt_slot.tool_header_sent
+                    self.chat_tool_header_hash = adopt_slot.chat_tool_header_hash
+                    self._active_slot_model = adopt_slot.model or self.default_model or "unspecified"
+                    self._active_workspace_root = norm_ws
+                    self._active_is_subagent = False
+                    self.ledger = adopt_slot.ledger or self._ensure_slot_ledger(target_key, False)
+                    adopt_slot.ledger = self.ledger
+                    logger.info(
+                        "[SESSION] Giữ liền mạch phiên chat (compaction/rekey %s -> %s) cho workspace '%s'.",
+                        adopt_key[:8],
+                        target_key[:8],
+                        norm_ws,
+                    )
+
+            if adopt_key is None:
+                if (
+                    self.turn_count > 0
+                    or has_dirty_chat
+                    or self.chat_session is None
+                    or self._current_slot_model() != desired_new_model
+                ):
+                    self._create_new_chat_session(preserve_metadata=None, model_override=desired_new_model)
+                else:
+                    self._active_slot_model = desired_new_model
+                self._active_is_subagent = bool(is_subagent)
+                self._active_workspace_root = norm_ws
+                self.ledger = self._ensure_slot_ledger(target_key, self._active_is_subagent)
+                pool[target_key] = self._snapshot_current_slot(target_key)
 
         self._active_session_key = target_key
         if requested_model:
@@ -511,6 +564,9 @@ class SessionPoolMixin:
             self.chat_tool_header_hash = (
                 saved_header_hash if isinstance(saved_header_hash, str) else ""
             )
+            saved_session_key = str(saved.get("session_key") or "").strip()
+            if saved_session_key:
+                self._active_session_key = saved_session_key
             self.session_initialized = True
             self.tool_header_sent = bool(self.chat_tool_header_hash)
             self.turn_count = 0
@@ -524,6 +580,8 @@ class SessionPoolMixin:
     def _save_session(self) -> None:
         if not self.auth_ok or self.chat_session is None:
             return
+        if getattr(self, "_active_is_subagent", False):
+            return
         try:
             meta = list(self.chat_session.metadata)
         except Exception:
@@ -536,6 +594,7 @@ class SessionPoolMixin:
                 tool_header_hash=(
                     self.chat_tool_header_hash if self.tool_header_sent else ""
                 ),
+                session_key=str(getattr(self, "_active_session_key", "") or ""),
             )
 
     async def reset_session(self) -> None:

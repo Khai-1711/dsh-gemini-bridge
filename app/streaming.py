@@ -7,6 +7,16 @@ is later parsed into structured ``tool_calls`` instead of leaking as content.
 from __future__ import annotations
 
 
+_PROSE_FENCE_LANGS = frozenset(
+    {
+        "python", "py", "javascript", "js", "typescript", "ts", "tsx", "jsx",
+        "markdown", "md", "xml", "html", "diff", "patch", "bash", "sh",
+        "powershell", "pwsh", "cmd", "text", "txt", "yaml", "yml", "toml",
+        "sql", "rust", "go", "java", "c", "cpp",
+    }
+)
+
+
 class ToolCallAwareStreamer:
     """Splits a stream of text deltas into content pieces safe to emit, while
     buffering the full text for final tool-call parsing."""
@@ -21,6 +31,41 @@ class ToolCallAwareStreamer:
         self._in_string = False
         self._escaped = False
         self._last_emitted_char = ""
+        self._in_prose_fence = False
+
+    def _update_prose_fence_state_until(self, prefix: str) -> None:
+        """Update `_in_prose_fence` across prose emitted before `idx`."""
+        full_before = "".join(self._full)
+        # Recompute deterministically from accumulated text before current buffered tail
+        upto = len(full_before) - len(self._buf) + len(prefix)
+        segment = full_before[: max(0, upto)]
+        if "```" not in segment:
+            self._in_prose_fence = False
+            return
+        in_fence = False
+        pos = 0
+        n = len(segment)
+        while pos < n:
+            f = segment.find("```", pos)
+            if f == -1:
+                break
+            if not in_fence:
+                if f > 0 and segment[f - 1] not in ("\n", "\r"):
+                    pos = f + 3
+                    continue
+                nl = segment.find("\n", f + 3)
+                if nl == -1:
+                    break
+                raw_lang = segment[f + 3 : nl].strip()
+                lang = raw_lang.split()[0].lower() if raw_lang else ""
+                if lang in _PROSE_FENCE_LANGS:
+                    in_fence = True
+                pos = nl + 1
+            else:
+                if f > 0 and segment[f - 1] in ("\n", "\r"):
+                    in_fence = False
+                pos = f + 3
+        self._in_prose_fence = in_fence
 
     def _append_out(self, out: list[str], piece: str) -> None:
         if piece:
@@ -85,8 +130,9 @@ class ToolCallAwareStreamer:
                     break
 
                 prev_char = self._buf[idx - 1] if idx > 0 else self._last_emitted_char
-                if prev_char == "`":
-                    # Inline code mention like `<tool_call>` in prose: emit verbatim.
+                self._update_prose_fence_state_until(self._buf[:idx])
+                if prev_char == "`" or self._in_prose_fence:
+                    # Inline code mention `<tool_call>` or inside ```xml/```python prose fence: emit verbatim.
                     end_pos = idx + len(self.OPEN)
                     self._append_out(out, self._buf[:end_pos])
                     self._buf = self._buf[end_pos:]

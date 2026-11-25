@@ -13,9 +13,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.activity import record_failed_tool_trace, summarize_tool_calls
 from app.config import (
-    FORBIDDEN_TOOLS,
     LOCK_ACQUIRE_TIMEOUT,
     TOOL_PARSE_SELF_CORRECTION,
+    TOOL_PROFILE,
     logger,
 )
 from app.errors import BridgeBusyError, BridgeError
@@ -26,8 +26,11 @@ from app.prompt_builder import (
     compile_tools_prompt,
     extract_system_context,
     extract_workspace_root,
+    filter_request_tools,
+    is_conversational_chat_request,
     is_plain_greeting_request,
 )
+from app.tool_profiles import extract_forced_tool_names, normalize_tool_profile
 from app.streaming import ToolCallAwareStreamer
 from app.title_generation import extract_local_title_request
 from app.tool_parser import (
@@ -135,12 +138,21 @@ async def _attempt_tool_self_correction(
         reason = "invalid JSON or schema mismatch"
 
     allowed_names = ", ".join(list(tools_map.keys())[:25])
-    correction_prompt = (
-        f"[TOOL FORMAT CORRECTION] Your previous tool call could not be parsed ({reason}). "
-        f"No tool was executed. Re-emit ONLY the corrected <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> "
-        f"block(s) using valid JSON, exact parameter names/types, raw URLs (never markdown links), "
-        f"and properly escaped quotes/newlines. Allowed tools: {allowed_names}."
-    )
+    if parse_res.has_unclosed_tag:
+        correction_prompt = (
+            "[TOOL FORMAT CORRECTION] Your previous <tool_call> was cut off mid-stream before </tool_call> "
+            "(payload too large for one turn). No tool was executed. Do NOT re-send a huge full-file payload at once: "
+            "split the change into smaller steps (create a concise skeleton with write first, then add sections via "
+            "targeted edit calls, or apply smaller edit blocks) and emit valid, closed "
+            f'<tool_call>{{"name": "...", "arguments": {{...}}}}</tool_call> JSON. Allowed tools: {allowed_names}.'
+        )
+    else:
+        correction_prompt = (
+            f"[TOOL FORMAT CORRECTION] Your previous tool call could not be parsed ({reason}). "
+            f"No tool was executed. Re-emit ONLY the corrected <tool_call>{{\"name\": \"...\", \"arguments\": {{...}}}}</tool_call> "
+            f"block(s) using strictly valid JSON (escape every inner `\"`, `\\\\`, and `\\n`), exact parameter names/types, "
+            f"and raw URLs. Allowed tools: {allowed_names}."
+        )
     try:
         logger.warning("[SELF-CORRECT] Thử tự sửa tool call 1 vòng kín (%s)...", reason)
         fixed_reply = await mgr.send_prepared_turn(
@@ -315,12 +327,51 @@ async def chat_completions(request: Request):
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
 
-    tools = body.get("tools") or []
-    tools_map = {
-        t.get("function", t).get("name"): t.get("function", t)
-        for t in tools
-        if t.get("function", t).get("name") and t.get("function", t).get("name").lower() not in FORBIDDEN_TOOLS
-    }
+    raw_tools = body.get("tools") or []
+    forced_tools = extract_forced_tool_names(body.get("tool_choice"))
+    default_profile = getattr(mgr, "tool_profile", None) or TOOL_PROFILE
+    req_profile_hdr = (request.headers.get("X-Tool-Profile") or "").strip()
+    active_tool_profile = (
+        normalize_tool_profile(req_profile_hdr, default=default_profile)
+        if req_profile_hdr
+        else normalize_tool_profile(default_profile)
+    )
+    base_allowed = tuple(getattr(mgr, "allowed_tools", None) or ())
+    mgr_allowed_tools = (
+        tuple(dict.fromkeys(base_allowed + forced_tools))
+        if forced_tools
+        else getattr(mgr, "allowed_tools", None)
+    )
+    mgr_blocked_tools = getattr(mgr, "blocked_tools", None)
+    tools, tool_filter_stats = filter_request_tools(
+        raw_tools,
+        tool_profile=active_tool_profile,
+        allowed_tools=mgr_allowed_tools,
+        blocked_tools=mgr_blocked_tools,
+    )
+    if tool_filter_stats["dropped"] > 0:
+        dropped_preview = ", ".join(tool_filter_stats["dropped_names"][:10])
+        suffix = "..." if len(tool_filter_stats["dropped_names"]) > 10 else ""
+        logger.info(
+            "[TOOL-PROFILE] profile=%s giữ %d/%d tool (ẩn %d: %s%s).",
+            active_tool_profile,
+            tool_filter_stats["kept"],
+            tool_filter_stats["total"],
+            tool_filter_stats["dropped"],
+            dropped_preview,
+            suffix,
+        )
+    is_greeting_turn = is_plain_greeting_request(messages)
+    is_chat_turn = is_greeting_turn or is_conversational_chat_request(messages)
+    tools_map = (
+        {}
+        if is_greeting_turn
+        else {
+            t.get("function", t).get("name"): t.get("function", t)
+            for t in tools
+            if t.get("function", t).get("name")
+        }
+    )
 
     raw_requested_model = str(body.get("model") or "").strip()
     is_explicit_model = bool(
@@ -392,20 +443,40 @@ async def chat_completions(request: Request):
             if msg.get("role") == "tool":
                 active_ledger.note_tool_result(msg.get("tool_call_id"), msg.get("content"))
 
-        tool_header = compile_tools_prompt(tools)
+        tool_header = compile_tools_prompt(
+            tools,
+            tool_profile=active_tool_profile,
+            allowed_tools=mgr_allowed_tools,
+            blocked_tools=mgr_blocked_tools,
+        )
         mgr.remember_tool_header(tool_header)
         needs_header = mgr.needs_tool_header
-        defer_header = needs_header and is_plain_greeting_request(messages)
+        defer_header = needs_header and bool(tool_header) and is_chat_turn
         is_first = needs_header and not defer_header
-        prompt_text, img_files = m.build_incremental_prompt_and_files(
-            messages, tools, is_first_turn=is_first
+        prompt_tools = [] if (is_greeting_turn or defer_header) else tools
+        prompt_breakdown: dict = {}
+        build_fn = m.build_incremental_prompt_and_files
+        build_kwargs: dict = {}
+        if _supports_kwarg(build_fn, "tool_profile"):
+            build_kwargs["tool_profile"] = active_tool_profile
+            build_kwargs["allowed_tools"] = mgr_allowed_tools
+            build_kwargs["blocked_tools"] = mgr_blocked_tools
+        if _supports_kwarg(build_fn, "breakdown_out"):
+            build_kwargs["breakdown_out"] = prompt_breakdown
+        prompt_text, img_files = build_fn(
+            messages, prompt_tools, is_first_turn=is_first, **build_kwargs
         )
+        if prompt_breakdown:
+            prompt_breakdown["tools_total"] = tool_filter_stats["total"]
+            prompt_breakdown["tools_kept"] = tool_filter_stats["kept"]
+            prompt_breakdown["tools_dropped"] = tool_filter_stats["dropped"]
+            prompt_breakdown["profile"] = active_tool_profile
         bootstrap_prompt = (
             ""
             if is_first or defer_header
             else _build_reset_bootstrap_prompt(messages, prompt_text, tool_header)
         )
-        return prompt_text, img_files, defer_header, active_ledger, active_workspace, bootstrap_prompt
+        return prompt_text, img_files, defer_header, active_ledger, active_workspace, bootstrap_prompt, prompt_breakdown
 
     # Lấy turn lock TRƯỚC khi trả StreamingResponse(200) để Gateway có thể failover thật khi worker bận (HTTP 429)
     acquired_lock = False
@@ -431,10 +502,18 @@ async def chat_completions(request: Request):
 
     image_files: List[str] = []
     try:
-        prompt_to_send, image_files, defer_tool_header, active_ledger, active_workspace, bootstrap_prompt = (
-            await _prepare_locked_turn()
-        )
+        (
+            prompt_to_send,
+            image_files,
+            defer_tool_header,
+            active_ledger,
+            active_workspace,
+            bootstrap_prompt,
+            prompt_breakdown,
+        ) = await _prepare_locked_turn()
         _reset_turn_activity_fields(mgr)
+        if isinstance(getattr(mgr, "last_turn_prompt_breakdown", None), dict):
+            mgr.last_turn_prompt_breakdown = prompt_breakdown
         if not requested_slot_model and hasattr(mgr, "_current_slot_model"):
             model_id = mgr._current_slot_model() or model_id
     except Exception:
@@ -574,10 +653,28 @@ async def chat_completions(request: Request):
                 yield f"data: {json.dumps(end_chunk, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                if not prod_task.done():
-                    prod_task.cancel()
-                await asyncio.gather(prod_task, return_exceptions=True)
-                mgr.release_turn_lock(acquired_lock)
+                stuck_producer = False
+                try:
+                    if not prod_task.done():
+                        prod_task.cancel()
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(prod_task, return_exceptions=True),
+                            timeout=3.0,
+                        )
+                    except asyncio.TimeoutError:
+                        stuck_producer = True
+                        logger.warning(
+                            "[SSE] Producer không thoát trong 3s khi client ngắt kết nối; cưỡng chế nhả turn lock."
+                        )
+                    except BaseException:
+                        stuck_producer = True
+                        raise
+                finally:
+                    if stuck_producer and hasattr(mgr, "force_release_stuck_turn_lock"):
+                        mgr.force_release_stuck_turn_lock(acquired_lock)
+                    else:
+                        mgr.release_turn_lock(acquired_lock)
 
         return StreamingResponse(sse_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 

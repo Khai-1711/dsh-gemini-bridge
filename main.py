@@ -121,7 +121,11 @@ async def security_middleware(request: Request, call_next):
         token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header
         key_ok = bool(token) and hmac.compare_digest(token.encode("utf-8"), API_KEY.encode("utf-8"))
         lane_header = request.headers.get("X-Lane-Token", "").strip()
-        lane_ok = path.startswith("/v1/lanes") and bool(lane_header) and lane_token_ok(lane_header, LANE_ADMIN_TOKEN)
+        lane_ok = (
+            (path.startswith("/v1/lanes") or path == "/v1/tool-profile")
+            and bool(lane_header)
+            and lane_token_ok(lane_header, LANE_ADMIN_TOKEN)
+        )
         if not (key_ok or lane_ok):
             return JSONResponse(
                 status_code=401,

@@ -9,6 +9,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 
+from app.config import GEMINI_STREAM_OVERALL_TIMEOUT
 from app.gemini_session import compute_session_key, is_subagent_messages
 
 logger = logging.getLogger("DSH-Bridge")
@@ -199,7 +200,7 @@ class GatewayRouter:
             out["Authorization"] = str(auth_val)
         elif self.api_key:
             out["Authorization"] = f"Bearer {self.api_key}"
-        for h_name in ("X-Session-Id", "X-DSH-Session-Id", "X-Workspace-Dir"):
+        for h_name in ("X-Session-Id", "X-DSH-Session-Id", "X-Workspace-Dir", "X-Tool-Profile"):
             val = request_headers.get(h_name) or request_headers.get(h_name.lower())
             if val:
                 out[h_name] = str(val)
@@ -463,12 +464,15 @@ class GatewayRouter:
 
             # Non-streaming proxy pass-through
             released = False
+            non_stream_read_timeout = max(240.0, float(GEMINI_STREAM_OVERALL_TIMEOUT) + 30.0)
             try:
                 resp = await client.post(
                     target_url,
                     json=body,
                     headers=fwd_headers,
-                    timeout=httpx.Timeout(connect=10.0, read=240.0, write=30.0, pool=10.0),
+                    timeout=httpx.Timeout(
+                        connect=10.0, read=non_stream_read_timeout, write=30.0, pool=10.0
+                    ),
                 )
             except (
                 httpx.ConnectError,

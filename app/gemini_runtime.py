@@ -11,17 +11,21 @@ from app.account_pool import AccountPoolMixin, _safe_init_client, first_availabl
 from app.accounts import account_key, find_chain_overlap, write_chain_file
 from app.config import (
     ACCOUNT_CHAIN,
+    ALLOWED_TOOLS,
     ALLOW_GUEST_MODE,
     BASE_DIR,
+    BLOCKED_TOOLS,
     BRIDGE_DEBUG_FAKE_QUOTA,
     DEFAULT_MODEL,
     EMPTY_REPLY_RETRIES,
     FALLBACK_MODEL,
     INSTANCE_ID,
+    IS_GATEWAY_INSTANCE,
     LOCK_ACQUIRE_TIMEOUT,
     PORT,
     SECURE_1PSID,
     SECURE_1PSIDTS,
+    TOOL_PROFILE,
     logger,
 )
 from app.errors import (
@@ -171,26 +175,34 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         self.last_turn_model: str = ""
         self.last_turn_fallback_from: Optional[str] = None
         self.last_turn_prompt_chars: int = 0
+        self.last_turn_prompt_breakdown: Dict[str, Any] = {}
+        self.tool_profile: str = TOOL_PROFILE
+        self.allowed_tools = ALLOWED_TOOLS
+        self.blocked_tools = BLOCKED_TOOLS
+        self._turn_epoch: int = 0
+        self._last_safe_metadata: Optional[list] = None
 
-        try:
-            write_chain_file(
-                paths["chain_file"],
-                INSTANCE_ID,
-                PORT,
-                [a["key"] for a in self.chain],
-                time.time(),
-            )
-            self.chain_overlap = find_chain_overlap(
-                BASE_DIR, paths["chain_file"], [a["key"] for a in self.chain]
-            )
-            for x in self.chain_overlap:
-                logger.critical(
-                    f"[ACCOUNTS] Một tài khoản trong chuỗi của con '{INSTANCE_ID or 'default'}' "
-                    f"cũng nằm trong chuỗi của con '{x.get('other_instance')}'. Hai con sẽ dùng chung một tài khoản."
+        self.chain_overlap = []
+        if not IS_GATEWAY_INSTANCE:
+            try:
+                write_chain_file(
+                    paths["chain_file"],
+                    INSTANCE_ID,
+                    PORT,
+                    [a["key"] for a in self.chain],
+                    time.time(),
                 )
-        except Exception as exc:
-            self.chain_overlap = []
-            logger.warning(f"[ACCOUNTS] Lỗi ghi chain file: {exc}")
+                self.chain_overlap = find_chain_overlap(
+                    BASE_DIR, paths["chain_file"], [a["key"] for a in self.chain]
+                )
+                for x in self.chain_overlap:
+                    logger.critical(
+                        f"[ACCOUNTS] Một tài khoản trong chuỗi của con '{INSTANCE_ID or 'default'}' "
+                        f"cũng nằm trong chuỗi của con '{x.get('other_instance')}'. Hai con sẽ dùng chung một tài khoản."
+                    )
+            except Exception as exc:
+                self.chain_overlap = []
+                logger.warning(f"[ACCOUNTS] Lỗi ghi chain file: {exc}")
 
         self._lead_ledger = FactLedger(
             paths["handoff_dir"], filename="ledger.json", persist=True
@@ -222,6 +234,43 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
         if acquired_here and self.lock.locked():
             self._lock_owner_task = None
             self.lock.release()
+
+    def force_release_stuck_turn_lock(self, acquired_here: bool = True) -> None:
+        """Cưỡng chế nhả turn lock khi producer bị kẹt lúc hủy:
+        - Tăng epoch để chặn task cũ ghi đè state/metadata.
+        - Tách hẳn object `chat_session` khỏi task cũ bằng bản sao metadata an toàn trước lượt,
+          đảm bảo lượt kế tiếp không bị race-condition trên cùng đối tượng ChatSession.
+        """
+        self._turn_epoch = getattr(self, "_turn_epoch", 0) + 1
+        try:
+            safe_meta = getattr(self, "_last_safe_metadata", None)
+            if getattr(self, "client", None) is not None and hasattr(self.client, "start_chat"):
+                self._restore_chat_metadata_after_abort(
+                    list(safe_meta) if safe_meta else None,
+                    model_override=self._current_slot_model(),
+                )
+        except Exception as exc:
+            logger.warning(f"[SESSION] Không thể tách ChatSession an toàn khi cưỡng chế nhả lock: {exc}")
+        if acquired_here and self.lock.locked():
+            self._lock_owner_task = None
+            self.lock.release()
+
+    def _format_prompt_telemetry(self) -> str:
+        bd = getattr(self, "last_turn_prompt_breakdown", None)
+        if not isinstance(bd, dict) or not bd:
+            return ""
+        parts = []
+        for k in ("user", "sys", "tools", "tool_res", "boot"):
+            v = bd.get(k)
+            if isinstance(v, int) and v > 0:
+                if k == "tools" and isinstance(bd.get("tools_total"), int) and bd["tools_total"] > 0:
+                    parts.append(f"tools={v}({bd.get('tools_kept', 0)}/{bd['tools_total']})")
+                else:
+                    parts.append(f"{k}={v}")
+        prof = bd.get("profile")
+        if prof:
+            parts.append(f"profile={prof}")
+        return f" [{' '.join(parts)}]" if parts else ""
 
     def transfer_turn_lock(self, new_owner_task: Optional[asyncio.Task] = None) -> None:
         """Chuyển quyền sở hữu turn lock đã giữ sang task con (vd producer SSE)."""
@@ -770,6 +819,7 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
             self.last_turn_model = requested_model
             self.last_turn_fallback_from = None
             self.last_turn_prompt_chars = 0
+            my_epoch = getattr(self, "_turn_epoch", 0)
             turn_start = asyncio.get_running_loop().time()
             stream_cap = (
                 image_deadline
@@ -780,6 +830,9 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
             while attempt < 2:
                 stage = "vision_upload" if image_files else "text_generation"
                 saved_meta_before_send = self._sanitize_chat_metadata_before_send()
+                self._last_safe_metadata = (
+                    list(saved_meta_before_send) if saved_meta_before_send else None
+                )
                 prompt_to_send = self._ensure_header_in_prompt(self._apply_pending_handoff(base_prompt), include_tool_header)
                 self.last_turn_prompt_chars = len(prompt_to_send)
                 now_ts = asyncio.get_running_loop().time()
@@ -800,7 +853,11 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         self._fake_quota_done = True
                         raise UsageLimitExceededError("DEBUG: giả lập hết quota (BRIDGE_DEBUG_FAKE_QUOTA)")
 
-                    logger.info(f"Stream vào ChatSession (Model={self._current_slot_model()} | Turn={self.turn_count + 1} | Chars={len(prompt_to_send)}{f' | Images={len(image_files)}' if image_files else ''})")
+                    logger.info(
+                        f"Stream vào ChatSession (Model={self._current_slot_model()} | Turn={self.turn_count + 1} | "
+                        f"Chars={len(prompt_to_send)}{self._format_prompt_telemetry()}"
+                        f"{f' | Images={len(image_files)}' if image_files else ''})"
+                    )
                     async for output in _iterate_stream_until(
                         self._open_chat_stream(prompt_to_send, image_files),
                         initial_deadline,
@@ -842,6 +899,8 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                         }
                         return
 
+                    if getattr(self, "_turn_epoch", 0) != my_epoch:
+                        return
                     self.session_initialized = True
                     self._mark_tool_header_sent(include_tool_header)
                     self.turn_count += 1
@@ -864,12 +923,15 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     return
 
                 except (asyncio.CancelledError, GeneratorExit):
-                    self._restore_chat_metadata_after_abort(
-                        saved_meta_before_send, model_override=requested_model
-                    )
+                    if getattr(self, "_turn_epoch", 0) == my_epoch:
+                        self._restore_chat_metadata_after_abort(
+                            saved_meta_before_send, model_override=requested_model
+                        )
                     raise
 
                 except asyncio.TimeoutError:
+                    if getattr(self, "_turn_epoch", 0) != my_epoch:
+                        return
                     retry_margin = min(5.0, max(0.05, stream_overall_timeout * 0.1))
                     if (
                         soft_fallback_eligible
@@ -928,6 +990,8 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                     return
 
                 except Exception as exc:
+                    if getattr(self, "_turn_epoch", 0) != my_epoch:
+                        return
                     self.total_errors += 1
                     if self._is_auth_error(exc):
                         self._consecutive_auth_errors += 1
@@ -986,7 +1050,27 @@ class SingleChatManager(SessionPoolMixin, AccountPoolMixin, HandoffRunnerMixin):
                             continue
 
                     if attempt == 0:
-                        saved_meta = self._chat_metadata_snapshot()
+                        saved_meta = saved_meta_before_send
+                        if (
+                            not self._is_auth_error(exc)
+                            and self.client is not None
+                            and getattr(self, "auth_ok", False)
+                        ):
+                            logger.warning(
+                                "[TRANSIENT_RETRY] Lỗi tạm thời không phải auth -> giữ nguyên GeminiClient, "
+                                "khôi phục metadata an toàn và thử lại ngay."
+                            )
+                            retry_delay = min(0.5, max(0.0, min_interval))
+                            if retry_delay > 0:
+                                await _await_with_deadline(asyncio.sleep(retry_delay), image_deadline)
+                            self._create_new_chat_session(
+                                preserve_metadata=saved_meta, model_override=requested_model
+                            )
+                            self._sync_active_session_slot()
+                            full_text = ""
+                            attempt += 1
+                            continue
+
                         ok, err_payload, failover_attempts = await self._recover_client_after_error(stage, image_deadline, failover_attempts, max_failover_attempts, raise_init_error=True)
                         if err_payload is not None:
                             yield "error", err_payload

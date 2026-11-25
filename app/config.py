@@ -32,14 +32,15 @@ def sanitize_instance_id(raw: str) -> str:
 def build_instance_paths(base_dir: Path, instance_id: str) -> dict:
     """DUY NHẤT một nơi quyết định tên file theo instance."""
     sfx = f"_{instance_id}" if instance_id else ""
+    state_dir = base_dir / ".bridge_state"
     return {
         "env_file": base_dir / (f".env.{instance_id}" if instance_id else ".env"),
-        "session_file": base_dir / f".bridge_session{sfx}.json",
+        "session_file": state_dir / f".bridge_session{sfx}.json",
         "log_file": base_dir / "logs" / f"bridge{sfx}.log",
         "activity_file": base_dir / "logs" / f"activity{sfx}.jsonl",
         "cookie_dir": base_dir / f".gemini_cookies{sfx}",
-        "accounts_state_file": base_dir / f".bridge_accounts{sfx}.json",
-        "chain_file": base_dir / f".bridge_chain{sfx}.json",
+        "accounts_state_file": state_dir / f".bridge_accounts{sfx}.json",
+        "chain_file": state_dir / f".bridge_chain{sfx}.json",
         "handoff_dir": base_dir / "handoff" / (instance_id or "default"),
     }
 
@@ -223,8 +224,15 @@ COOKIE_SYNC_COOLDOWN = max(15.0, float(os.getenv("COOKIE_SYNC_COOLDOWN", "120"))
 DEFAULT_PROJECT_DIR = os.getenv("DEFAULT_PROJECT_DIR", "").strip()
 # client = tin tưởng phạm vi thư mục của IDE/đoạn chat (chỉ chặn lệnh phá OS cực đoan)
 # workspace = khóa mềm đường dẫn file vào workspace nhận diện được từ đoạn chat / DEFAULT_PROJECT_DIR
+from app.tool_profiles import normalize_tool_profile, parse_tool_list
+
 WORKSPACE_SANDBOX_MODE = os.getenv("WORKSPACE_SANDBOX_MODE", "client").strip().lower()
 FORBIDDEN_TOOLS = {"read_image", "generate_video", "generate_image"}
+# Profile lọc tool để giảm phình prompt Turn 1 & ngăn tự ý đẻ subagent mở chat web mới:
+# no_subagents (mặc định an toàn) | coding | coding_parallel | research | none | all
+TOOL_PROFILE = normalize_tool_profile(os.getenv("TOOL_PROFILE", "no_subagents"))
+ALLOWED_TOOLS = parse_tool_list(os.getenv("ALLOWED_TOOLS", ""))
+BLOCKED_TOOLS = parse_tool_list(os.getenv("BLOCKED_TOOLS", ""))
 
 # =====================================================================
 # 5. LOGGING (Console + File Rotation)

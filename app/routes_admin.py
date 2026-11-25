@@ -39,6 +39,12 @@ from app.errors import BridgeError
 from app.gemini_session import clear_response_cache
 from app.lane_security import is_loopback_host, is_loopback_url
 from app.lanes import build_local_lane_status, spawn_local_lane
+from app.tool_profiles import (
+    VALID_TOOL_PROFILES,
+    describe_profiles,
+    normalize_tool_profile,
+    parse_tool_list,
+)
 
 admin_router = APIRouter()
 
@@ -1074,3 +1080,124 @@ async def sync_all_profiles(request: Request):
         "synced": synced_count,
         "results": results,
     }
+
+
+@admin_router.get("/v1/tool-profile")
+async def get_tool_profile():
+    """Trả về cấu hình Tool Profile hiện hành và danh sách các profile được hỗ trợ."""
+    mgr = _m().session_manager
+    return {
+        "profile": getattr(mgr, "tool_profile", "no_subagents"),
+        "allowed_tools": list(getattr(mgr, "allowed_tools", ()) or ()),
+        "blocked_tools": list(getattr(mgr, "blocked_tools", ()) or ()),
+        "available_profiles": describe_profiles(),
+    }
+
+
+@admin_router.post("/v1/tool-profile")
+async def set_tool_profile(request: Request):
+    """Đổi nóng Tool Profile (và optional allowed_tools/blocked_tools) không cần khởi động lại.
+
+    Nếu chạy ở chế độ Frontend Gateway (:10000), tự động đồng bộ sang các worker lane đang chạy.
+    """
+    if err := _origin_error(request):
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400, content={"error": "Payload phải là JSON object"})
+
+    raw_profile = str(body.get("profile") or "").strip().lower().replace("-", "_")
+    if raw_profile not in VALID_TOOL_PROFILES:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "invalid_tool_profile",
+                    "message": f"Profile '{raw_profile}' không hợp lệ. Chọn một trong: {', '.join(VALID_TOOL_PROFILES)}.",
+                }
+            },
+        )
+
+    profile = normalize_tool_profile(raw_profile)
+    persist = bool(body.get("persist", False))
+    m = _m()
+    mgr = m.session_manager
+    mgr.tool_profile = profile
+    if "allowed_tools" in body:
+        mgr.allowed_tools = parse_tool_list(body.get("allowed_tools"))
+    if "blocked_tools" in body:
+        mgr.blocked_tools = parse_tool_list(body.get("blocked_tools"))
+    mgr.tool_header_sent = False
+    mgr.chat_tool_header_hash = ""
+    for slot in (getattr(mgr, "_session_pool", None) or {}).values():
+        slot.tool_header_sent = False
+        slot.chat_tool_header_hash = ""
+
+    persisted = False
+    persist_error = None
+    if persist:
+        env_updates = {"TOOL_PROFILE": profile}
+        if "allowed_tools" in body:
+            env_updates["ALLOWED_TOOLS"] = ",".join(mgr.allowed_tools)
+        if "blocked_tools" in body:
+            env_updates["BLOCKED_TOOLS"] = ",".join(mgr.blocked_tools)
+        try:
+            env_file = Path(m.INSTANCE_PATHS["env_file"])
+            content = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
+            new_content = update_env_values(content, env_updates)
+            tmp_file = env_file.parent / f".tmp_{env_file.name}_{uuid.uuid4().hex}"
+            tmp_file.write_text(new_content, encoding="utf-8")
+            os.replace(tmp_file, env_file)
+            persisted = True
+        except Exception as exc:
+            persist_error = str(exc)
+            logger.warning("[TOOL-PROFILE] Không lưu được cấu hình vào .env: %s", exc)
+
+    logger.info(
+        "[TOOL-PROFILE] Đã chuyển profile -> '%s' (allowed=%d, blocked=%d, persisted=%s).",
+        profile,
+        len(getattr(mgr, "allowed_tools", ()) or ()),
+        len(getattr(mgr, "blocked_tools", ()) or ()),
+        persisted,
+    )
+
+    forwarded: dict = {}
+    if getattr(m, "is_frontend_gateway", False) and getattr(m, "lane_registry", None) is not None:
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if getattr(m, "API_KEY", ""):
+            headers["Authorization"] = f"Bearer {m.API_KEY}"
+        if getattr(m, "LANE_ADMIN_TOKEN", ""):
+            headers["X-Lane-Token"] = m.LANE_ADMIN_TOKEN
+        payload = {"profile": profile, "persist": persist}
+        if "allowed_tools" in body:
+            payload["allowed_tools"] = list(mgr.allowed_tools)
+        if "blocked_tools" in body:
+            payload["blocked_tools"] = list(mgr.blocked_tools)
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            for lane_id, peer_url in (m.lane_registry.peers or {}).items():
+                try:
+                    resp = await client.post(
+                        f"{str(peer_url).rstrip('/')}/v1/tool-profile",
+                        json=payload,
+                        headers=headers,
+                    )
+                    forwarded[lane_id] = {"ok": resp.status_code == 200, "status": resp.status_code}
+                except Exception as exc:
+                    forwarded[lane_id] = {"ok": False, "error": str(exc)}
+
+    result = {
+        "ok": True,
+        "profile": profile,
+        "allowed_tools": list(getattr(mgr, "allowed_tools", ()) or ()),
+        "blocked_tools": list(getattr(mgr, "blocked_tools", ()) or ()),
+        "persisted": persisted,
+        "forwarded": forwarded,
+    }
+    if persist_error:
+        result["persist_error"] = persist_error
+    return result
